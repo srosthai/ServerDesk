@@ -1,6 +1,7 @@
 import { NavLink } from "react-router-dom";
 import { CaretUpDownIcon, HardDrivesIcon, XIcon } from "@phosphor-icons/react";
 import { navGroups } from "@/app/navigation";
+import { useAppInfo } from "@/hooks/useAppInfo";
 import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { cn } from "@/lib/utils";
 
@@ -11,6 +12,18 @@ type SidebarProps = {
 
 function Sidebar({ open, onClose }: SidebarProps) {
   const isDesktop = useMediaQuery("(min-width: 768px)");
+  const appInfo = useAppInfo();
+  const version = appInfo.status === "ready" ? `v${appInfo.info.appVersion}` : "v0.1.0";
+  const storageLabel =
+    appInfo.status === "ready"
+      ? `Database v${appInfo.info.databaseSchemaVersion}`
+      : appInfo.status === "error"
+        ? "Database error"
+        : appInfo.status === "unavailable"
+          ? "Web preview"
+          : "Checking database";
+  const storageTitle =
+    appInfo.status === "error" ? appInfo.message : "Local SQLite storage is initialized on launch.";
 
   return (
     <aside
@@ -120,7 +133,15 @@ function Sidebar({ open, onClose }: SidebarProps) {
           <span className="size-1.5 rounded-full bg-sidebar-muted/60" aria-hidden="true" />
           No server selected
         </div>
-        <div className="mt-2 font-mono text-[10px] text-sidebar-muted/80">v0.1.0</div>
+        <div className="mt-2 flex items-center justify-between gap-2 font-mono text-[10px] text-sidebar-muted/80">
+          <span>{version}</span>
+          <span
+            className={appInfo.status === "error" ? "text-destructive" : undefined}
+            title={storageTitle}
+          >
+            {storageLabel}
+          </span>
+        </div>
       </div>
     </aside>
   );
