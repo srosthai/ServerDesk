@@ -54,7 +54,7 @@ impl client::Handler for ClientHandler {
         let observation = if self
             .trusted_host_keys
             .iter()
-            .any(|trusted| trusted.fingerprint == fingerprint)
+            .any(|trusted| trusted.key_type == key_type && trusted.fingerprint == fingerprint)
         {
             HostKeyObservation::Trusted
         } else if self.trusted_host_keys.is_empty() {
@@ -340,5 +340,23 @@ mod tests {
             map_russh_error(russh::Error::ConnectionTimeout),
             TransportError::Timeout
         );
+    }
+
+    #[test]
+    fn fingerprints_use_the_standard_openssh_sha256_format() {
+        let mut rng = rand::rng();
+        let key = russh::keys::PrivateKey::random(&mut rng, russh::keys::Algorithm::Ed25519)
+            .expect("generate test key");
+        let fingerprint = key.public_key().fingerprint(HashAlg::Sha256).to_string();
+
+        assert!(fingerprint.starts_with("SHA256:"));
+        let encoded = fingerprint.trim_start_matches("SHA256:");
+        assert_eq!(encoded.len(), 43);
+        assert!(
+            encoded.chars().all(
+                |character| character.is_ascii_alphanumeric() || matches!(character, '+' | '/')
+            )
+        );
+        assert_eq!(key.public_key().algorithm().as_str(), "ssh-ed25519");
     }
 }

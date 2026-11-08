@@ -9,7 +9,11 @@ use crate::storage::{
 const KNOWN_HOST_COLUMNS: &str = "id, server_id, key_type, fingerprint, first_seen_at, verified_at";
 
 impl Database {
-    pub fn upsert_known_host(
+    /// Stores a host key only after the user explicitly trusts it.
+    ///
+    /// Existing records are never overwritten. A different fingerprint for the
+    /// same key type is a conflict so a changed key cannot be silently trusted.
+    pub fn insert_known_host(
         &self,
         server_id: &str,
         key_type: &str,
@@ -23,13 +27,19 @@ impl Database {
                 "INSERT INTO known_hosts (
                     id, server_id, key_type, fingerprint, first_seen_at, verified_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                ON CONFLICT (server_id, key_type) DO UPDATE SET
-                    fingerprint = excluded.fingerprint,
-                    verified_at = excluded.verified_at",
+                ON CONFLICT (server_id, key_type) DO NOTHING",
                 params![id, server_id, key_type, fingerprint, now, now],
             )?;
 
-            get_known_host(connection, server_id, key_type)?.ok_or(StorageError::NotFound)
+            let host =
+                get_known_host(connection, server_id, key_type)?.ok_or(StorageError::NotFound)?;
+            if host.fingerprint != fingerprint {
+                return Err(StorageError::Conflict(
+                    "a different host key is already trusted for this server".to_string(),
+                ));
+            }
+
+            Ok(host)
         })
     }
 
@@ -53,13 +63,13 @@ impl Database {
         })
     }
 
-    pub fn delete_known_host(&self, server_id: &str, key_type: &str) -> Result<(), StorageError> {
+    pub fn delete_known_host(&self, server_id: &str, key_type: &str) -> Result<bool, StorageError> {
         self.with_connection(|connection| {
-            connection.execute(
+            let deleted = connection.execute(
                 "DELETE FROM known_hosts WHERE server_id = ?1 AND key_type = ?2",
                 params![server_id, key_type],
             )?;
-            Ok(())
+            Ok(deleted > 0)
         })
     }
 }
