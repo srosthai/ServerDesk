@@ -17,7 +17,11 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![commands::system::get_app_info])
+        .invoke_handler(tauri::generate_handler![
+            commands::system::get_app_info,
+            commands::preferences::get_preferences,
+            commands::preferences::save_preferences
+        ])
         .run(tauri::generate_context!())
         .expect("error while running ServerDesk");
 }

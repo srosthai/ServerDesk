@@ -23,3 +23,11 @@ export type AppInfo = {
   appVersion: string;
   databaseSchemaVersion: number;
 };
+
+export type ThemePreference = "system" | "light" | "dark";
+
+export type UserPreferences = {
+  theme: ThemePreference;
+  monitoringIntervalSeconds: number;
+  lastActiveServerId: string | null;
+};
