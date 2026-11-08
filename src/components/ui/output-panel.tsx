@@ -1,3 +1,4 @@
+import type * as React from "react";
 import { CopyButton } from "@/components/ui/copy-button";
 import { cn } from "@/lib/utils";
 
@@ -7,6 +8,7 @@ type OutputPanelProps = {
   emptyText?: string;
   className?: string;
   maxHeightClassName?: string;
+  meta?: React.ReactNode;
 };
 
 function OutputPanel({
@@ -15,6 +17,7 @@ function OutputPanel({
   emptyText = "No output yet.",
   className,
   maxHeightClassName = "max-h-72",
+  meta,
 }: OutputPanelProps) {
   return (
     <section
@@ -23,12 +26,15 @@ function OutputPanel({
         className,
       )}
     >
-      <header className="flex h-9 items-center justify-between border-b border-[#26332c] px-3">
+      <header className="flex h-9 items-center justify-between gap-3 border-b border-[#26332c] px-3">
         <span className="text-[11px] font-medium text-[#91a198]">{title}</span>
-        <CopyButton
-          value={content}
-          className="text-[#91a198] hover:bg-[#18221d] hover:text-[#dfe7e1]"
-        />
+        <div className="flex items-center gap-2">
+          {meta ? <span className="font-mono text-[10px] text-[#91a198]">{meta}</span> : null}
+          <CopyButton
+            value={content}
+            className="text-[#91a198] hover:bg-[#18221d] hover:text-[#dfe7e1]"
+          />
+        </div>
       </header>
       <pre
         className={cn(

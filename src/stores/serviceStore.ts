@@ -93,7 +93,7 @@ function applyVerifiedStatus(
   };
 }
 
-export const useServiceStore = create<ServiceStore>((set) => {
+export const useServiceStore = create<ServiceStore>((set, get) => {
   let requestCounter = 0;
   const requestIds: Record<string, number> = {};
   let actionCounter = 0;
@@ -227,6 +227,11 @@ export const useServiceStore = create<ServiceStore>((set) => {
               : state.entries,
           };
         });
+
+        // The action result already carries the verified unit state. Re-running
+        // discovery keeps every other row, the state counts, and the sample time
+        // in sync when an action starts, stops, or restarts a unit.
+        await get().refresh(serverId);
 
         return result.succeeded;
       } catch (error) {
