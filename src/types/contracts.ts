@@ -274,6 +274,39 @@ export type ProjectScanResult = {
   connectionState: ConnectionState;
 };
 
+export type ArtisanActionName =
+  | "about"
+  | "route-list"
+  | "config-cache"
+  | "config-clear"
+  | "cache-clear"
+  | "optimize-clear"
+  | "queue-restart"
+  | "migrate-status";
+
+export type ArtisanActionResult = {
+  serverId: string;
+  projectId: string;
+  action: ArtisanActionName;
+  command: string;
+  targetPath: string;
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  succeeded: boolean;
+  startedAt: number;
+  durationMs: number;
+  secretsRedacted: boolean;
+  outputTruncated: boolean;
+  connectionState: ConnectionState;
+};
+
+export type ProjectArtisanRun = {
+  result: ArtisanActionResult;
+  historyRecorded: boolean;
+  historyError: string | null;
+};
+
 export type ServerProfile = {
   id: string;
   name: string;
