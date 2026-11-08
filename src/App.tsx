@@ -1,11 +1,15 @@
 import { HashRouter } from "react-router-dom";
 import { AppRoutes } from "@/app/AppRoutes";
+import { ThemeSync } from "@/app/ThemeSync";
 
 function App() {
   return (
-    <HashRouter>
-      <AppRoutes />
-    </HashRouter>
+    <>
+      <ThemeSync />
+      <HashRouter>
+        <AppRoutes />
+      </HashRouter>
+    </>
   );
 }
 
