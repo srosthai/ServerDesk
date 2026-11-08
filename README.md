@@ -54,6 +54,8 @@ GitHub Actions runs the frontend and Rust checks on pushes and pull requests to 
 
 SSH passwords and private key material are stored in the operating system credential store through the Rust keyring integration. SQLite stores only a credential reference. Secret input is available in the desktop build, not the browser preview.
 
+Private key authentication supports OpenSSH, PEM (RSA, ECDSA, Ed25519), and PuTTY PPK keys, including passphrase-protected keys. The passphrase is stored with the key inside the credential store entry, so SQLite still holds only the credential reference. Key material can also be supplied as a local file path. Authentication failures return the distinct `authentication` error code; unreadable keys and incorrect passphrases return `credential`. Credentials, key material, and passphrases are redacted from debug output and are never written to logs.
+
 ## Connections
 
 A Rust connection manager owns one SSH session per server profile, reuses healthy sessions, rejects duplicate concurrent connects, and emits `connection-state-changed` events to the frontend. Connection states are `disconnected`, `connecting`, `host-key-verification`, `connected`, `reconnecting`, and `error`.

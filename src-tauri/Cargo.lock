@@ -4340,6 +4340,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "keyring",
+ "rand 0.10.3",
  "rusqlite",
  "russh",
  "serde",
@@ -4347,6 +4348,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "uuid",
