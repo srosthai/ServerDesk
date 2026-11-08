@@ -19,6 +19,7 @@ pub enum ErrorCode {
     Cancelled,
     NotFound,
     Storage,
+    Credential,
     Internal,
 }
 
@@ -86,6 +87,10 @@ impl AppError {
 
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::NotFound, message)
+    }
+
+    pub fn credential(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Credential, message)
     }
 
     pub fn internal(message: impl Into<String>) -> Self {

@@ -1,4 +1,8 @@
+use std::sync::Arc;
+
 use tauri::Manager;
+
+use crate::core::credentials::{CredentialStore, OsCredentialStore};
 
 pub mod commands;
 pub mod core;
@@ -14,6 +18,7 @@ pub fn run() {
 
             let database = storage::Database::open(data_directory.join("serverdesk.sqlite3"))?;
             app.manage(database);
+            app.manage(Arc::new(OsCredentialStore) as Arc<dyn CredentialStore>);
 
             Ok(())
         })
@@ -25,7 +30,10 @@ pub fn run() {
             commands::servers::get_server,
             commands::servers::create_server,
             commands::servers::update_server,
-            commands::servers::delete_server
+            commands::servers::delete_server,
+            commands::credentials::create_credential,
+            commands::credentials::store_credential,
+            commands::credentials::delete_credential
         ])
         .run(tauri::generate_context!())
         .expect("error while running ServerDesk");

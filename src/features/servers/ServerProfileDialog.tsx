@@ -21,6 +21,9 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { WarningCircleIcon } from "@phosphor-icons/react";
+import { getCommandErrorMessage } from "@/lib/errors";
+import { isTauriRuntime } from "@/lib/tauri";
+import { createCredential, deleteCredential, storeCredential } from "@/services/credentials";
 import { useServerStore } from "@/stores/serverStore";
 import type { AuthType, ServerProfile, ServerProfileInput } from "@/types/contracts";
 
@@ -40,6 +43,7 @@ function ServerProfileDialog({ server, onOpenChange }: ServerProfileDialogProps)
   const [groupName, setGroupName] = useState(server?.groupName ?? "");
   const [tags, setTags] = useState(server?.tags.join(", ") ?? "");
   const [notes, setNotes] = useState(server?.notes ?? "");
+  const [secret, setSecret] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
 
@@ -48,13 +52,31 @@ function ServerProfileDialog({ server, onOpenChange }: ServerProfileDialogProps)
     setPending(true);
     setError(null);
 
+    let credentialRef = server?.credentialRef ?? null;
+    let createdReference: string | null = null;
+
+    if (secret.length > 0 && isTauriRuntime()) {
+      try {
+        if (credentialRef) {
+          await storeCredential(credentialRef, secret);
+        } else {
+          credentialRef = await createCredential(secret);
+          createdReference = credentialRef;
+        }
+      } catch (credentialError) {
+        setError(getCommandErrorMessage(credentialError));
+        setPending(false);
+        return;
+      }
+    }
+
     const input: ServerProfileInput = {
       name,
       host,
       port: Number(port),
       username,
       authType,
-      credentialRef: server?.credentialRef ?? null,
+      credentialRef,
       groupName: groupName.trim() || null,
       tags: tags
         .split(",")
@@ -64,6 +86,14 @@ function ServerProfileDialog({ server, onOpenChange }: ServerProfileDialogProps)
     };
 
     const saved = server ? await updateServer(server.id, input) : await createServer(input);
+
+    if (!saved && createdReference) {
+      try {
+        await deleteCredential(createdReference);
+      } catch {
+        // The profile did not save; cleanup is best effort.
+      }
+    }
 
     setPending(false);
 
@@ -176,6 +206,28 @@ function ServerProfileDialog({ server, onOpenChange }: ServerProfileDialogProps)
                 placeholder="web, laravel"
               />
             </div>
+            {isTauriRuntime() ? (
+              <div className="space-y-2 sm:col-span-2">
+                <Label htmlFor="server-secret">
+                  {authType === "password" ? "SSH password" : "Key passphrase"}
+                </Label>
+                <Input
+                  id="server-secret"
+                  type="password"
+                  value={secret}
+                  onChange={(event) => setSecret(event.currentTarget.value)}
+                  placeholder={
+                    server?.credentialRef
+                      ? "Leave blank to keep the existing secret"
+                      : "Optional now; stored in the OS credential store"
+                  }
+                  autoComplete="new-password"
+                />
+                <p className="text-[11px] leading-relaxed text-muted-foreground">
+                  Secrets are stored in the OS credential store, never in SQLite or logs.
+                </p>
+              </div>
+            ) : null}
             <div className="space-y-2 sm:col-span-2">
               <Label htmlFor="server-notes">Notes</Label>
               <Textarea
