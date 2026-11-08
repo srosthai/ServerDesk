@@ -69,6 +69,8 @@ pub fn run() {
             commands::projects::scan_remote_projects,
             commands::projects::run_project_artisan_action,
             commands::projects::delete_project,
+            commands::logs::list_log_sources,
+            commands::logs::read_log_tail,
             commands::known_hosts::list_known_hosts,
             commands::known_hosts::trust_host_key,
             commands::known_hosts::reject_host_key,

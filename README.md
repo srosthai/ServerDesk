@@ -127,6 +127,14 @@ Every card shows the exact command and working directory before a button can run
 
 Action output is bounded to 64 KiB per command and each stream is shortened at a display limit while the exit status, stdout, stderr, and duration stay visible. ANSI escapes are stripped. Environment-style lines, secret assignments, bearer tokens, credentialed URLs, and private-key blocks are redacted before output reaches the UI or local history. Operation history stores only the fixed action name and a safe summary with the target path and exit status; it never stores raw output or `.env` values.
 
+## Bounded log viewer
+
+The Logs page reads only a bounded tail from approved remote log locations. System logs come from a fixed allowlist of common paths such as `/var/log/syslog`, `/var/log/auth.log`, Nginx and Apache access and error logs, MySQL, Redis, and UFW. A Laravel log must be a `.log` file directly inside a `storage/logs` directory. Relative paths, parent segments, control characters, arbitrary files, and symlinks that resolve outside those locations are rejected before any remote command is sent.
+
+Each request uses one fixed shell template with a quoted path and `tail -c` bounded to 64 KiB. The Rust side then keeps at most 2,000 lines (200 by default) and reports a typed `available`, `missing`, `not_file`, `unreadable`, or `unavailable` result. The result carries the requested and resolved remote path, retrieval time, duration, file size, returned line and byte counts, truncation flags, and whether the file rotated during the read. A partial first line from a byte-bounded tail is dropped and disclosed instead of displayed as corrupted text.
+
+The page shows the remote path and retrieval time beside every tail, supports refresh, and filters the already retrieved text locally without another remote read. Missing files, permission errors, non-regular files, rotation, and truncation are shown as explicit alerts. ServerDesk does not use sudo to read logs, and raw log content is kept in memory only.
+
 ## Command contracts
 
 React calls typed Tauri commands through `src/services/`. Contract types live in `src/types/contracts.ts`, and every command returns a structured `AppError` when it fails. Components do not call `invoke` directly. Tauri event subscriptions use `useTauriEvent`, which cleans up its listener on unmount.
