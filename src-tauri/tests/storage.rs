@@ -99,13 +99,26 @@ fn related_records_survive_and_cascade() {
     );
 
     let known_host = database
-        .upsert_known_host(&server.id, "ssh-ed25519", "SHA256:first")
+        .insert_known_host(&server.id, "ssh-ed25519", "SHA256:first")
         .expect("insert known host");
-    let updated_host = database
-        .upsert_known_host(&server.id, "ssh-ed25519", "SHA256:second")
-        .expect("update known host");
-    assert_eq!(known_host.id, updated_host.id);
-    assert_eq!(updated_host.fingerprint, "SHA256:second");
+    let duplicate = database
+        .insert_known_host(&server.id, "ssh-ed25519", "SHA256:first")
+        .expect("idempotent known host");
+    assert_eq!(known_host.id, duplicate.id);
+    assert!(
+        database
+            .insert_known_host(&server.id, "ssh-ed25519", "SHA256:second")
+            .is_err(),
+        "a different fingerprint must never overwrite a trusted key"
+    );
+    assert_eq!(
+        database
+            .get_known_host(&server.id, "ssh-ed25519")
+            .expect("get known host")
+            .expect("known host exists")
+            .fingerprint,
+        "SHA256:first"
+    );
     assert_eq!(
         database
             .list_known_hosts(&server.id)
@@ -113,6 +126,19 @@ fn related_records_survive_and_cascade() {
             .len(),
         1
     );
+    assert!(
+        database
+            .delete_known_host(&server.id, "ssh-ed25519")
+            .expect("delete known host")
+    );
+    assert!(
+        !database
+            .delete_known_host(&server.id, "ssh-ed25519")
+            .expect("delete missing known host")
+    );
+    database
+        .insert_known_host(&server.id, "ssh-ed25519", "SHA256:first")
+        .expect("reinsert known host");
 
     let forward = database
         .create_port_forward(&NewPortForward {
@@ -247,4 +273,32 @@ fn duplicate_server_names_are_rejected_case_insensitively() {
             .server_name_exists("PRODUCTION", Some(&created.id))
             .expect("name lookup excluding self")
     );
+}
+
+#[test]
+fn trusted_known_hosts_survive_a_database_restart() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("serverdesk.sqlite3");
+    let server_id;
+
+    {
+        let database = Database::open(&path).expect("open database");
+        let server = database
+            .create_server(&server_input("Production"))
+            .expect("create server");
+        server_id = server.id.clone();
+        database
+            .insert_known_host(&server.id, "ssh-ed25519", "SHA256:trusted")
+            .expect("insert known host");
+    }
+
+    {
+        let database = Database::open(&path).expect("reopen database");
+        let hosts = database
+            .list_known_hosts(&server_id)
+            .expect("list known hosts after restart");
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].key_type, "ssh-ed25519");
+        assert_eq!(hosts[0].fingerprint, "SHA256:trusted");
+    }
 }

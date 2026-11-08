@@ -1,10 +1,13 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ServersPage } from "@/features/servers/ServersPage";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useServerStore } from "@/stores/serverStore";
 import type { ServerProfile } from "@/types/contracts";
+
+const originalTrustHostKey = useConnectionStore.getState().trustHostKey;
+const originalRejectHostKey = useConnectionStore.getState().rejectHostKey;
 
 const server: ServerProfile = {
   id: "server-1",
@@ -32,6 +35,8 @@ describe("ServersPage", () => {
       connections: {},
       busy: {},
       error: null,
+      trustHostKey: originalTrustHostKey,
+      rejectHostKey: originalRejectHostKey,
     });
   });
 
@@ -124,5 +129,85 @@ describe("ServersPage", () => {
     expect(
       screen.getByText("SSH authentication failed. Check the username and credentials."),
     ).toBeInTheDocument();
+  });
+
+  it("requires explicit acceptance before trusting a first-seen host key", async () => {
+    const user = userEvent.setup();
+    const trust = vi.fn().mockResolvedValue(true);
+    const reject = vi.fn().mockResolvedValue(true);
+    useServerStore.setState({
+      servers: [server],
+      status: "ready",
+      error: null,
+    });
+    useConnectionStore.setState({
+      connections: {
+        [server.id]: {
+          serverId: server.id,
+          state: "host-key-verification",
+          changedAt: 1,
+          hostKey: {
+            keyType: "ssh-ed25519",
+            fingerprint: "SHA256:firstseen",
+          },
+        },
+      },
+      busy: {},
+      error: null,
+      trustHostKey: trust,
+      rejectHostKey: reject,
+    });
+
+    render(<ServersPage />);
+
+    expect(screen.getByRole("heading", { name: "Verify SSH host key" })).toBeInTheDocument();
+    expect(screen.getAllByText("SHA256:firstseen").length).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole("button", { name: "Trust and connect" }));
+    expect(trust).toHaveBeenCalledWith(server.id, "ssh-ed25519", "SHA256:firstseen");
+    expect(reject).not.toHaveBeenCalled();
+  });
+
+  it("shows a blocking security warning when the host key changed", async () => {
+    const user = userEvent.setup();
+    useServerStore.setState({
+      servers: [server],
+      status: "ready",
+      error: null,
+    });
+    useConnectionStore.setState({
+      connections: {
+        [server.id]: {
+          serverId: server.id,
+          state: "error",
+          changedAt: 1,
+          error: {
+            code: "host_key",
+            message: "The server host key has changed. The connection was blocked.",
+          },
+          hostKey: {
+            keyType: "ssh-ed25519",
+            fingerprint: "SHA256:received",
+            expectedFingerprint: "SHA256:saved",
+          },
+        },
+      },
+      busy: {},
+      error: null,
+    });
+
+    render(<ServersPage />);
+
+    expect(screen.getByRole("heading", { name: "SSH host key changed" })).toBeInTheDocument();
+    expect(screen.getByText("SHA256:saved")).toBeInTheDocument();
+    expect(screen.getAllByText("SHA256:received").length).toBeGreaterThan(0);
+    expect(screen.queryByRole("button", { name: "Trust and connect" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Dismiss warning" }));
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("heading", { name: "SSH host key changed" }),
+      ).not.toBeInTheDocument();
+    });
   });
 });

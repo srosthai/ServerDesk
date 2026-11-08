@@ -41,6 +41,16 @@ export type ConnectionState =
 export type HostKeyDetails = {
   keyType: string;
   fingerprint: string;
+  expectedFingerprint?: string;
+};
+
+export type TrustedHostKey = {
+  id: string;
+  serverId: string;
+  keyType: string;
+  fingerprint: string;
+  firstSeenAt: number;
+  verifiedAt: number | null;
 };
 
 export type ConnectionSnapshot = {

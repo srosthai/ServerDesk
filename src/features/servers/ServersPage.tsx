@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import {
+  FingerprintIcon,
   HardDrivesIcon,
   InfoIcon,
   LinkBreakIcon,
@@ -34,16 +35,43 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { StatusBadge } from "@/components/ui/status-badge";
+import { HostKeyChangedDialog, HostKeyVerificationDialog } from "@/features/servers/HostKeyDialogs";
+import { KnownHostsDialog } from "@/features/servers/KnownHostsDialog";
 import { ServerProfileDialog } from "@/features/servers/ServerProfileDialog";
 import { isTauriRuntime } from "@/lib/tauri";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useServerStore } from "@/stores/serverStore";
-import type { AuthType, ServerProfile } from "@/types/contracts";
+import type {
+  AuthType,
+  ConnectionSnapshot,
+  HostKeyDetails,
+  ServerProfile,
+} from "@/types/contracts";
 
 const authLabels: Record<AuthType, string> = {
   password: "Password",
   private_key: "Private key",
 };
+
+type HostKeyTarget = {
+  server: ServerProfile;
+  hostKey: HostKeyDetails;
+};
+
+function findHostKeyTarget(
+  servers: ServerProfile[],
+  connections: Record<string, ConnectionSnapshot>,
+  predicate: (connection: ConnectionSnapshot) => boolean,
+): HostKeyTarget | null {
+  for (const server of servers) {
+    const connection = connections[server.id];
+    if (connection?.hostKey && predicate(connection)) {
+      return { server, hostKey: connection.hostKey };
+    }
+  }
+
+  return null;
+}
 
 function ServersPage() {
   const servers = useServerStore((state) => state.servers);
@@ -59,6 +87,8 @@ function ServersPage() {
   const refreshConnectionStates = useConnectionStore((state) => state.refreshStates);
   const connect = useConnectionStore((state) => state.connect);
   const disconnect = useConnectionStore((state) => state.disconnect);
+  const trustHostKey = useConnectionStore((state) => state.trustHostKey);
+  const rejectHostKey = useConnectionStore((state) => state.rejectHostKey);
   const clearConnectionError = useConnectionStore((state) => state.clearError);
 
   const [query, setQuery] = useState("");
@@ -67,6 +97,8 @@ function ServersPage() {
   const [editing, setEditing] = useState<ServerProfile | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ServerProfile | null>(null);
   const [deletePending, setDeletePending] = useState(false);
+  const [knownHostsTarget, setKnownHostsTarget] = useState<ServerProfile | null>(null);
+  const [dismissedChangedKeys, setDismissedChangedKeys] = useState<Record<string, string>>({});
 
   useEffect(() => {
     if (status === "idle") {
@@ -114,6 +146,21 @@ function ServersPage() {
     setQuery("");
     setGroupFilter("all");
   }
+
+  const verificationTarget = findHostKeyTarget(
+    servers,
+    connections,
+    (connection) => connection.state === "host-key-verification",
+  );
+  const changedKeyTarget = findHostKeyTarget(
+    servers,
+    connections,
+    (connection) =>
+      connection.state === "error" &&
+      connection.error?.code === "host_key" &&
+      Boolean(connection.hostKey?.expectedFingerprint) &&
+      dismissedChangedKeys[connection.serverId] !== connection.hostKey?.fingerprint,
+  );
 
   async function handleDelete() {
     if (!deleteTarget) {
@@ -359,6 +406,15 @@ function ServersPage() {
                         <Button
                           variant="ghost"
                           size="icon-sm"
+                          onClick={() => setKnownHostsTarget(server)}
+                          aria-label={`Manage trusted host keys for ${server.name}`}
+                          title="Trusted host keys"
+                        >
+                          <FingerprintIcon className="size-3.5" aria-hidden="true" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
                           onClick={() => openEditDialog(server)}
                           aria-label={`Edit ${server.name}`}
                           title="Edit server"
@@ -414,6 +470,62 @@ function ServersPage() {
         onConfirm={() => void handleDelete()}
         pending={deletePending}
       />
+
+      {verificationTarget ? (
+        <HostKeyVerificationDialog
+          serverName={verificationTarget.server.name}
+          host={`${verificationTarget.server.host}:${verificationTarget.server.port}`}
+          hostKey={verificationTarget.hostKey}
+          pending={connectionBusy[verificationTarget.server.id] ?? false}
+          onTrust={() =>
+            void trustHostKey(
+              verificationTarget.server.id,
+              verificationTarget.hostKey.keyType,
+              verificationTarget.hostKey.fingerprint,
+            )
+          }
+          onReject={() =>
+            void rejectHostKey(
+              verificationTarget.server.id,
+              verificationTarget.hostKey.keyType,
+              verificationTarget.hostKey.fingerprint,
+            )
+          }
+        />
+      ) : null}
+
+      {!verificationTarget && changedKeyTarget ? (
+        <HostKeyChangedDialog
+          serverName={changedKeyTarget.server.name}
+          host={`${changedKeyTarget.server.host}:${changedKeyTarget.server.port}`}
+          hostKey={changedKeyTarget.hostKey}
+          onDismiss={() => {
+            setDismissedChangedKeys((current) => ({
+              ...current,
+              [changedKeyTarget.server.id]: changedKeyTarget.hostKey.fingerprint,
+            }));
+          }}
+          onManageKeys={() => {
+            setDismissedChangedKeys((current) => ({
+              ...current,
+              [changedKeyTarget.server.id]: changedKeyTarget.hostKey.fingerprint,
+            }));
+            setKnownHostsTarget(changedKeyTarget.server);
+          }}
+        />
+      ) : null}
+
+      {knownHostsTarget ? (
+        <KnownHostsDialog
+          key={knownHostsTarget.id}
+          server={knownHostsTarget}
+          onOpenChange={(open) => {
+            if (!open) {
+              setKnownHostsTarget(null);
+            }
+          }}
+        />
+      ) : null}
     </div>
   );
 }
