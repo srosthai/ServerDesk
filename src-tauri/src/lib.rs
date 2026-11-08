@@ -2,7 +2,13 @@ use std::sync::Arc;
 
 use tauri::Manager;
 
-use crate::core::credentials::{CredentialStore, OsCredentialStore};
+use crate::{
+    commands::connections::TauriConnectionEventSink,
+    core::{
+        credentials::{CredentialStore, OsCredentialStore},
+        ssh::{ConnectionManager, ConnectionTimeouts, RusshTransport},
+    },
+};
 
 pub mod commands;
 pub mod core;
@@ -10,7 +16,7 @@ pub mod storage;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let data_directory = app.path().app_data_dir()?;
@@ -19,8 +25,20 @@ pub fn run() {
             let database = storage::Database::open(data_directory.join("serverdesk.sqlite3"))?;
             app.manage(database);
             app.manage(Arc::new(OsCredentialStore) as Arc<dyn CredentialStore>);
+            app.manage(Arc::new(ConnectionManager::new(
+                Arc::new(RusshTransport::new()),
+                Arc::new(TauriConnectionEventSink::new(app.handle().clone())),
+                ConnectionTimeouts::default(),
+            )));
 
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. })
+                && let Some(manager) = window.app_handle().try_state::<Arc<ConnectionManager>>()
+            {
+                tauri::async_runtime::block_on(manager.disconnect_all());
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::system::get_app_info,
@@ -33,8 +51,19 @@ pub fn run() {
             commands::servers::delete_server,
             commands::credentials::create_credential,
             commands::credentials::store_credential,
-            commands::credentials::delete_credential
+            commands::credentials::delete_credential,
+            commands::connections::connect_server,
+            commands::connections::disconnect_server,
+            commands::connections::get_connection_state
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running ServerDesk");
+        .build(tauri::generate_context!())
+        .expect("error while building ServerDesk");
+
+    app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::Exit)
+            && let Some(manager) = app_handle.try_state::<Arc<ConnectionManager>>()
+        {
+            tauri::async_runtime::block_on(manager.disconnect_all());
+        }
+    });
 }
