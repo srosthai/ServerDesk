@@ -1,8 +1,16 @@
 import { create } from "zustand";
-import { getCommandErrorMessage } from "@/lib/errors";
+import { getCommandErrorDetails, getCommandErrorMessage } from "@/lib/errors";
 import { isTauriRuntime } from "@/lib/tauri";
-import { getSystemdServices as getSystemdServicesService } from "@/services/services";
-import type { ServiceDiscovery } from "@/types/contracts";
+import {
+  getSystemdServices as getSystemdServicesService,
+  runServiceAction as runServiceActionService,
+} from "@/services/services";
+import type {
+  ServiceActionName,
+  ServiceActionResult,
+  ServiceDiscovery,
+  ServiceStatus,
+} from "@/types/contracts";
 
 export type ServiceDiscoveryEntry = {
   discovery: ServiceDiscovery | null;
@@ -11,9 +19,20 @@ export type ServiceDiscoveryEntry = {
   lastAttemptAt: number | null;
 };
 
+export type ServiceActionEntry = {
+  pending: ServiceActionName | null;
+  pendingUnit: string | null;
+  result: ServiceActionResult | null;
+  error: string | null;
+  errorDetails: string | null;
+};
+
 type ServiceStore = {
   entries: Record<string, ServiceDiscoveryEntry>;
+  actions: Record<string, ServiceActionEntry>;
   refresh: (serverId: string) => Promise<boolean>;
+  runAction: (serverId: string, unit: string, action: ServiceActionName) => Promise<boolean>;
+  clearActionResult: (serverId: string) => void;
   clearServer: (serverId: string) => void;
   clearError: (serverId: string) => void;
 };
@@ -27,12 +46,62 @@ function emptyEntry(): ServiceDiscoveryEntry {
   };
 }
 
+function emptyActionEntry(): ServiceActionEntry {
+  return {
+    pending: null,
+    pendingUnit: null,
+    result: null,
+    error: null,
+    errorDetails: null,
+  };
+}
+
+function applyVerifiedStatus(
+  discovery: ServiceDiscovery | null,
+  status: ServiceStatus,
+): ServiceDiscovery | null {
+  if (!discovery || discovery.status !== "available") {
+    return discovery;
+  }
+
+  const updatedUnit = {
+    name: status.unit,
+    state: status.state,
+    activeState: status.activeState,
+    subState: status.subState,
+    loadState: status.loadState,
+    description: status.description,
+  };
+  let found = false;
+  const services = discovery.services.map((service) => {
+    if (service.name !== status.unit) {
+      return service;
+    }
+    found = true;
+    return updatedUnit;
+  });
+
+  if (!found) {
+    services.push(updatedUnit);
+  }
+
+  return {
+    ...discovery,
+    services,
+    sampledAt: status.sampledAt,
+    durationMs: status.durationMs,
+  };
+}
+
 export const useServiceStore = create<ServiceStore>((set) => {
   let requestCounter = 0;
   const requestIds: Record<string, number> = {};
+  let actionCounter = 0;
+  const actionIds: Record<string, number> = {};
 
   return {
     entries: {},
+    actions: {},
 
     refresh: async (serverId) => {
       if (!isTauriRuntime()) {
@@ -95,12 +164,111 @@ export const useServiceStore = create<ServiceStore>((set) => {
       }
     },
 
+    runAction: async (serverId, unit, action) => {
+      if (!isTauriRuntime()) {
+        return false;
+      }
+
+      const requestId = ++actionCounter;
+      actionIds[serverId] = requestId;
+      set((state) => {
+        const current = state.actions[serverId] ?? emptyActionEntry();
+        return {
+          actions: {
+            ...state.actions,
+            [serverId]: {
+              ...current,
+              pending: action,
+              pendingUnit: unit,
+              result: null,
+              error: null,
+              errorDetails: null,
+            },
+          },
+        };
+      });
+
+      try {
+        const result = await runServiceActionService(serverId, unit, action);
+        if (actionIds[serverId] !== requestId) {
+          return false;
+        }
+
+        set((state) => {
+          const current = state.actions[serverId] ?? emptyActionEntry();
+          const discoveryEntry = state.entries[serverId];
+          const discovery = result.verifiedStatus
+            ? applyVerifiedStatus(discoveryEntry?.discovery ?? null, result.verifiedStatus)
+            : (discoveryEntry?.discovery ?? null);
+
+          return {
+            actions: {
+              ...state.actions,
+              [serverId]: {
+                ...current,
+                pending: null,
+                pendingUnit: null,
+                result,
+                error: null,
+                errorDetails: null,
+              },
+            },
+            entries: discoveryEntry
+              ? {
+                  ...state.entries,
+                  [serverId]: {
+                    ...discoveryEntry,
+                    discovery,
+                    lastAttemptAt: result.verifiedStatus
+                      ? Date.now()
+                      : discoveryEntry.lastAttemptAt,
+                  },
+                }
+              : state.entries,
+          };
+        });
+
+        return result.succeeded;
+      } catch (error) {
+        const message = getCommandErrorMessage(error);
+        if (actionIds[serverId] === requestId) {
+          set((state) => {
+            const current = state.actions[serverId] ?? emptyActionEntry();
+            return {
+              actions: {
+                ...state.actions,
+                [serverId]: {
+                  ...current,
+                  pending: null,
+                  pendingUnit: null,
+                  result: null,
+                  error: message,
+                  errorDetails: getCommandErrorDetails(error),
+                },
+              },
+            };
+          });
+        }
+        return false;
+      }
+    },
+
+    clearActionResult: (serverId) =>
+      set((state) => {
+        const actions = { ...state.actions };
+        delete actions[serverId];
+        return { actions };
+      }),
+
     clearServer: (serverId) => {
       requestIds[serverId] = ++requestCounter;
+      actionIds[serverId] = ++actionCounter;
       set((state) => {
         const entries = { ...state.entries };
+        const actions = { ...state.actions };
         delete entries[serverId];
-        return { entries };
+        delete actions[serverId];
+        return { entries, actions };
       });
     },
 

@@ -184,6 +184,40 @@ export type ServiceDiscovery = {
   connectionState: ConnectionState;
 };
 
+export type ServiceActionName = "status" | "start" | "stop" | "restart";
+
+export type ServiceStatus = {
+  serverId: string;
+  unit: string;
+  state: ServiceState;
+  activeState: string;
+  subState: string | null;
+  loadState: string | null;
+  unitFileState: string | null;
+  description: string | null;
+  sampledAt: number;
+  durationMs: number;
+};
+
+export type ServiceActionResult = {
+  serverId: string;
+  unit: string;
+  action: ServiceActionName;
+  command: string;
+  succeeded: boolean;
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  durationMs: number;
+  permissionDenied: boolean;
+  sudoGuidance: string | null;
+  verifiedStatus: ServiceStatus | null;
+  stateVerified: boolean | null;
+  verificationError: string | null;
+  error: CommandError | null;
+  connectionState: ConnectionState;
+};
+
 export type ServerProfile = {
   id: string;
   name: string;
