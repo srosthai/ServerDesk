@@ -10,7 +10,9 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/ui/empty-state";
+import { OutputPanel } from "@/components/ui/output-panel";
 import { PageHeader } from "@/components/ui/page-header";
 import {
   Select,
@@ -33,8 +35,18 @@ import { isTauriRuntime } from "@/lib/tauri";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useServerStore } from "@/stores/serverStore";
-import { useServiceStore, type ServiceDiscoveryEntry } from "@/stores/serviceStore";
-import type { ServerProfile, ServiceDiscovery, ServiceState } from "@/types/contracts";
+import {
+  useServiceStore,
+  type ServiceActionEntry,
+  type ServiceDiscoveryEntry,
+} from "@/stores/serviceStore";
+import type {
+  ServerProfile,
+  ServiceActionName,
+  ServiceActionResult,
+  ServiceDiscovery,
+  ServiceState,
+} from "@/types/contracts";
 
 type ServiceStateBadge = {
   label: string;
@@ -177,8 +189,26 @@ function ServicesToolbar({
   );
 }
 
-function ServiceList({ discovery }: { discovery: ServiceDiscovery }) {
+const serviceActionLabels: Record<ServiceActionName, string> = {
+  status: "Status",
+  start: "Start",
+  stop: "Stop",
+  restart: "Restart",
+};
+
+function ServiceList({
+  discovery,
+  actionEntry,
+  connected,
+  onAction,
+}: {
+  discovery: ServiceDiscovery;
+  actionEntry: ServiceActionEntry | undefined;
+  connected: boolean;
+  onAction: (unit: string, action: ServiceActionName) => void;
+}) {
   const counts = stateCounts(discovery);
+  const pending = Boolean(actionEntry?.pending);
 
   if (discovery.services.length === 0) {
     return (
@@ -221,6 +251,7 @@ function ServiceList({ discovery }: { discovery: ServiceDiscovery }) {
             <TableHead>Active / sub</TableHead>
             <TableHead>Load</TableHead>
             <TableHead>Description</TableHead>
+            <TableHead>Actions</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -242,6 +273,30 @@ function ServiceList({ discovery }: { discovery: ServiceDiscovery }) {
               <TableCell className="max-w-[48ch] text-[12px] text-muted-foreground">
                 {service.description ?? "No description reported"}
               </TableCell>
+              <TableCell>
+                <div className="flex flex-wrap gap-1">
+                  {(["status", "start", "stop", "restart"] as const).map((action) => {
+                    const actionPending =
+                      actionEntry?.pending === action && actionEntry.pendingUnit === service.name;
+                    return (
+                      <Button
+                        key={action}
+                        variant={action === "status" ? "ghost" : "secondary"}
+                        size="sm"
+                        className="h-7 px-2 text-[11px]"
+                        aria-label={`${serviceActionLabels[action]} ${service.name}`}
+                        disabled={pending || !connected}
+                        onClick={() => onAction(service.name, action)}
+                      >
+                        {actionPending ? (
+                          <CircleNotchIcon className="size-3 animate-spin" aria-hidden="true" />
+                        ) : null}
+                        {serviceActionLabels[action]}
+                      </Button>
+                    );
+                  })}
+                </div>
+              </TableCell>
             </TableRow>
           ))}
         </TableBody>
@@ -255,7 +310,163 @@ function ServiceList({ discovery }: { discovery: ServiceDiscovery }) {
           </time>{" "}
           in {discovery.durationMs} ms.
         </span>
-        <span>Read-only discovery. Start, stop, and restart actions are not enabled yet.</span>
+        <span>Every action re-queries the unit; only the verified state is shown.</span>
+      </div>
+    </section>
+  );
+}
+
+function ServiceActionResultPanel({
+  result,
+  onDismiss,
+}: {
+  result: ServiceActionResult;
+  onDismiss: () => void;
+}) {
+  const verified = result.verifiedStatus;
+  const verifiedBadge = verified ? serviceStateBadges[verified.state] : null;
+  const actionLabel = serviceActionLabels[result.action];
+  const verifiedSuccess = result.succeeded && result.stateVerified === true;
+  const verificationMismatch = result.succeeded && result.stateVerified === false;
+
+  return (
+    <section
+      aria-label="Service action result"
+      className="rounded-md border border-border bg-card px-3 py-3"
+    >
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-[13px] font-semibold text-foreground">
+            {actionLabel} {result.unit}
+          </h2>
+          <p className="mt-0.5 font-mono text-[10px] text-muted-foreground">{result.command}</p>
+        </div>
+        <Button variant="ghost" size="sm" onClick={onDismiss}>
+          Dismiss
+        </Button>
+      </div>
+
+      <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 rounded-md border border-border bg-muted/35 px-3 py-2.5 text-[11px] sm:grid-cols-4">
+        <div>
+          <dt className="text-muted-foreground">Action exit</dt>
+          <dd className="font-mono text-foreground">
+            {result.exitCode === null ? "No exit status" : `Exit code ${result.exitCode}`}
+          </dd>
+        </div>
+        <div>
+          <dt className="text-muted-foreground">Duration</dt>
+          <dd className="font-mono text-foreground">{result.durationMs} ms</dd>
+        </div>
+        <div>
+          <dt className="text-muted-foreground">Verified state</dt>
+          <dd>
+            {verified && verifiedBadge ? (
+              <Badge variant={verifiedBadge.variant}>{verifiedBadge.label}</Badge>
+            ) : (
+              <Badge variant="warning">Unverified</Badge>
+            )}
+          </dd>
+        </div>
+        <div>
+          <dt className="text-muted-foreground">Verification</dt>
+          <dd className="text-foreground">
+            {result.stateVerified === true
+              ? "Matches the requested state"
+              : result.stateVerified === false
+                ? "Does not match the requested state"
+                : verified
+                  ? "State re-queried"
+                  : "Not verified"}
+          </dd>
+        </div>
+      </dl>
+
+      {result.error ? (
+        <Alert variant="destructive" className="mt-3">
+          <WarningCircleIcon
+            className="mt-0.5 size-4 shrink-0 text-destructive"
+            aria-hidden="true"
+          />
+          <div>
+            <AlertTitle>
+              {result.permissionDenied ? "Sudo permission denied" : "Service action failed"}
+            </AlertTitle>
+            <AlertDescription>{result.error.message}</AlertDescription>
+          </div>
+        </Alert>
+      ) : null}
+
+      {result.permissionDenied && result.sudoGuidance ? (
+        <OutputPanel
+          title="Required scoped sudo rule"
+          content={result.sudoGuidance}
+          className="mt-3"
+          maxHeightClassName="max-h-52"
+        />
+      ) : null}
+
+      {verifiedSuccess ? (
+        <Alert variant="success" className="mt-3">
+          <InfoIcon className="mt-0.5 size-4 shrink-0 text-success" aria-hidden="true" />
+          <div>
+            <AlertTitle>Verified state after the action</AlertTitle>
+            <AlertDescription>
+              systemd reports {result.unit} as {verified?.state}. This is the state the UI keeps
+              showing.
+            </AlertDescription>
+          </div>
+        </Alert>
+      ) : null}
+
+      {verificationMismatch ? (
+        <Alert variant="warning" className="mt-3">
+          <WarningCircleIcon className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden="true" />
+          <div>
+            <AlertTitle>Verified state differs from the request</AlertTitle>
+            <AlertDescription>
+              The command exited successfully, but systemd reports {result.unit} as{" "}
+              {verified?.state ?? "unknown"}. No optimistic success is shown.
+            </AlertDescription>
+          </div>
+        </Alert>
+      ) : null}
+
+      {result.succeeded && !verified ? (
+        <Alert variant="warning" className="mt-3">
+          <WarningCircleIcon className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden="true" />
+          <div>
+            <AlertTitle>Action could not be verified</AlertTitle>
+            <AlertDescription>
+              The command exited successfully, but the follow-up status query did not return a
+              verified state. Treat this as unconfirmed.
+            </AlertDescription>
+          </div>
+        </Alert>
+      ) : null}
+
+      {result.verificationError ? (
+        <Alert variant="warning" className="mt-3">
+          <WarningCircleIcon className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden="true" />
+          <div>
+            <AlertTitle>Verification query failed</AlertTitle>
+            <AlertDescription>{result.verificationError}</AlertDescription>
+          </div>
+        </Alert>
+      ) : null}
+
+      <div className="mt-3 grid gap-2 lg:grid-cols-2">
+        <OutputPanel
+          title="stdout"
+          content={result.stdout}
+          emptyText="No stdout."
+          maxHeightClassName="max-h-48"
+        />
+        <OutputPanel
+          title="stderr"
+          content={result.stderr}
+          emptyText="No stderr."
+          maxHeightClassName="max-h-48"
+        />
       </div>
     </section>
   );
@@ -271,8 +482,14 @@ function ServicesPage() {
   const lastActiveServerId = usePreferencesStore((state) => state.preferences.lastActiveServerId);
   const refresh = useServiceStore((state) => state.refresh);
   const clearError = useServiceStore((state) => state.clearError);
+  const runAction = useServiceStore((state) => state.runAction);
+  const clearActionResult = useServiceStore((state) => state.clearActionResult);
 
   const [selectedId, setSelectedId] = useState<string | null>(lastActiveServerId);
+  const [pendingAction, setPendingAction] = useState<{
+    unit: string;
+    action: Exclude<ServiceActionName, "status">;
+  } | null>(null);
 
   const selected =
     servers.find((server) => server.id === selectedId) ??
@@ -283,7 +500,21 @@ function ServicesPage() {
   const connection = selected ? connections[selected.id] : undefined;
   const connected = connection?.state === "connected";
   const entry = useServiceStore((state) => (selected ? state.entries[selected.id] : undefined));
+  const actionEntry = useServiceStore((state) =>
+    selected ? state.actions[selected.id] : undefined,
+  );
   const discovery = entry?.discovery ?? null;
+
+  const requestAction = (unit: string, action: ServiceActionName) => {
+    if (!selectedServerId || !connected) {
+      return;
+    }
+    if (action === "status") {
+      void runAction(selectedServerId, unit, action);
+      return;
+    }
+    setPendingAction({ unit, action });
+  };
 
   useEffect(() => {
     if (status === "idle") {
@@ -416,7 +647,44 @@ function ServicesPage() {
 
           {entry?.pending && !discovery ? <LoadingState rows={5} /> : null}
 
-          {discovery?.status === "available" ? <ServiceList discovery={discovery} /> : null}
+          {discovery?.status === "available" ? (
+            <ServiceList
+              discovery={discovery}
+              actionEntry={actionEntry}
+              connected={connected}
+              onAction={requestAction}
+            />
+          ) : null}
+
+          {actionEntry?.error ? (
+            <Alert variant="destructive">
+              <WarningCircleIcon
+                className="mt-0.5 size-4 shrink-0 text-destructive"
+                aria-hidden="true"
+              />
+              <div className="flex-1">
+                <AlertTitle>Service action failed</AlertTitle>
+                <AlertDescription>
+                  <span className="block">{actionEntry.error}</span>
+                  {actionEntry.errorDetails ? (
+                    <span className="mt-1.5 block whitespace-pre-wrap font-mono text-[11px]">
+                      {actionEntry.errorDetails}
+                    </span>
+                  ) : null}
+                </AlertDescription>
+              </div>
+              <Button variant="ghost" size="sm" onClick={() => clearActionResult(selected.id)}>
+                Dismiss
+              </Button>
+            </Alert>
+          ) : null}
+
+          {actionEntry?.result ? (
+            <ServiceActionResultPanel
+              result={actionEntry.result}
+              onDismiss={() => clearActionResult(selected.id)}
+            />
+          ) : null}
 
           {!entry?.pending && !discovery && !entry?.error ? (
             <EmptyState
@@ -436,6 +704,42 @@ function ServicesPage() {
               }
             />
           ) : null}
+
+          <ConfirmDialog
+            open={pendingAction !== null}
+            onOpenChange={(open) => {
+              if (!open) {
+                setPendingAction(null);
+              }
+            }}
+            title={
+              pendingAction
+                ? `${serviceActionLabels[pendingAction.action]} ${pendingAction.unit}?`
+                : "Confirm service action"
+            }
+            description="ServerDesk will send the fixed action command, then immediately query the unit again. Only the state systemd reports is shown as verified."
+            confirmLabel={
+              pendingAction ? `${serviceActionLabels[pendingAction.action]} unit` : "Run action"
+            }
+            details={
+              pendingAction
+                ? [
+                    { label: "Server", value: `${selected.name} (${selected.host})` },
+                    { label: "Unit", value: pendingAction.unit },
+                    { label: "Action", value: pendingAction.action },
+                  ]
+                : undefined
+            }
+            pending={Boolean(actionEntry?.pending)}
+            onConfirm={() => {
+              if (!pendingAction || !selectedServerId) {
+                return;
+              }
+              const { unit, action } = pendingAction;
+              void runAction(selectedServerId, unit, action);
+              setPendingAction(null);
+            }}
+          />
         </>
       ) : null}
 
