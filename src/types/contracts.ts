@@ -160,6 +160,30 @@ export type MonitoringSnapshot = {
   network: MetricGroup<NetworkInterfaceMetrics[]>;
 };
 
+export type ServiceState = "active" | "inactive" | "failed" | "unknown";
+
+export type ServiceDiscoveryStatus = "available" | "unsupported" | "unavailable";
+
+export type ServiceUnit = {
+  name: string;
+  state: ServiceState;
+  activeState: string;
+  subState: string | null;
+  loadState: string | null;
+  description: string | null;
+};
+
+export type ServiceDiscovery = {
+  serverId: string;
+  status: ServiceDiscoveryStatus;
+  services: ServiceUnit[];
+  detail: string | null;
+  truncated: boolean;
+  sampledAt: number;
+  durationMs: number;
+  connectionState: ConnectionState;
+};
+
 export type ServerProfile = {
   id: string;
   name: string;

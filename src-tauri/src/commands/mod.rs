@@ -6,4 +6,5 @@ pub mod monitoring;
 pub mod preferences;
 pub mod remote;
 pub mod servers;
+pub mod services;
 pub mod system;
