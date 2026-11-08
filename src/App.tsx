@@ -1,7 +1,12 @@
-import { StyleGuidePage } from "@/features/style-guide/StyleGuidePage";
+import { HashRouter } from "react-router-dom";
+import { AppRoutes } from "@/app/AppRoutes";
 
 function App() {
-  return <StyleGuidePage />;
+  return (
+    <HashRouter>
+      <AppRoutes />
+    </HashRouter>
+  );
 }
 
 export default App;
