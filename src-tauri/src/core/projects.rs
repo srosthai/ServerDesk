@@ -162,7 +162,7 @@ fn invalid_path_error(message: &str) -> AppError {
 /// The path validator has already rejected control characters. This function
 /// keeps spaces, quotes, and other printable characters usable without ever
 /// letting them escape the argument.
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 

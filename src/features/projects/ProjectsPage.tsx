@@ -10,6 +10,7 @@ import {
   FolderSimpleIcon,
   InfoIcon,
   MagnifyingGlassIcon,
+  PlayIcon,
   QuestionIcon,
   TerminalWindowIcon,
   WarningCircleIcon,
@@ -18,8 +19,10 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Input } from "@/components/ui/input";
+import { OutputPanel } from "@/components/ui/output-panel";
 import { PageHeader } from "@/components/ui/page-header";
 import {
   Select,
@@ -30,13 +33,26 @@ import {
 } from "@/components/ui/select";
 import { ErrorState, LoadingState } from "@/components/ui/states";
 import { StatusBadge } from "@/components/ui/status-badge";
+import {
+  ARTISAN_ACTIONS,
+  artisanActionConfig,
+  artisanCommand,
+  artisanTranscript,
+} from "@/features/projects/artisanActions";
 import { normalizeProjectPath } from "@/features/projects/projectPaths";
 import { isTauriRuntime } from "@/lib/tauri";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
-import { useProjectStore, type ProjectEntry } from "@/stores/projectStore";
+import {
+  projectActionKey,
+  useProjectStore,
+  type ProjectActionEntry,
+  type ProjectEntry,
+} from "@/stores/projectStore";
 import { useServerStore } from "@/stores/serverStore";
 import type {
+  ArtisanActionName,
+  ProjectArtisanRun,
   ProjectOperationStatus,
   ProjectRecord,
   ProjectScanResult,
@@ -87,7 +103,246 @@ function OperationStatusBadge({ status }: { status: ProjectOperationStatus }) {
   );
 }
 
-function ProjectCard({ project }: { project: ProjectRecord }) {
+function ArtisanResultPanel({ run, onDismiss }: { run: ProjectArtisanRun; onDismiss: () => void }) {
+  const result = run.result;
+  const config = artisanActionConfig[result.action];
+  const outcome = result.succeeded
+    ? { label: "Succeeded", variant: "success" as const }
+    : { label: "Failed", variant: "danger" as const };
+
+  return (
+    <section
+      aria-label={`${config.label} result`}
+      className="mt-2 rounded-md border border-border bg-muted/20 px-2.5 py-2.5"
+    >
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <h4 className="text-[12px] font-semibold text-foreground">{config.label} result</h4>
+            <Badge variant={outcome.variant}>
+              {result.succeeded ? (
+                <CheckCircleIcon className="size-3" aria-hidden="true" />
+              ) : (
+                <XCircleIcon className="size-3" aria-hidden="true" />
+              )}
+              {outcome.label}
+            </Badge>
+          </div>
+          <p className="mt-0.5 break-all font-mono text-[10px] text-muted-foreground">
+            {result.command}
+          </p>
+        </div>
+        <Button variant="ghost" size="sm" className="shrink-0" onClick={onDismiss}>
+          Dismiss
+        </Button>
+      </div>
+
+      <dl className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 rounded-sm border border-border bg-card px-2.5 py-2 text-[10px] sm:grid-cols-4">
+        <div>
+          <dt className="text-muted-foreground">Working directory</dt>
+          <dd className="break-all font-mono text-foreground">{result.targetPath}</dd>
+        </div>
+        <div>
+          <dt className="text-muted-foreground">Exit status</dt>
+          <dd className="font-mono text-foreground">
+            {result.exitCode === null ? "No exit status" : `Exit ${result.exitCode.toString()}`}
+          </dd>
+        </div>
+        <div>
+          <dt className="text-muted-foreground">Duration</dt>
+          <dd className="font-mono text-foreground">{result.durationMs} ms</dd>
+        </div>
+        <div>
+          <dt className="text-muted-foreground">Local history</dt>
+          <dd className="text-foreground">{run.historyRecorded ? "Recorded" : "Not recorded"}</dd>
+        </div>
+      </dl>
+
+      {!run.historyRecorded ? (
+        <Alert variant="warning" className="mt-2 py-2">
+          <WarningCircleIcon className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden="true" />
+          <div>
+            <AlertTitle>Action ran but history was not saved</AlertTitle>
+            <AlertDescription>
+              {run.historyError ?? "The local operation history could not be updated."}
+            </AlertDescription>
+          </div>
+        </Alert>
+      ) : null}
+
+      {result.secretsRedacted ? (
+        <Alert variant="info" className="mt-2 py-2">
+          <InfoIcon className="mt-0.5 size-4 shrink-0 text-info" aria-hidden="true" />
+          <div>
+            <AlertTitle>Secret-like output was redacted</AlertTitle>
+            <AlertDescription>
+              ServerDesk replaced environment-style lines, secret assignments, tokens, or
+              private-key blocks before showing or storing this output.
+            </AlertDescription>
+          </div>
+        </Alert>
+      ) : null}
+
+      {result.outputTruncated ? (
+        <Alert variant="warning" className="mt-2 py-2">
+          <WarningCircleIcon className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden="true" />
+          <div>
+            <AlertTitle>Output was shortened</AlertTitle>
+            <AlertDescription>
+              Only the bounded portion of stdout or stderr is shown. The exact exit status above is
+              still the command result.
+            </AlertDescription>
+          </div>
+        </Alert>
+      ) : null}
+
+      <OutputPanel
+        title="Command output"
+        content={artisanTranscript(result)}
+        meta={
+          result.exitCode === null
+            ? "no exit status"
+            : `exit ${result.exitCode.toString()} · ${result.durationMs.toString()} ms`
+        }
+        className="mt-2"
+        maxHeightClassName="max-h-64"
+      />
+    </section>
+  );
+}
+
+function ArtisanActionsSection({
+  project,
+  connected,
+  actionEntry,
+  onRequestAction,
+  onDismissResult,
+}: {
+  project: ProjectRecord;
+  connected: boolean;
+  actionEntry: ProjectActionEntry | undefined;
+  onRequestAction: (action: ArtisanActionName) => void;
+  onDismissResult: () => void;
+}) {
+  const pending = actionEntry?.pending ?? null;
+
+  return (
+    <section
+      aria-label={`Artisan actions for ${project.name}`}
+      className="border-t border-border px-3.5 py-3"
+    >
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="flex items-center gap-1.5">
+            <TerminalWindowIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
+            <h3 className="text-[12px] font-semibold text-foreground">Artisan actions</h3>
+          </div>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Fixed commands only. Every action runs with{" "}
+            <span className="break-all font-mono text-foreground">{project.remotePath}</span> as its
+            working directory. ServerDesk never accepts custom command text.
+          </p>
+        </div>
+        <Badge variant="outline">{ARTISAN_ACTIONS.length} fixed actions</Badge>
+      </div>
+
+      {!connected ? (
+        <p className="mt-2 text-[11px] text-warning">
+          Connect this server to run Artisan actions. Saved project data stays visible offline.
+        </p>
+      ) : null}
+
+      <div className="mt-2 grid gap-1.5 xl:grid-cols-2">
+        {ARTISAN_ACTIONS.map((config) => {
+          const actionPending = pending === config.action;
+          return (
+            <div
+              key={config.action}
+              className="rounded-sm border border-border bg-card px-2.5 py-2"
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[12px] font-medium text-foreground">{config.label}</span>
+                    {config.destructive ? (
+                      <Badge variant="warning">Confirm</Badge>
+                    ) : (
+                      <Badge variant="outline">Read-only</Badge>
+                    )}
+                  </div>
+                  <p className="mt-0.5 text-[11px] leading-4 text-muted-foreground">
+                    {config.description}
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  variant={config.destructive ? "secondary" : "default"}
+                  size="sm"
+                  className="h-7 shrink-0 gap-1 px-2 text-[11px]"
+                  aria-label={`Run ${config.label}`}
+                  title={`${config.label} in ${project.remotePath}`}
+                  disabled={!connected || Boolean(pending)}
+                  onClick={() => onRequestAction(config.action)}
+                >
+                  {actionPending ? (
+                    <CircleNotchIcon className="size-3 animate-spin" aria-hidden="true" />
+                  ) : (
+                    <PlayIcon className="size-3" aria-hidden="true" />
+                  )}
+                  {actionPending ? "Running..." : config.destructive ? "Review" : "Run"}
+                </Button>
+              </div>
+              <code className="mt-1.5 block break-all rounded-sm bg-muted/45 px-2 py-1 font-mono text-[10px] text-muted-foreground">
+                {artisanCommand(project.remotePath, config.action)}
+              </code>
+            </div>
+          );
+        })}
+      </div>
+
+      {actionEntry?.error ? (
+        <Alert variant="destructive" className="mt-2">
+          <WarningCircleIcon
+            className="mt-0.5 size-4 shrink-0 text-destructive"
+            aria-hidden="true"
+          />
+          <div className="flex-1">
+            <AlertTitle>Artisan action could not run</AlertTitle>
+            <AlertDescription>
+              <span className="block">{actionEntry.error}</span>
+              {actionEntry.errorDetails ? (
+                <span className="mt-1 block whitespace-pre-wrap font-mono text-[10px]">
+                  {actionEntry.errorDetails}
+                </span>
+              ) : null}
+            </AlertDescription>
+          </div>
+          <Button variant="ghost" size="sm" onClick={onDismissResult}>
+            Dismiss
+          </Button>
+        </Alert>
+      ) : null}
+
+      {actionEntry?.run ? (
+        <ArtisanResultPanel run={actionEntry.run} onDismiss={onDismissResult} />
+      ) : null}
+    </section>
+  );
+}
+
+function ProjectCard({
+  project,
+  connected,
+  actionEntry,
+  onRequestAction,
+  onDismissResult,
+}: {
+  project: ProjectRecord;
+  connected: boolean;
+  actionEntry: ProjectActionEntry | undefined;
+  onRequestAction: (action: ArtisanActionName) => void;
+  onDismissResult: () => void;
+}) {
   const terminalPath = remoteLink("/terminal", project, project.remotePath);
   const logPath = remoteLink("/logs", project, project.logPath);
 
@@ -203,6 +458,14 @@ function ProjectCard({ project }: { project: ProjectRecord }) {
           </ul>
         )}
       </div>
+
+      <ArtisanActionsSection
+        project={project}
+        connected={connected}
+        actionEntry={actionEntry}
+        onRequestAction={onRequestAction}
+        onDismissResult={onDismissResult}
+      />
 
       <div className="flex flex-wrap items-end justify-between gap-3 border-t border-border bg-muted/20 px-3.5 py-3">
         <div className="min-w-0">
@@ -514,6 +777,9 @@ function ProjectsPage() {
   const fetchProjects = useProjectStore((state) => state.fetchProjects);
   const browse = useProjectStore((state) => state.browse);
   const scan = useProjectStore((state) => state.scan);
+  const runAction = useProjectStore((state) => state.runAction);
+  const actions = useProjectStore((state) => state.actions);
+  const clearActionResult = useProjectStore((state) => state.clearActionResult);
   const clearScan = useProjectStore((state) => state.clearScan);
   const clearBrowse = useProjectStore((state) => state.clearBrowse);
   const clearError = useProjectStore((state) => state.clearError);
@@ -522,6 +788,10 @@ function ProjectsPage() {
   const [pathInput, setPathInput] = useState(DEFAULT_REMOTE_PATH);
   const [pathError, setPathError] = useState<string | null>(null);
   const [scanTarget, setScanTarget] = useState<"directory" | "children" | null>(null);
+  const [pendingAction, setPendingAction] = useState<{
+    project: ProjectRecord;
+    action: ArtisanActionName;
+  } | null>(null);
 
   const selected =
     servers.find((server) => server.id === selectedId) ??
@@ -557,6 +827,19 @@ function ProjectsPage() {
     setPathInput(DEFAULT_REMOTE_PATH);
     setPathError(null);
     setScanTarget(null);
+    setPendingAction(null);
+  }
+
+  function requestAction(project: ProjectRecord, action: ArtisanActionName) {
+    if (!connected) {
+      return;
+    }
+    if (artisanActionConfig[action].destructive) {
+      setPendingAction({ project, action });
+      return;
+    }
+
+    void runAction(project.serverId, project.id, action, false);
   }
 
   function validatePath(): string | null {
@@ -773,9 +1056,74 @@ function ProjectsPage() {
             ) : null}
 
             {projects.map((project) => (
-              <ProjectCard key={project.id} project={project} />
+              <ProjectCard
+                key={project.id}
+                project={project}
+                connected={connected}
+                actionEntry={actions[projectActionKey(project.serverId, project.id)]}
+                onRequestAction={(action) => requestAction(project, action)}
+                onDismissResult={() => clearActionResult(project.serverId, project.id)}
+              />
             ))}
           </section>
+
+          <ConfirmDialog
+            open={pendingAction !== null}
+            onOpenChange={(open) => {
+              if (!open) {
+                setPendingAction(null);
+              }
+            }}
+            title={
+              pendingAction
+                ? `${artisanActionConfig[pendingAction.action].label} on ${pendingAction.project.name}?`
+                : "Confirm Artisan action"
+            }
+            description={
+              pendingAction
+                ? (artisanActionConfig[pendingAction.action].confirmation ??
+                  "Review the target project path and exact command before running this action.")
+                : ""
+            }
+            confirmLabel="Run command"
+            details={
+              pendingAction
+                ? [
+                    {
+                      label: "Server",
+                      value: `${selected.name} (${selected.username}@${selected.host}:${selected.port})`,
+                    },
+                    { label: "Project", value: pendingAction.project.name },
+                    { label: "Target path", value: pendingAction.project.remotePath },
+                    {
+                      label: "Command",
+                      value: artisanCommand(pendingAction.project.remotePath, pendingAction.action),
+                    },
+                  ]
+                : undefined
+            }
+            pending={
+              pendingAction
+                ? Boolean(
+                    actions[
+                      projectActionKey(pendingAction.project.serverId, pendingAction.project.id)
+                    ]?.pending,
+                  )
+                : false
+            }
+            onConfirm={() => {
+              if (!pendingAction) {
+                return;
+              }
+              void runAction(
+                pendingAction.project.serverId,
+                pendingAction.project.id,
+                pendingAction.action,
+                true,
+              );
+              setPendingAction(null);
+            }}
+          />
         </>
       ) : null}
 
