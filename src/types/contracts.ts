@@ -61,6 +61,27 @@ export type ConnectionSnapshot = {
   hostKey?: HostKeyDetails;
 };
 
+export type TrustedHostKeyInput = {
+  keyType: string;
+  fingerprint: string;
+};
+
+export type ConnectionTestInput = {
+  serverId?: string | null;
+  host: string;
+  port: number;
+  username: string;
+  authType: AuthType;
+  credentialRef?: string | null;
+  secret?: string | null;
+  passphrase?: string | null;
+  acceptedHostKey?: TrustedHostKeyInput | null;
+};
+
+export type ConnectionTestOutcome =
+  | { status: "connected"; durationMs: number }
+  | { status: "hostKeyVerification"; hostKey: HostKeyDetails };
+
 export type ServerProfile = {
   id: string;
   name: string;
