@@ -432,6 +432,32 @@ impl ConnectionManager {
         server_id: &str,
         command: &str,
     ) -> Result<super::CommandOutput, AppError> {
+        self.execute_with_limit(server_id, command, None).await
+    }
+
+    /// Executes a fixed command and rejects output larger than `max_output_bytes`.
+    pub async fn execute_bounded(
+        &self,
+        server_id: &str,
+        command: &str,
+        max_output_bytes: usize,
+    ) -> Result<super::CommandOutput, AppError> {
+        if max_output_bytes == 0 {
+            return Err(AppError::validation(
+                "The command output limit must be greater than zero.",
+            ));
+        }
+
+        self.execute_with_limit(server_id, command, Some(max_output_bytes))
+            .await
+    }
+
+    async fn execute_with_limit(
+        &self,
+        server_id: &str,
+        command: &str,
+        max_output_bytes: Option<usize>,
+    ) -> Result<super::CommandOutput, AppError> {
         if command.trim().is_empty() {
             return Err(AppError::validation("Command cannot be empty."));
         }
@@ -445,7 +471,14 @@ impl ConnectionManager {
                 .ok_or_else(|| AppError::not_found("The server is not connected."))?
         };
 
-        match tokio::time::timeout(self.timeouts.command, session.execute(command)).await {
+        let execution = async {
+            match max_output_bytes {
+                Some(limit) => session.execute_bounded(command, limit).await,
+                None => session.execute(command).await,
+            }
+        };
+
+        match tokio::time::timeout(self.timeouts.command, execution).await {
             Err(_) => Err(AppError::timeout(format!(
                 "The remote command timed out after {} seconds.",
                 timeout_seconds(self.timeouts.command)
@@ -706,6 +739,11 @@ mod tests {
 
         fn with_command_delay(mut self, delay: Duration) -> Self {
             self.command_delay = delay;
+            self
+        }
+
+        fn with_command_output(mut self, output: CommandOutput) -> Self {
+            self.command_result = Ok(output);
             self
         }
 
@@ -1166,6 +1204,45 @@ mod tests {
             manager.connection_state("server-1").expect("state").state,
             ConnectionState::Connected
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn execute_bounded_rejects_oversized_output_without_dropping_session() {
+        let output = CommandOutput {
+            stdout: "x".repeat(64),
+            stderr: String::new(),
+            exit_code: Some(0),
+        };
+        let transport = Arc::new(MockTransport::success().with_command_output(output));
+        let events = Arc::new(RecordingSink::default());
+        let manager = Arc::new(ConnectionManager::new(
+            Arc::clone(&transport) as Arc<dyn SshTransport>,
+            Arc::clone(&events) as Arc<dyn ConnectionEventSink>,
+            test_timeouts(),
+        ));
+
+        manager.connect(request("server-1")).await.expect("connect");
+        let error = manager
+            .execute_bounded("server-1", "uname -srm", 16)
+            .await
+            .expect_err("oversized output must be rejected");
+        assert_eq!(error.code, crate::core::ErrorCode::Remote);
+        assert_eq!(
+            manager.connection_state("server-1").expect("state").state,
+            ConnectionState::Connected
+        );
+
+        let output = manager
+            .execute("server-1", "uname -srm")
+            .await
+            .expect("the session remains usable");
+        assert_eq!(output.stdout.len(), 64);
+
+        let error = manager
+            .execute_bounded("server-1", "uname -srm", 0)
+            .await
+            .expect_err("a zero output limit must be rejected");
+        assert_eq!(error.code, crate::core::ErrorCode::Validation);
     }
 
     #[tokio::test(start_paused = true)]
