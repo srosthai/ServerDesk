@@ -43,8 +43,12 @@ npm run typecheck
 npm run lint
 npm run format:check
 npm run build
+npm test
 cargo check --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml
 ```
+
+GitHub Actions runs the frontend and Rust checks on pushes and pull requests to `dev`, `production`, and `main`.
 
 ## Command contracts
 
