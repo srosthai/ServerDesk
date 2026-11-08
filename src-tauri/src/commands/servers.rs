@@ -1,7 +1,13 @@
+use std::sync::Arc;
+
 use tauri::State;
 
 use crate::{
-    core::{AppError, servers::ServerProfile, servers::ServerProfileInput},
+    core::{
+        AppError,
+        credentials::CredentialStore,
+        servers::{ServerProfile, ServerProfileInput},
+    },
     storage::Database,
 };
 
@@ -60,7 +66,18 @@ pub fn update_server(
 }
 
 #[tauri::command]
-pub fn delete_server(database: State<'_, Database>, id: String) -> Result<(), AppError> {
+pub fn delete_server(
+    database: State<'_, Database>,
+    credentials: State<'_, Arc<dyn CredentialStore>>,
+    id: String,
+) -> Result<(), AppError> {
+    if let Some(reference) = database
+        .get_server(&id)?
+        .and_then(|server| server.credential_ref)
+    {
+        credentials.delete_secret(&reference)?;
+    }
+
     database.delete_server(&id)?;
     Ok(())
 }
