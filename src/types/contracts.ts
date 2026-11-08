@@ -218,6 +218,62 @@ export type ServiceActionResult = {
   connectionState: ConnectionState;
 };
 
+export type ProjectType = "laravel";
+
+export type ProjectOperationStatus = "succeeded" | "failed" | "unknown";
+
+export type ProjectOperationSummary = {
+  id: string;
+  operation: string;
+  safeSummary: string;
+  status: ProjectOperationStatus;
+  exitCode: number | null;
+  startedAt: number;
+  durationMs: number;
+};
+
+export type ProjectRecord = {
+  id: string;
+  serverId: string;
+  name: string;
+  remotePath: string;
+  projectType: ProjectType;
+  laravelVersion: string | null;
+  phpVersion: string | null;
+  queueHint: string | null;
+  schedulerHint: string | null;
+  detectedAt: number;
+  logPath: string;
+  recentOperations: ProjectOperationSummary[];
+};
+
+export type RemoteDirectory = {
+  name: string;
+  path: string;
+};
+
+export type RemoteDirectoryListing = {
+  serverId: string;
+  path: string;
+  directories: RemoteDirectory[];
+  truncated: boolean;
+  sampledAt: number;
+  durationMs: number;
+  connectionState: ConnectionState;
+};
+
+export type ProjectScanResult = {
+  serverId: string;
+  path: string;
+  includeChildren: boolean;
+  scannedPaths: number;
+  rejectedPaths: number;
+  truncated: boolean;
+  projects: ProjectRecord[];
+  durationMs: number;
+  connectionState: ConnectionState;
+};
+
 export type ServerProfile = {
   id: string;
   name: string;

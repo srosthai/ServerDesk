@@ -78,6 +78,10 @@ pub struct Project {
     pub name: String,
     pub remote_path: String,
     pub project_type: String,
+    pub laravel_version: Option<String>,
+    pub php_version: Option<String>,
+    pub queue_hint: Option<String>,
+    pub scheduler_hint: Option<String>,
     pub detected_at: i64,
 }
 
@@ -87,6 +91,10 @@ pub struct NewProject {
     pub name: String,
     pub remote_path: String,
     pub project_type: String,
+    pub laravel_version: Option<String>,
+    pub php_version: Option<String>,
+    pub queue_hint: Option<String>,
+    pub scheduler_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
