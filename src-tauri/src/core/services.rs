@@ -8,10 +8,10 @@
 
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::core::{
-    AppError,
+    AppError, ErrorCode,
     ssh::{CommandOutput, ConnectionManager, ConnectionState},
 };
 
@@ -19,8 +19,29 @@ use crate::core::{
 pub const MAX_SERVICE_OUTPUT_BYTES: usize = 64 * 1024;
 const _: () = assert!(MAX_SERVICE_OUTPUT_BYTES <= 64 * 1024);
 
+/// Hard output bounds applied to service status and action commands.
+pub const MAX_SERVICE_STATUS_OUTPUT_BYTES: usize = 16 * 1024;
+pub const MAX_SERVICE_ACTION_OUTPUT_BYTES: usize = 64 * 1024;
+const _: () = assert!(MAX_SERVICE_STATUS_OUTPUT_BYTES <= 64 * 1024);
+const _: () = assert!(MAX_SERVICE_ACTION_OUTPUT_BYTES <= 64 * 1024);
+
 /// Hard command-duration bound applied on top of the connection timeout.
 pub const SERVICE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+pub const SERVICE_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+pub const SERVICE_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Fixed binaries used by every action command.
+///
+/// The action path always uses non-interactive sudo (`-n`). It never falls back
+/// to an interactive password prompt or to direct root execution.
+pub const SUDO_BINARY: &str = "/usr/bin/sudo";
+pub const SYSTEMCTL_BINARY: &str = "/usr/bin/systemctl";
+pub const SERVICE_STATUS_PROPERTIES: &str =
+    "Id,LoadState,ActiveState,SubState,UnitFileState,Description";
+/// Repeated `--property` flags avoid commas in the sudoers command arguments.
+pub const SERVICE_STATUS_PROPERTY_FLAGS: &str = "--property=Id --property=LoadState \
+                                                 --property=ActiveState --property=SubState \
+                                                 --property=UnitFileState --property=Description";
 
 /// The single fixed command sent during service discovery.
 ///
@@ -339,6 +360,596 @@ fn now_millis() -> i64 {
         .unwrap_or_default()
 }
 
+/// A validated systemd service unit name.
+///
+/// The type can only be built through [`validate_service_unit_name`], so every
+/// command template receives a value from a strict ASCII allowlist instead of
+/// an arbitrary string from the frontend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceUnitName(String);
+
+impl ServiceUnitName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Rejects unit names that could change the command being executed.
+///
+/// systemd unit names are restricted to a small ASCII allowlist for this MVP.
+/// Shell operators, whitespace, slashes, control characters, option-like names,
+/// and names that do not end in `.service` never reach an SSH command.
+pub fn validate_service_unit_name(value: &str) -> Result<ServiceUnitName, AppError> {
+    if value.is_empty() || value.chars().count() > MAX_UNIT_NAME_CHARS {
+        return Err(invalid_unit_name_error());
+    }
+
+    let Some(stem) = value.strip_suffix(".service") else {
+        return Err(invalid_unit_name_error());
+    };
+
+    if stem.is_empty()
+        || stem.starts_with('.')
+        || stem.starts_with('-')
+        || stem.ends_with('.')
+        || stem.contains("..")
+        || stem.chars().any(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, ':' | '_' | '.' | '@' | '-'))
+        })
+    {
+        return Err(invalid_unit_name_error());
+    }
+
+    Ok(ServiceUnitName(value.to_string()))
+}
+
+fn invalid_unit_name_error() -> AppError {
+    AppError::validation("The service unit name is not valid.").with_details(
+        "Unit names must end in .service and contain only ASCII letters, digits, ':', '_', \
+         '.', '@', or '-'. Whitespace, shell operators, slashes, control characters, and \
+         option-like names are rejected before any remote command is sent.",
+    )
+}
+
+/// The fixed service operations exposed by the typed action path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceAction {
+    Status,
+    Start,
+    Stop,
+    Restart,
+}
+
+impl ServiceAction {
+    pub const ALL: [Self; 4] = [Self::Status, Self::Start, Self::Stop, Self::Restart];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
+
+    pub const fn verb(self) -> &'static str {
+        match self {
+            Self::Status => "inspect",
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
+
+    /// The state a successful command should produce, if there is one.
+    ///
+    /// Status inspection has no expected state. The verified state is always
+    /// reported regardless of this expectation.
+    pub const fn expected_state(self) -> Option<ServiceState> {
+        match self {
+            Self::Status => None,
+            Self::Start | Self::Restart => Some(ServiceState::Active),
+            Self::Stop => Some(ServiceState::Inactive),
+        }
+    }
+
+    /// Builds the only command line used for this action and unit.
+    ///
+    /// The unit has already passed [`validate_service_unit_name`]. `--` is
+    /// passed to both sudo and systemctl so neither can interpret the unit name
+    /// as an option.
+    pub fn command(self, unit: &ServiceUnitName) -> String {
+        match self {
+            Self::Status => format!(
+                "{SUDO_BINARY} -n -- {SYSTEMCTL_BINARY} show --no-pager \
+                 {SERVICE_STATUS_PROPERTY_FLAGS} -- {}",
+                unit.as_str()
+            ),
+            Self::Start | Self::Stop | Self::Restart => format!(
+                "{SUDO_BINARY} -n -- {SYSTEMCTL_BINARY} {} -- {}",
+                self.as_str(),
+                unit.as_str()
+            ),
+        }
+    }
+}
+
+/// A parsed, verified state for one unit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceStatus {
+    pub server_id: String,
+    pub unit: String,
+    pub state: ServiceState,
+    pub active_state: String,
+    pub sub_state: Option<String>,
+    pub load_state: Option<String>,
+    pub unit_file_state: Option<String>,
+    pub description: Option<String>,
+    pub sampled_at: i64,
+    pub duration_ms: u64,
+}
+
+/// The complete result of one fixed service action.
+///
+/// A non-zero action exit status is a structured, typed result rather than a
+/// transport error, so stdout, stderr, and the exit code stay visible. The
+/// state is re-queried after every action; `verified_status` is the only state
+/// the UI may present as verified.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceActionResult {
+    pub server_id: String,
+    pub unit: String,
+    pub action: ServiceAction,
+    pub command: String,
+    pub succeeded: bool,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<u32>,
+    pub duration_ms: u64,
+    pub permission_denied: bool,
+    pub sudo_guidance: Option<String>,
+    pub verified_status: Option<ServiceStatus>,
+    /// `None` when the action was status or the state could not be verified.
+    pub state_verified: Option<bool>,
+    pub verification_error: Option<String>,
+    pub error: Option<AppError>,
+    pub connection_state: ConnectionState,
+}
+
+struct StatusQuery {
+    output: CommandOutput,
+    duration_ms: u64,
+    status: Option<ServiceStatus>,
+    parse_error: Option<String>,
+    permission_denied: bool,
+}
+
+/// Inspects one unit through the fixed status command and waits for the result.
+pub async fn inspect_service_status(
+    manager: &ConnectionManager,
+    server_id: &str,
+    unit_name: &str,
+) -> Result<ServiceStatus, AppError> {
+    if server_id.trim().is_empty() {
+        return Err(AppError::validation("Server ID is required."));
+    }
+
+    let unit = validate_service_unit_name(unit_name)?;
+    let query = query_service_status(manager, server_id, &unit).await?;
+
+    match query.status {
+        Some(status) => Ok(status),
+        None => Err(status_error(&unit, &query)),
+    }
+}
+
+/// Executes one fixed service action and re-queries the unit afterwards.
+///
+/// Command-level failures (including sudo denial and systemctl errors) are
+/// returned as [`ServiceActionResult`] values so the caller can show the exact
+/// output and exit status. Transport, timeout, and validation failures are
+/// returned as [`AppError`]. No action ever reports success from the button
+/// click alone.
+pub async fn run_service_action(
+    manager: &ConnectionManager,
+    server_id: &str,
+    unit_name: &str,
+    action: ServiceAction,
+) -> Result<ServiceActionResult, AppError> {
+    if server_id.trim().is_empty() {
+        return Err(AppError::validation("Server ID is required."));
+    }
+
+    let unit = validate_service_unit_name(unit_name)?;
+
+    if action == ServiceAction::Status {
+        let query = query_service_status(manager, server_id, &unit).await?;
+        let connection_state = manager.connection_state(server_id)?.state;
+        let command = action.command(&unit);
+        let succeeded = query.output.exit_code == Some(0) && query.status.is_some();
+        let (error, permission_denied) = if succeeded {
+            (None, false)
+        } else {
+            let error = command_error(&action, &unit, &command, &query.output, query.duration_ms);
+            let permission_denied = error.code == ErrorCode::Permission;
+            (Some(error), permission_denied)
+        };
+        let sudo_guidance = permission_denied.then(|| sudo_guidance(&unit));
+
+        return Ok(ServiceActionResult {
+            server_id: server_id.to_string(),
+            unit: unit.as_str().to_string(),
+            action,
+            command,
+            succeeded,
+            stdout: query.output.stdout,
+            stderr: query.output.stderr,
+            exit_code: query.output.exit_code,
+            duration_ms: query.duration_ms,
+            permission_denied,
+            sudo_guidance,
+            verified_status: query.status,
+            state_verified: None,
+            verification_error: query.parse_error,
+            error,
+            connection_state,
+        });
+    }
+
+    let command = action.command(&unit);
+    let started = Instant::now();
+    let output = tokio::time::timeout(
+        SERVICE_ACTION_TIMEOUT,
+        manager.execute_bounded(server_id, &command, MAX_SERVICE_ACTION_OUTPUT_BYTES),
+    )
+    .await
+    .map_err(|_| {
+        AppError::timeout(format!(
+            "The {} action timed out after {} seconds.",
+            action.verb(),
+            SERVICE_ACTION_TIMEOUT.as_secs()
+        ))
+    })??;
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    let (verified_status, verification_error) =
+        match query_service_status(manager, server_id, &unit).await {
+            Ok(query) => (query.status, query.parse_error),
+            Err(error) => (None, Some(with_details(&error))),
+        };
+
+    let connection_state = manager.connection_state(server_id)?.state;
+    let action_succeeded = output.exit_code == Some(0);
+    let (error, permission_denied) = if action_succeeded {
+        (None, false)
+    } else {
+        let error = command_error(&action, &unit, &command, &output, duration_ms);
+        let permission_denied = error.code == ErrorCode::Permission;
+        (Some(error), permission_denied)
+    };
+    let sudo_guidance = permission_denied.then(|| sudo_guidance(&unit));
+    let state_verified = match (&verified_status, action.expected_state()) {
+        (Some(status), Some(expected)) => Some(status.state == expected),
+        _ => None,
+    };
+
+    Ok(ServiceActionResult {
+        server_id: server_id.to_string(),
+        unit: unit.as_str().to_string(),
+        action,
+        command,
+        succeeded: action_succeeded,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit_code: output.exit_code,
+        duration_ms,
+        permission_denied,
+        sudo_guidance,
+        verified_status,
+        state_verified,
+        verification_error,
+        error,
+        connection_state,
+    })
+}
+
+async fn query_service_status(
+    manager: &ConnectionManager,
+    server_id: &str,
+    unit: &ServiceUnitName,
+) -> Result<StatusQuery, AppError> {
+    let command = ServiceAction::Status.command(unit);
+    let started = Instant::now();
+    let output = tokio::time::timeout(
+        SERVICE_STATUS_TIMEOUT,
+        manager.execute_bounded(server_id, &command, MAX_SERVICE_STATUS_OUTPUT_BYTES),
+    )
+    .await
+    .map_err(|_| {
+        AppError::timeout(format!(
+            "The service status query timed out after {} seconds.",
+            SERVICE_STATUS_TIMEOUT.as_secs()
+        ))
+    })??;
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    if output.exit_code != Some(0) {
+        let permission_denied = is_permission_denied(&output);
+        return Ok(StatusQuery {
+            parse_error: Some(describe_failure(&output)),
+            output,
+            duration_ms,
+            status: None,
+            permission_denied,
+        });
+    }
+
+    match parse_service_status(server_id, unit, &output.stdout, duration_ms) {
+        Ok(status) => Ok(StatusQuery {
+            output,
+            duration_ms,
+            status: Some(status),
+            parse_error: None,
+            permission_denied: false,
+        }),
+        Err(message) => Ok(StatusQuery {
+            output,
+            duration_ms,
+            status: None,
+            parse_error: Some(message),
+            permission_denied: false,
+        }),
+    }
+}
+
+fn parse_service_status(
+    server_id: &str,
+    unit: &ServiceUnitName,
+    stdout: &str,
+    duration_ms: u64,
+) -> Result<ServiceStatus, String> {
+    let mut active_state = None;
+    let mut sub_state = None;
+    let mut load_state = None;
+    let mut unit_file_state = None;
+    let mut description = None;
+
+    for line in stdout.lines().take(MAX_PROCESSING_LINES) {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if value.chars().any(char::is_control) {
+            continue;
+        }
+
+        match key.trim() {
+            "ActiveState" => active_state = sanitize_status_value(value),
+            "SubState" => sub_state = sanitize_status_value(value),
+            "LoadState" => load_state = sanitize_status_value(value),
+            "UnitFileState" => unit_file_state = sanitize_status_value(value),
+            "Description" => description = bounded_description(value),
+            _ => {}
+        }
+    }
+
+    let Some(active_state) = active_state else {
+        return Err(format!(
+            "Systemd did not report ActiveState for {}.",
+            unit.as_str()
+        ));
+    };
+    let state = classify_state(&active_state);
+
+    Ok(ServiceStatus {
+        server_id: server_id.to_string(),
+        unit: unit.as_str().to_string(),
+        state,
+        active_state,
+        sub_state,
+        load_state,
+        unit_file_state,
+        description,
+        sampled_at: now_millis(),
+        duration_ms,
+    })
+}
+
+fn sanitize_status_value(value: &str) -> Option<String> {
+    let value = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_STATE_CHARS)
+        .collect::<String>();
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn status_error(unit: &ServiceUnitName, query: &StatusQuery) -> AppError {
+    let command = ServiceAction::Status.command(unit);
+    if query.permission_denied {
+        permission_denied_error(
+            ServiceAction::Status,
+            unit,
+            &command,
+            &query.output,
+            query.duration_ms,
+        )
+    } else {
+        AppError::remote(format!(
+            "Could not inspect {} {}.",
+            unit.as_str(),
+            exit_suffix(&query.output)
+        ))
+        .with_details(command_diagnostics(
+            &command,
+            &query.output,
+            query.duration_ms,
+        ))
+    }
+}
+
+fn command_error(
+    action: &ServiceAction,
+    unit: &ServiceUnitName,
+    command: &str,
+    output: &CommandOutput,
+    duration_ms: u64,
+) -> AppError {
+    if is_permission_denied(output) {
+        permission_denied_error(*action, unit, command, output, duration_ms)
+    } else {
+        AppError::remote(format!(
+            "Could not {} {} {}.",
+            action.verb(),
+            unit.as_str(),
+            exit_suffix(output)
+        ))
+        .with_details(command_diagnostics(command, output, duration_ms))
+    }
+}
+
+fn permission_denied_error(
+    action: ServiceAction,
+    unit: &ServiceUnitName,
+    command: &str,
+    output: &CommandOutput,
+    duration_ms: u64,
+) -> AppError {
+    AppError::permission(format!(
+        "The SSH account is not allowed to {} {}. Grant the dedicated non-root account the \
+         narrowly scoped passwordless sudo rule shown in the details; do not use unrestricted sudo.",
+        action.verb(),
+        unit.as_str()
+    ))
+    .with_details(format!(
+        "{}\n\nRemote diagnostics:\n{}",
+        sudo_guidance(unit),
+        command_diagnostics(command, output, duration_ms)
+    ))
+}
+
+/// Guidance for a narrowly scoped sudoers rule for exactly one unit.
+///
+/// The placeholder account name makes it clear that the rule belongs to the
+/// dedicated ServerDesk SSH account, not to an interactive administrator.
+pub fn sudo_guidance(unit: &ServiceUnitName) -> String {
+    format!(
+        "Create and validate a rule for the dedicated non-root ServerDesk SSH account (replace \
+         <serverdesk-ssh-user>):\n\
+         <serverdesk-ssh-user> ALL=(root) NOPASSWD: \
+         /usr/bin/systemctl show --no-pager {SERVICE_STATUS_PROPERTY_FLAGS} -- {unit}, \
+         /usr/bin/systemctl start -- {unit}, \
+         /usr/bin/systemctl stop -- {unit}, \
+         /usr/bin/systemctl restart -- {unit}\n\
+         Never grant ALL=(ALL) NOPASSWD: ALL or unrestricted sudo.",
+        unit = unit.as_str()
+    )
+}
+
+fn is_permission_denied(output: &CommandOutput) -> bool {
+    if output.exit_code == Some(0) {
+        return false;
+    }
+
+    let combined = format!(
+        "{}\n{}",
+        output.stderr.to_ascii_lowercase(),
+        output.stdout.to_ascii_lowercase()
+    );
+
+    [
+        "a password is required",
+        "a terminal is required",
+        "must have a tty",
+        "no tty present",
+        "not allowed to execute",
+        "not allowed to run sudo",
+        "not in the sudoers file",
+        "sudoers",
+        "permission denied",
+        "access denied",
+        "authentication is required",
+        "interactive authentication required",
+        "not authorized",
+        "polkit",
+        "command not allowed",
+    ]
+    .iter()
+    .any(|needle| combined.contains(needle))
+}
+
+fn describe_failure(output: &CommandOutput) -> String {
+    let stderr = output
+        .stderr
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| bounded_detail(line.trim()))
+        .unwrap_or_default();
+    let stdout = output
+        .stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| bounded_detail(line.trim()))
+        .unwrap_or_default();
+
+    match (stderr.is_empty(), stdout.is_empty()) {
+        (false, _) => format!("{} ({})", stderr, exit_suffix(output).trim_start()),
+        (true, false) => format!("{} ({})", stdout, exit_suffix(output).trim_start()),
+        (true, true) => format!("The remote command failed {}.", exit_suffix(output)),
+    }
+}
+
+fn exit_suffix(output: &CommandOutput) -> String {
+    match output.exit_code {
+        Some(code) => format!("(exit code {code})"),
+        None => "(no exit status)".to_string(),
+    }
+}
+
+fn command_diagnostics(command: &str, output: &CommandOutput, duration_ms: u64) -> String {
+    let stdout = bounded_diagnostic(&output.stdout);
+    let stderr = bounded_diagnostic(&output.stderr);
+    format!(
+        "Command: {command}\nExit code: {}\nDuration: {duration_ms} ms\n\nstdout:\n{}\n\nstderr:\n{}",
+        match output.exit_code {
+            Some(code) => code.to_string(),
+            None => "no exit status".to_string(),
+        },
+        if stdout.is_empty() {
+            "(empty)"
+        } else {
+            stdout.as_str()
+        },
+        if stderr.is_empty() {
+            "(empty)"
+        } else {
+            stderr.as_str()
+        }
+    )
+}
+
+fn bounded_diagnostic(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .take(MAX_DETAIL_CHARS * 16)
+        .collect()
+}
+
+fn with_details(error: &AppError) -> String {
+    match error.details.as_deref() {
+        Some(details) if !details.is_empty() => format!("{} {details}", error.message),
+        _ => error.message.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,5 +1265,307 @@ mod tests {
             );
         }
         assert!(SERVICE_DISCOVERY_TIMEOUT <= Duration::from_secs(10));
+    }
+
+    fn unit(name: &str) -> ServiceUnitName {
+        validate_service_unit_name(name).expect("valid fixture unit")
+    }
+
+    fn output(stdout: &str, stderr: &str, exit_code: Option<u32>) -> CommandOutput {
+        CommandOutput {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            exit_code,
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_unit_names_before_any_command_is_built() {
+        for invalid in [
+            "",
+            "nginx",
+            "nginx.socket",
+            "nginx.service ",
+            " nginx.service",
+            "nginx.service\n",
+            "nginx.service; id",
+            "nginx.service && reboot",
+            "nginx.service|cat",
+            "nginx.service$(id)",
+            "nginx.service`id`",
+            "nginx\".service",
+            "nginx'.service",
+            "../../etc/passwd.service",
+            "/usr/lib/systemd/system/nginx.service",
+            "-H.service",
+            ".hidden.service",
+            "nginx..service",
+            "nginx service.service",
+            "nginx.service\t",
+            "nïginx.service",
+            ".service",
+        ] {
+            assert!(
+                validate_service_unit_name(invalid).is_err(),
+                "{invalid:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_versioned_template_and_custom_unit_names() {
+        for valid in [
+            "nginx.service",
+            "php8.3-fpm.service",
+            "getty@tty1.service",
+            "user@1000.service",
+            "custom_worker:1.service",
+            "a.service",
+        ] {
+            assert_eq!(
+                validate_service_unit_name(valid).expect(valid).as_str(),
+                valid
+            );
+        }
+
+        let too_long = format!("{}.service", "x".repeat(MAX_UNIT_NAME_CHARS));
+        assert!(validate_service_unit_name(&too_long).is_err());
+    }
+
+    #[test]
+    fn action_commands_are_fixed_and_use_scoped_non_interactive_sudo() {
+        let nginx = unit("nginx.service");
+
+        assert_eq!(
+            ServiceAction::Status.command(&nginx),
+            "/usr/bin/sudo -n -- /usr/bin/systemctl show --no-pager \
+             --property=Id --property=LoadState --property=ActiveState --property=SubState \
+             --property=UnitFileState --property=Description -- nginx.service"
+        );
+        assert_eq!(
+            ServiceAction::Start.command(&nginx),
+            "/usr/bin/sudo -n -- /usr/bin/systemctl start -- nginx.service"
+        );
+        assert_eq!(
+            ServiceAction::Stop.command(&nginx),
+            "/usr/bin/sudo -n -- /usr/bin/systemctl stop -- nginx.service"
+        );
+        assert_eq!(
+            ServiceAction::Restart.command(&nginx),
+            "/usr/bin/sudo -n -- /usr/bin/systemctl restart -- nginx.service"
+        );
+
+        for action in ServiceAction::ALL {
+            let command = action.command(&nginx);
+            assert!(command.starts_with("/usr/bin/sudo -n -- /usr/bin/systemctl "));
+            assert!(command.contains(" -- nginx.service"));
+            for forbidden in [';', '|', '&', '$', '`', '>', '<', '\n', '*', '?', '(', ')'] {
+                assert!(
+                    !command.contains(forbidden),
+                    "{command:?} must not contain {forbidden:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn status_output_is_parsed_into_a_verified_state() {
+        let status = parse_service_status(
+            "server-1",
+            &unit("nginx.service"),
+            "Id=nginx.service\nLoadState=loaded\nActiveState=active\nSubState=running\n\
+             UnitFileState=enabled\nDescription=A high performance web server\n",
+            12,
+        )
+        .expect("parsed status");
+
+        assert_eq!(status.server_id, "server-1");
+        assert_eq!(status.unit, "nginx.service");
+        assert_eq!(status.state, ServiceState::Active);
+        assert_eq!(status.active_state, "active");
+        assert_eq!(status.sub_state.as_deref(), Some("running"));
+        assert_eq!(status.load_state.as_deref(), Some("loaded"));
+        assert_eq!(status.unit_file_state.as_deref(), Some("enabled"));
+        assert_eq!(
+            status.description.as_deref(),
+            Some("A high performance web server")
+        );
+        assert!(status.sampled_at > 0);
+
+        let missing = parse_service_status(
+            "server-1",
+            &unit("nginx.service"),
+            "LoadState=loaded\nSubState=running\n",
+            5,
+        )
+        .expect_err("ActiveState is required");
+        assert!(missing.contains("ActiveState"));
+
+        let unknown = parse_service_status(
+            "server-1",
+            &unit("nginx.service"),
+            "LoadState=loaded\nActiveState=activating\nSubState=start\n",
+            5,
+        )
+        .expect("unknown state is still parsed");
+        assert_eq!(unknown.state, ServiceState::Unknown);
+        assert_eq!(unknown.active_state, "activating");
+        assert_eq!(unknown.sub_state.as_deref(), Some("start"));
+    }
+
+    #[test]
+    fn permission_denial_maps_to_permission_error_with_sudo_guidance() {
+        let nginx = unit("nginx.service");
+        let command = ServiceAction::Restart.command(&nginx);
+        let denied = output(
+            "",
+            "sudo: a password is required\nsudo: no tty present and no askpass program specified\n",
+            Some(1),
+        );
+
+        assert!(is_permission_denied(&denied));
+        let error = command_error(&ServiceAction::Restart, &nginx, &command, &denied, 17);
+
+        assert_eq!(error.code, ErrorCode::Permission);
+        assert!(error.message.contains("narrowly scoped"));
+        assert!(error.message.contains("nginx.service"));
+        let details = error.details.expect("sudo guidance details");
+        assert!(details.contains("NOPASSWD"));
+        assert!(details.contains("/usr/bin/systemctl restart -- nginx.service"));
+        assert!(details.contains("/usr/bin/systemctl start -- nginx.service"));
+        assert!(details.contains("Never grant ALL=(ALL) NOPASSWD: ALL"));
+        assert!(details.contains("sudo: a password is required"));
+        assert!(details.contains("Exit code: 1"));
+        assert!(details.contains("Duration: 17 ms"));
+    }
+
+    #[test]
+    fn access_denied_and_success_are_classified_correctly() {
+        assert!(is_permission_denied(&output(
+            "",
+            "Failed to restart nginx.service: Access denied\n",
+            Some(1),
+        )));
+        assert!(is_permission_denied(&output(
+            "",
+            "Interactive authentication required.\n",
+            Some(1),
+        )));
+        assert!(!is_permission_denied(&output(
+            "",
+            "Job for nginx.service failed because the control process exited with error code.\n",
+            Some(1),
+        )));
+        assert!(!is_permission_denied(&output(
+            "",
+            "permission denied\n",
+            Some(0),
+        )));
+    }
+
+    #[test]
+    fn failed_action_keeps_output_exit_code_and_duration() {
+        let nginx = unit("nginx.service");
+        let command = ServiceAction::Start.command(&nginx);
+        let failed = output(
+            "starting\n",
+            "Job for nginx.service failed because the control process exited with error code.\n",
+            Some(5),
+        );
+
+        let error = command_error(&ServiceAction::Start, &nginx, &command, &failed, 33);
+        assert_eq!(error.code, ErrorCode::Remote);
+        assert!(error.message.contains("exit code 5"));
+        let details = error.details.expect("failure details");
+        assert!(
+            details
+                .contains("Command: /usr/bin/sudo -n -- /usr/bin/systemctl start -- nginx.service")
+        );
+        assert!(details.contains("stdout:\nstarting"));
+        assert!(details.contains("stderr:\nJob for nginx.service failed"));
+        assert!(details.contains("Exit code: 5"));
+        assert!(details.contains("Duration: 33 ms"));
+    }
+
+    #[test]
+    fn action_names_are_a_closed_typed_set() {
+        for (value, expected) in [
+            ("\"status\"", ServiceAction::Status),
+            ("\"start\"", ServiceAction::Start),
+            ("\"stop\"", ServiceAction::Stop),
+            ("\"restart\"", ServiceAction::Restart),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<ServiceAction>(value).expect("known action"),
+                expected
+            );
+        }
+
+        for invalid in [
+            "\"reload\"",
+            "\"start; id\"",
+            "\"rm -rf /\"",
+            "\"\"",
+            "null",
+        ] {
+            assert!(
+                serde_json::from_str::<ServiceAction>(invalid).is_err(),
+                "{invalid:?} must not deserialize into a service action"
+            );
+        }
+    }
+
+    #[test]
+    fn serializes_action_results_with_verified_state_and_nested_error() {
+        let nginx = unit("nginx.service");
+        let command = ServiceAction::Restart.command(&nginx);
+        let denied = output("", "sudo: a password is required\n", Some(1));
+        let error = command_error(&ServiceAction::Restart, &nginx, &command, &denied, 5);
+        let result = ServiceActionResult {
+            server_id: "server-1".to_string(),
+            unit: "nginx.service".to_string(),
+            action: ServiceAction::Restart,
+            command,
+            succeeded: false,
+            stdout: String::new(),
+            stderr: "sudo: a password is required\n".to_string(),
+            exit_code: Some(1),
+            duration_ms: 5,
+            permission_denied: true,
+            sudo_guidance: Some(sudo_guidance(&nginx)),
+            verified_status: Some(ServiceStatus {
+                server_id: "server-1".to_string(),
+                unit: "nginx.service".to_string(),
+                state: ServiceState::Inactive,
+                active_state: "inactive".to_string(),
+                sub_state: Some("dead".to_string()),
+                load_state: Some("loaded".to_string()),
+                unit_file_state: Some("enabled".to_string()),
+                description: Some("A high performance web server".to_string()),
+                sampled_at: 1_762_665_720_000,
+                duration_ms: 3,
+            }),
+            state_verified: Some(false),
+            verification_error: None,
+            error: Some(error),
+            connection_state: ConnectionState::Connected,
+        };
+        let value = serde_json::to_value(&result).expect("serialized action result");
+
+        assert_eq!(value["serverId"], "server-1");
+        assert_eq!(value["unit"], "nginx.service");
+        assert_eq!(value["action"], "restart");
+        assert_eq!(value["succeeded"], false);
+        assert_eq!(value["permissionDenied"], true);
+        assert_eq!(value["exitCode"], 1);
+        assert_eq!(value["stateVerified"], false);
+        assert_eq!(value["verifiedStatus"]["state"], "inactive");
+        assert_eq!(value["error"]["code"], "permission");
+        assert!(
+            value["sudoGuidance"]
+                .as_str()
+                .expect("guidance")
+                .contains("NOPASSWD")
+        );
     }
 }

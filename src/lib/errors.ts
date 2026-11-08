@@ -24,3 +24,12 @@ export function getCommandErrorMessage(error: unknown): string {
 
   return "The operation failed.";
 }
+
+export function getCommandErrorDetails(error: unknown): string | null {
+  if (!isCommandError(error) || typeof error.details !== "string") {
+    return null;
+  }
+
+  const details = error.details.trim();
+  return details.length > 0 ? details : null;
+}

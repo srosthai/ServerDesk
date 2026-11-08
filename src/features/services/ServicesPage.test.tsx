@@ -1,16 +1,21 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ServicesPage } from "@/features/services/ServicesPage";
 import { getConnectionState } from "@/services/connections";
-import { getSystemdServices } from "@/services/services";
+import { getSystemdServices, runServiceAction } from "@/services/services";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useServerStore } from "@/stores/serverStore";
 import { useServiceStore } from "@/stores/serviceStore";
 import { DEFAULT_PREFERENCES } from "@/lib/preferences";
-import type { ConnectionSnapshot, ServerProfile, ServiceDiscovery } from "@/types/contracts";
+import type {
+  ConnectionSnapshot,
+  ServerProfile,
+  ServiceActionResult,
+  ServiceDiscovery,
+} from "@/types/contracts";
 
 vi.mock("@/services/connections", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/services/connections")>();
@@ -22,6 +27,7 @@ vi.mock("@/services/connections", async (importOriginal) => {
 
 vi.mock("@/services/services", () => ({
   getSystemdServices: vi.fn(),
+  runServiceAction: vi.fn(),
 }));
 
 const sampledAt = Date.now();
@@ -107,6 +113,36 @@ const discovery: ServiceDiscovery = {
   connectionState: "connected",
 };
 
+const restartResult: ServiceActionResult = {
+  serverId: server.id,
+  unit: "nginx.service",
+  action: "restart",
+  command: "/usr/bin/sudo -n -- /usr/bin/systemctl restart -- nginx.service",
+  succeeded: true,
+  stdout: "restarted\n",
+  stderr: "",
+  exitCode: 0,
+  durationMs: 42,
+  permissionDenied: false,
+  sudoGuidance: null,
+  verifiedStatus: {
+    serverId: server.id,
+    unit: "nginx.service",
+    state: "active",
+    activeState: "active",
+    subState: "running",
+    loadState: "loaded",
+    unitFileState: "enabled",
+    description: "A high performance web server",
+    sampledAt: sampledAt + 1_000,
+    durationMs: 7,
+  },
+  stateVerified: true,
+  verificationError: null,
+  error: null,
+  connectionState: "connected",
+};
+
 function enableTauriRuntime() {
   Object.defineProperty(window, "__TAURI_INTERNALS__", {
     configurable: true,
@@ -131,12 +167,13 @@ describe("ServicesPage", () => {
       busy: {},
       error: null,
     });
-    useServiceStore.setState({ entries: {} });
+    useServiceStore.setState({ entries: {}, actions: {} });
     usePreferencesStore.setState({
       preferences: { ...DEFAULT_PREFERENCES, lastActiveServerId: server.id },
     });
     vi.mocked(getConnectionState).mockResolvedValue(connected);
     vi.mocked(getSystemdServices).mockResolvedValue(discovery);
+    vi.mocked(runServiceAction).mockReset();
   });
 
   it("lists discovered units with distinct active, failed, inactive, and unknown badges", async () => {
@@ -171,6 +208,69 @@ describe("ServicesPage", () => {
     await waitFor(() => {
       expect(getSystemdServices).toHaveBeenCalledTimes(2);
     });
+  });
+
+  it("confirms a restart and shows the verified state instead of an optimistic result", async () => {
+    const user = userEvent.setup();
+    vi.mocked(runServiceAction).mockResolvedValue(restartResult);
+    renderPage();
+
+    await screen.findByText("Discovered systemd units");
+    await user.click(screen.getByLabelText("Restart nginx.service"));
+
+    expect(screen.getByRole("dialog", { name: "Restart nginx.service?" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Restart unit" }));
+
+    await waitFor(() => {
+      expect(runServiceAction).toHaveBeenCalledWith(server.id, "nginx.service", "restart");
+    });
+
+    const resultPanel = await screen.findByLabelText("Service action result");
+    expect(within(resultPanel).getByText(/Verified state after the action/)).toBeInTheDocument();
+    expect(
+      within(resultPanel).getByText(/systemd reports nginx.service as active/),
+    ).toBeInTheDocument();
+    expect(within(resultPanel).getByText("restarted")).toBeInTheDocument();
+    expect(within(resultPanel).getByText("No stderr.")).toBeInTheDocument();
+  });
+
+  it("shows sudo guidance and remote output when an action is denied", async () => {
+    const user = userEvent.setup();
+    vi.mocked(runServiceAction).mockResolvedValue({
+      ...restartResult,
+      action: "stop",
+      command: "/usr/bin/sudo -n -- /usr/bin/systemctl stop -- nginx.service",
+      succeeded: false,
+      stdout: "",
+      stderr: "sudo: a password is required\n",
+      exitCode: 1,
+      permissionDenied: true,
+      sudoGuidance:
+        "<serverdesk-ssh-user> ALL=(root) NOPASSWD: /usr/bin/systemctl stop -- nginx.service",
+      verifiedStatus: {
+        ...restartResult.verifiedStatus!,
+        state: "inactive",
+        activeState: "inactive",
+        subState: "dead",
+      },
+      stateVerified: false,
+      error: {
+        code: "permission",
+        message: "The SSH account is not allowed to stop nginx.service.",
+        details: "Never grant unrestricted sudo.",
+      },
+    });
+    renderPage();
+
+    await screen.findByText("Discovered systemd units");
+    await user.click(screen.getByLabelText("Stop nginx.service"));
+    await user.click(screen.getByRole("button", { name: "Stop unit" }));
+
+    const resultPanel = await screen.findByLabelText("Service action result");
+    expect(within(resultPanel).getByText("Sudo permission denied")).toBeInTheDocument();
+    expect(within(resultPanel).getByText(/NOPASSWD/)).toBeInTheDocument();
+    expect(within(resultPanel).getByText("sudo: a password is required")).toBeInTheDocument();
+    expect(within(resultPanel).getByText("Exit code 1")).toBeInTheDocument();
   });
 
   it("shows a typed unsupported state without inventing services", async () => {

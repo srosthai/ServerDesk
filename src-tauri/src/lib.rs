@@ -62,6 +62,8 @@ pub fn run() {
             commands::identity::get_system_identity,
             commands::monitoring::get_monitoring_snapshot,
             commands::services::get_systemd_services,
+            commands::services::get_service_status,
+            commands::services::run_service_action,
             commands::known_hosts::list_known_hosts,
             commands::known_hosts::trust_host_key,
             commands::known_hosts::reject_host_key,
