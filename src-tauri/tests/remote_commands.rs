@@ -16,6 +16,9 @@ use serverdesk_lib::core::{
     identity::sample_system_identity,
     monitoring::{MONITORING_COMMANDS, MetricStatus, sample_monitoring_snapshot},
     remote::{RemoteCommand, run_remote_command},
+    services::{
+        SYSTEMD_SERVICES_COMMAND, ServiceDiscoveryStatus, ServiceState, discover_systemd_services,
+    },
     ssh::{
         Authentication, ConnectionEventSink, ConnectionManager, ConnectionRequest,
         ConnectionSnapshot, ConnectionState, ConnectionTimeouts, RusshTransport, TrustedHostKey,
@@ -60,6 +63,18 @@ const NETDEV_OUTPUT: &str = r#"Inter-|   Receive                                
     lo:    1000      10    0    0    0     0          0         0     1000      10    0    0    0     0       0          0
   eth0: 123456789   98765    0    0    0     0          0         0 987654321   54321    0    0    0     0       0          0
 "#;
+const SYSTEMD_UNITS_OUTPUT: &str = r#"  nginx.service               loaded    active   running    A high performance web server
+  apache2.service             loaded    failed   failed     The Apache HTTP Server
+  mysql.service               loaded    inactive dead       MySQL Community Server
+  mariadb.service             loaded    inactive dead       MariaDB database server
+  postgresql.service          loaded    active   exited     PostgreSQL RDBMS
+  redis-server.service        loaded    activating start     Redis persistent key-value database
+  supervisor.service          loaded    inactive dead       Supervisor process control system for UNIX
+  php8.3-fpm.service          loaded    active   running    The PHP 8.3 FastCGI Process Manager
+  custom-worker.service       loaded    active   running    A service that is not in any common list
+"#;
+const SYSTEMD_MISSING: &str =
+    "System has not been booted with systemd as init system (PID 1). Can't operate.\n";
 
 #[derive(Default)]
 struct FixtureState {
@@ -78,14 +93,18 @@ struct FixtureServer {
 
 impl FixtureServer {
     async fn start(fail_uptime: bool) -> Self {
-        Self::start_with(fail_uptime, true).await
+        Self::start_with(fail_uptime, true, true).await
     }
 
     async fn start_without_os_release() -> Self {
-        Self::start_with(false, false).await
+        Self::start_with(false, false, true).await
     }
 
-    async fn start_with(fail_uptime: bool, has_os_release: bool) -> Self {
+    async fn start_without_systemd() -> Self {
+        Self::start_with(false, true, false).await
+    }
+
+    async fn start_with(fail_uptime: bool, has_os_release: bool, has_systemd: bool) -> Self {
         let host_key = generate_private_key();
         let host_key_type = host_key.public_key().algorithm().as_str().to_string();
         let host_fingerprint = host_key
@@ -111,6 +130,7 @@ impl FixtureServer {
             Arc::clone(&state),
             fail_uptime,
             has_os_release,
+            has_systemd,
         ));
 
         Self {
@@ -184,6 +204,7 @@ async fn run_fixture_server(
     state: Arc<FixtureState>,
     fail_uptime: bool,
     has_os_release: bool,
+    has_systemd: bool,
 ) {
     loop {
         let Ok((socket, _)) = listener.accept().await else {
@@ -198,6 +219,7 @@ async fn run_fixture_server(
                 state,
                 fail_uptime,
                 has_os_release,
+                has_systemd,
             };
             if let Ok(session) = server::run_stream(config, socket, handler).await {
                 let _ = session.await;
@@ -210,6 +232,7 @@ struct FixtureHandler {
     state: Arc<FixtureState>,
     fail_uptime: bool,
     has_os_release: bool,
+    has_systemd: bool,
 }
 
 impl server::Handler for FixtureHandler {
@@ -263,6 +286,12 @@ impl server::Handler for FixtureHandler {
             "cat /proc/meminfo" => respond(session, channel, MEMINFO_OUTPUT.as_bytes(), b"", 0),
             "df -Pk" => respond(session, channel, DF_OUTPUT.as_bytes(), b"", 0),
             "cat /proc/net/dev" => respond(session, channel, NETDEV_OUTPUT.as_bytes(), b"", 0),
+            command if command == SYSTEMD_SERVICES_COMMAND && self.has_systemd => {
+                respond(session, channel, SYSTEMD_UNITS_OUTPUT.as_bytes(), b"", 0)
+            }
+            command if command == SYSTEMD_SERVICES_COMMAND => {
+                respond(session, channel, b"", SYSTEMD_MISSING.as_bytes(), 1)
+            }
             "uptime" if self.fail_uptime => {
                 respond(session, channel, b"", UPTIME_FAILURE.as_bytes(), 7)
             }
@@ -612,6 +641,91 @@ async fn unsupported_distribution_returns_partial_identity() {
     assert_eq!(identity.architecture.as_deref(), Some("x86_64"));
     assert_eq!(identity.uptime_seconds, Some(372_063));
     assert_eq!(identity.connection_state, ConnectionState::Connected);
+
+    manager
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+    fixture.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn discovers_systemd_units_and_distinguishes_their_states() {
+    let fixture = FixtureServer::start(false).await;
+    let manager = manager();
+    manager
+        .connect(fixture.request(true))
+        .await
+        .expect("connect with the trusted host key");
+
+    let discovery = discover_systemd_services(&manager, "fixture-server")
+        .await
+        .expect("discover services");
+
+    assert_eq!(discovery.server_id, "fixture-server");
+    assert_eq!(discovery.status, ServiceDiscoveryStatus::Available);
+    assert_eq!(discovery.connection_state, ConnectionState::Connected);
+    assert!(!discovery.truncated);
+    assert!(discovery.sampled_at > 0);
+    assert_eq!(discovery.services.len(), 9);
+    assert!(discovery.detail.is_none());
+
+    let service = |name: &str| {
+        discovery
+            .services
+            .iter()
+            .find(|service| service.name == name)
+            .unwrap_or_else(|| panic!("missing fixture unit {name}"))
+    };
+
+    assert_eq!(service("nginx.service").state, ServiceState::Active);
+    assert_eq!(service("apache2.service").state, ServiceState::Failed);
+    assert_eq!(service("mysql.service").state, ServiceState::Inactive);
+    assert_eq!(service("mariadb.service").state, ServiceState::Inactive);
+    assert_eq!(service("postgresql.service").state, ServiceState::Active);
+    assert_eq!(service("redis-server.service").state, ServiceState::Unknown);
+    assert_eq!(service("supervisor.service").state, ServiceState::Inactive);
+    assert_eq!(service("php8.3-fpm.service").state, ServiceState::Active);
+    assert_eq!(service("custom-worker.service").state, ServiceState::Active);
+    assert_ne!(
+        service("apache2.service").state,
+        service("redis-server.service").state,
+        "failed and unknown states must stay distinct"
+    );
+
+    assert_eq!(
+        fixture.executed(),
+        vec!["true".to_string(), SYSTEMD_SERVICES_COMMAND.to_string()],
+        "discovery must send exactly the fixed command template"
+    );
+
+    manager
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+    fixture.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn systems_without_systemd_return_a_typed_unsupported_result() {
+    let fixture = FixtureServer::start_without_systemd().await;
+    let manager = manager();
+    manager
+        .connect(fixture.request(true))
+        .await
+        .expect("connect with the trusted host key");
+
+    let discovery = discover_systemd_services(&manager, "fixture-server")
+        .await
+        .expect("an unsupported system is a typed result, not a transport failure");
+
+    assert_eq!(discovery.status, ServiceDiscoveryStatus::Unsupported);
+    assert_eq!(discovery.connection_state, ConnectionState::Connected);
+    assert!(discovery.services.is_empty());
+    assert!(!discovery.truncated);
+    let detail = discovery.detail.expect("unsupported detail");
+    assert!(detail.contains("Systemd is not available"));
+    assert!(detail.contains("not been booted with systemd"));
 
     manager
         .disconnect("fixture-server")
