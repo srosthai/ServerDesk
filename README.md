@@ -60,7 +60,9 @@ Private key authentication supports OpenSSH, PEM (RSA, ECDSA, Ed25519), and PuTT
 
 A Rust connection manager owns one SSH session per server profile, reuses healthy sessions, rejects duplicate concurrent connects, and emits `connection-state-changed` events to the frontend. Connection states are `disconnected`, `connecting`, `host-key-verification`, `connected`, `reconnecting`, and `error`.
 
-Host keys are checked against the local `known_hosts` records before authentication. An unknown or changed fingerprint blocks the connection with a typed `host_key` error; accepting a new fingerprint from the UI is tracked separately in issue #12.
+Host keys are checked against the local `known_hosts` records before authentication. An unknown fingerprint opens a blocking verification dialog with the key type and fingerprint; the key is trusted only after explicit acceptance. A changed fingerprint blocks the connection with a typed `host_key` error and is never saved automatically.
+
+The add/edit server form includes a connection test. It reports visible progress, keeps non-secret field values after a failed test, and uses the same host-key verification flow before sending credentials. Auth failures, host-key mismatches, timeouts, DNS failures, and network loss keep distinct error codes and UI labels. Tests against an unsaved profile trust an accepted key only for that test; saving and connecting verifies the key again.
 
 ## Command contracts
 

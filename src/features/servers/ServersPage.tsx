@@ -38,6 +38,7 @@ import { StatusBadge } from "@/components/ui/status-badge";
 import { HostKeyChangedDialog, HostKeyVerificationDialog } from "@/features/servers/HostKeyDialogs";
 import { KnownHostsDialog } from "@/features/servers/KnownHostsDialog";
 import { ServerProfileDialog } from "@/features/servers/ServerProfileDialog";
+import { describeConnectionError } from "@/lib/connectionErrors";
 import { isTauriRuntime } from "@/lib/tauri";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useServerStore } from "@/stores/serverStore";
@@ -315,6 +316,9 @@ function ServersPage() {
               {filtered.map((server) => {
                 const connection = connections[server.id];
                 const connectionState = connection?.state ?? "disconnected";
+                const connectionError = connection?.error
+                  ? describeConnectionError(connection.error)
+                  : null;
                 const busy = connectionBusy[server.id] ?? false;
                 const canConnect =
                   connectionState === "disconnected" || connectionState === "error";
@@ -356,13 +360,32 @@ function ServersPage() {
                     <TableCell>
                       <div className="max-w-56 space-y-1">
                         <StatusBadge state={connectionState} />
-                        {connection?.error ? (
-                          <div
-                            className="truncate text-[11px] text-destructive"
-                            title={connection.error.message}
-                          >
-                            {connection.error.message}
-                          </div>
+                        {connection?.error && connectionError ? (
+                          <>
+                            <div
+                              className="truncate text-[11px] font-medium text-destructive"
+                              title={connectionError.title}
+                            >
+                              {connectionError.title}
+                            </div>
+                            <div
+                              className="truncate text-[11px] text-destructive/90"
+                              title={connection.error.message}
+                            >
+                              {connection.error.message}
+                            </div>
+                            {connection.error.details ? (
+                              <div
+                                className="truncate text-[10px] text-muted-foreground"
+                                title={connection.error.details}
+                              >
+                                {connection.error.details}
+                              </div>
+                            ) : null}
+                            <div className="truncate text-[10px] text-muted-foreground">
+                              {connectionError.action}
+                            </div>
+                          </>
                         ) : null}
                         {connection?.hostKey ? (
                           <div

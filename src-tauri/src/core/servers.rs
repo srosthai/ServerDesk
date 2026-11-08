@@ -69,22 +69,7 @@ impl ServerProfileInput {
                 "Server name must be 80 characters or fewer.",
             ));
         }
-        if host.is_empty() {
-            return Err(AppError::validation("Host is required."));
-        }
-        if host.len() > 253 || host.chars().any(char::is_whitespace) {
-            return Err(AppError::validation(
-                "Enter a valid hostname or IP address.",
-            ));
-        }
-        if self.port == 0 {
-            return Err(AppError::validation(
-                "SSH port must be between 1 and 65535.",
-            ));
-        }
-        if username.is_empty() || username.len() > 64 || username.chars().any(char::is_whitespace) {
-            return Err(AppError::validation("Enter a valid SSH username."));
-        }
+        validate_connection_fields(&host, self.port, &username)?;
 
         let tags = normalize_tags(self.tags)?;
         let group_name = normalize_optional(self.group_name, 120, "Group")?;
@@ -103,6 +88,27 @@ impl ServerProfileInput {
             notes,
         })
     }
+}
+
+pub fn validate_connection_fields(host: &str, port: u16, username: &str) -> Result<(), AppError> {
+    if host.is_empty() {
+        return Err(AppError::validation("Host is required."));
+    }
+    if host.len() > 253 || host.chars().any(char::is_whitespace) {
+        return Err(AppError::validation(
+            "Enter a valid hostname or IP address.",
+        ));
+    }
+    if port == 0 {
+        return Err(AppError::validation(
+            "SSH port must be between 1 and 65535.",
+        ));
+    }
+    if username.is_empty() || username.len() > 64 || username.chars().any(char::is_whitespace) {
+        return Err(AppError::validation("Enter a valid SSH username."));
+    }
+
+    Ok(())
 }
 
 fn normalize_optional(

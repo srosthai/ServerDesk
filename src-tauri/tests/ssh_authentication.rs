@@ -13,7 +13,8 @@ use serverdesk_lib::core::{
     AppError, ErrorCode,
     ssh::{
         Authentication, CommandOutput, ConnectionEventSink, ConnectionManager, ConnectionRequest,
-        ConnectionSnapshot, ConnectionState, ConnectionTimeouts, RusshTransport, TrustedHostKey,
+        ConnectionSnapshot, ConnectionState, ConnectionTestOutcome, ConnectionTimeouts,
+        RusshTransport, TrustedHostKey, test_connection,
     },
 };
 use tokio::net::TcpListener;
@@ -604,6 +605,72 @@ async fn private_key_can_be_loaded_from_a_file_path() {
         .expect("private key path authentication");
 
     assert_eq!(fixture.accepted(), vec!["publickey:deploy"]);
+}
+
+#[tokio::test]
+async fn connection_test_prompts_for_an_unknown_host_key_then_succeeds_after_acceptance() {
+    let fixture = FixtureServer::start().await;
+    let transport = RusshTransport::new();
+    let timeouts = ConnectionTimeouts {
+        connect: Duration::from_secs(5),
+        command: Duration::from_secs(5),
+        close: Duration::from_secs(1),
+    };
+    let mut request = fixture.untrusted_request(USERNAME, password_authentication(PASSWORD));
+
+    let outcome = test_connection(&transport, &request, &timeouts)
+        .await
+        .expect("test connection");
+    let ConnectionTestOutcome::HostKeyVerification { host_key } = outcome else {
+        panic!("expected a host-key verification result");
+    };
+    assert_eq!(host_key.key_type, fixture.host_key_type);
+    assert_eq!(host_key.fingerprint, fixture.host_fingerprint);
+    assert!(host_key.expected_fingerprint.is_none());
+    assert!(
+        fixture.accepted().is_empty(),
+        "authentication must not run before the host key is accepted"
+    );
+
+    request.trusted_host_keys = vec![TrustedHostKey {
+        key_type: host_key.key_type,
+        fingerprint: host_key.fingerprint,
+    }];
+    let outcome = test_connection(&transport, &request, &timeouts)
+        .await
+        .expect("accepted connection test");
+    assert!(matches!(outcome, ConnectionTestOutcome::Connected { .. }));
+    assert_eq!(fixture.accepted(), vec!["password:deploy"]);
+}
+
+#[tokio::test]
+async fn connection_test_returns_distinct_authentication_and_host_key_errors() {
+    let fixture = FixtureServer::start().await;
+    let transport = RusshTransport::new();
+    let timeouts = ConnectionTimeouts {
+        connect: Duration::from_secs(5),
+        command: Duration::from_secs(5),
+        close: Duration::from_secs(1),
+    };
+
+    let error = test_connection(
+        &transport,
+        &fixture.request(USERNAME, password_authentication("wrong-password")),
+        &timeouts,
+    )
+    .await
+    .expect_err("authentication failure");
+    assert_eq!(error.code, ErrorCode::Authentication);
+
+    let error = test_connection(
+        &transport,
+        &fixture.changed_key_request(USERNAME, password_authentication(PASSWORD)),
+        &timeouts,
+    )
+    .await
+    .expect_err("host key mismatch");
+    assert_eq!(error.code, ErrorCode::HostKey);
+    assert!(error.message.contains("changed"));
 }
 
 #[tokio::test]

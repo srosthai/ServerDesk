@@ -99,7 +99,41 @@ describe("ServersPage", () => {
     });
 
     expect(await screen.findByText("Connection timed out after 15 seconds.")).toBeInTheDocument();
+    expect(screen.getByText("Connection timed out")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Check that the host is reachable, the SSH port is correct, and a firewall is not blocking the connection.",
+      ),
+    ).toBeInTheDocument();
     expect(screen.getByText("Connection error")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["disconnected", "Disconnected"],
+    ["connecting", "Connecting"],
+    ["host-key-verification", "Verify host key"],
+    ["reconnecting", "Reconnecting"],
+  ] as const)("renders the %s connection state", (state, label) => {
+    useServerStore.setState({
+      servers: [server],
+      status: "ready",
+      error: null,
+    });
+    useConnectionStore.setState({
+      connections: {
+        [server.id]: {
+          serverId: server.id,
+          state,
+          changedAt: 1,
+        },
+      },
+      busy: {},
+      error: null,
+    });
+
+    render(<ServersPage />);
+
+    expect(screen.getAllByText(label).length).toBeGreaterThan(0);
   });
 
   it("shows a distinct authentication error instead of a generic failure", async () => {
