@@ -1,6 +1,7 @@
 import { useState } from "react";
 import {
   CircleNotchIcon,
+  HeartbeatIcon,
   LinkBreakIcon,
   PlugsIcon,
   TerminalWindowIcon,
@@ -15,9 +16,12 @@ import { HostKeyVerificationDialog } from "@/features/servers/HostKeyDialogs";
 import { MonitoringCard } from "@/features/dashboard/MonitoringCard";
 import { ServerIdentityCard } from "@/features/dashboard/ServerIdentityCard";
 import { describeConnectionError } from "@/lib/connectionErrors";
+import { MIN_MONITORING_INTERVAL_SECONDS } from "@/lib/preferences";
 import { isTauriRuntime } from "@/lib/tauri";
 import { remoteCommands } from "@/services/remote";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { useMonitoringStore } from "@/stores/monitoringStore";
+import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useRemoteCommandStore } from "@/stores/remoteCommandStore";
 import { useSystemIdentityStore } from "@/stores/systemIdentityStore";
 import type { RemoteCommandName, RemoteCommandResult, ServerProfile } from "@/types/contracts";
@@ -33,6 +37,107 @@ const commandDescriptions: Record<RemoteCommandName, string> = {
 
 function formatDuration(durationMs: number) {
   return durationMs < 1000 ? `${durationMs} ms` : `${(durationMs / 1000).toFixed(1)} s`;
+}
+
+function formatSampleTime(sampledAt: number) {
+  const date = new Date(sampledAt);
+  return Number.isNaN(date.getTime()) ? "Unavailable" : date.toLocaleString();
+}
+
+function dateTimeValue(sampledAt: number) {
+  const date = new Date(sampledAt);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+function OverviewSummary({ serverId, connected }: { serverId: string; connected: boolean }) {
+  const monitoringEntry = useMonitoringStore((state) => state.entries[serverId]);
+  const identity = useSystemIdentityStore((state) => state.identities[serverId]);
+  const identityStale = useSystemIdentityStore((state) => state.stale[serverId] ?? false);
+  const identityPending = useSystemIdentityStore((state) => state.pending[serverId] ?? false);
+  const refreshIdentity = useSystemIdentityStore((state) => state.refresh);
+  const refreshMonitoring = useMonitoringStore((state) => state.refresh);
+  const intervalSeconds = usePreferencesStore(
+    (state) => state.preferences.monitoringIntervalSeconds,
+  );
+
+  const monitoringPending = monitoringEntry?.pending ?? false;
+  const monitoringStale = monitoringEntry?.stale ?? false;
+  const pending = identityPending || monitoringPending;
+  const sampleTimes = [identity?.sampledAt, monitoringEntry?.snapshot?.sampledAt].filter(
+    (value): value is number => typeof value === "number" && Number.isFinite(value),
+  );
+  const lastSampleAt = sampleTimes.length > 0 ? Math.max(...sampleTimes) : null;
+  const stale = monitoringStale || identityStale || (!connected && lastSampleAt !== null);
+  const safeIntervalSeconds = Math.max(MIN_MONITORING_INTERVAL_SECONDS, intervalSeconds);
+
+  const state = !connected
+    ? lastSampleAt === null
+      ? { label: "Unavailable", variant: "outline" as const }
+      : { label: "Stale", variant: "warning" as const }
+    : stale
+      ? { label: pending ? "Stale · refreshing" : "Stale", variant: "warning" as const }
+      : pending
+        ? {
+            label: lastSampleAt === null ? "Collecting" : "Refreshing",
+            variant: "info" as const,
+          }
+        : lastSampleAt === null
+          ? { label: "No sample", variant: "outline" as const }
+          : { label: "Live", variant: "success" as const };
+
+  async function handleRefresh() {
+    await Promise.all([refreshIdentity(serverId), refreshMonitoring(serverId)]);
+  }
+
+  return (
+    <div className="flex flex-col gap-3 rounded-md border border-border bg-muted/25 px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between">
+      <dl className="grid flex-1 grid-cols-2 gap-x-6 gap-y-2 md:grid-cols-3">
+        <div>
+          <dt className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+            Data freshness
+          </dt>
+          <dd className="mt-0.5" aria-live="polite">
+            <Badge variant={state.variant}>{state.label}</Badge>
+          </dd>
+        </div>
+        <div>
+          <dt className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+            Last successful sample
+          </dt>
+          <dd className="mt-1 font-mono text-[11px] text-foreground">
+            {lastSampleAt === null ? (
+              <span className="font-sans text-muted-foreground">No successful sample yet</span>
+            ) : (
+              <time dateTime={dateTimeValue(lastSampleAt)}>{formatSampleTime(lastSampleAt)}</time>
+            )}
+          </dd>
+        </div>
+        <div>
+          <dt className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+            Auto refresh
+          </dt>
+          <dd className="mt-1 text-[11px] text-foreground">
+            {connected ? `Every ${safeIntervalSeconds} s` : "Paused while disconnected"}
+          </dd>
+        </div>
+      </dl>
+      <Button
+        variant="secondary"
+        size="sm"
+        onClick={() => void handleRefresh()}
+        disabled={!connected || pending}
+        aria-label="Refresh server overview"
+        className="shrink-0"
+      >
+        {pending ? (
+          <CircleNotchIcon className="size-3.5 animate-spin" aria-hidden="true" />
+        ) : (
+          <HeartbeatIcon className="size-3.5" aria-hidden="true" />
+        )}
+        {pending ? "Refreshing..." : "Refresh all"}
+      </Button>
+    </div>
+  );
 }
 
 function RemoteCommandResultCard({
@@ -222,6 +327,10 @@ function ServerInspectionPanel({ server }: ServerInspectionPanelProps) {
             </Alert>
           </div>
         ) : null}
+
+        <div className="border-t border-border px-4 py-3">
+          <OverviewSummary serverId={server.id} connected={connected} />
+        </div>
 
         <div className="border-t border-border px-4 py-4">
           <ServerIdentityCard serverId={server.id} connected={connected} />

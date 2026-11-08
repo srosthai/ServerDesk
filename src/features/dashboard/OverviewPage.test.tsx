@@ -181,7 +181,14 @@ describe("OverviewPage", () => {
     useServerStore.setState({ servers: [], status: "idle", error: null });
     useConnectionStore.setState({ connections: {}, busy: {}, error: null });
     useRemoteCommandStore.setState({ results: {}, pending: {}, error: null });
-    useSystemIdentityStore.setState({ identities: {}, pending: {}, error: null });
+    useSystemIdentityStore.setState({
+      identities: {},
+      pending: {},
+      stale: {},
+      staleReason: {},
+      lastAttemptAt: {},
+      error: null,
+    });
     useMonitoringStore.setState({ entries: {} });
     vi.mocked(getSystemIdentity).mockResolvedValue(identity);
     vi.mocked(getMonitoringSnapshot).mockResolvedValue(monitoringSnapshot);
@@ -253,6 +260,8 @@ describe("OverviewPage", () => {
     expect(await screen.findByText("0.42")).toBeInTheDocument();
     expect(screen.getByText("25.0%")).toBeInTheDocument();
     expect(screen.getByText("Current")).toBeInTheDocument();
+    expect(screen.getByText("Live")).toBeInTheDocument();
+    expect(screen.getByText("Every 30 s")).toBeInTheDocument();
     expect(getMonitoringSnapshot).toHaveBeenCalledWith(server.id);
     expect(screen.getAllByText(/Sampled/).length).toBeGreaterThanOrEqual(4);
 
@@ -330,5 +339,123 @@ describe("OverviewPage", () => {
     expect(await screen.findByText("Ubuntu")).toBeInTheDocument();
     expect(screen.getByText("4 days, 7 hours")).toBeInTheDocument();
     expect(getSystemIdentity).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows an honest unavailable dashboard for a disconnected server", () => {
+    enableTauriRuntime();
+    vi.mocked(getConnectionState).mockResolvedValue({
+      serverId: server.id,
+      state: "disconnected",
+      changedAt: 1,
+    });
+    useServerStore.setState({ servers: [server], status: "ready", error: null });
+    useConnectionStore.setState({
+      connections: { [server.id]: { serverId: server.id, state: "disconnected", changedAt: 1 } },
+      busy: {},
+      error: null,
+    });
+
+    render(
+      <MemoryRouter>
+        <OverviewPage />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText("Disconnected")).toBeInTheDocument();
+    expect(screen.getByText("Unavailable")).toBeInTheDocument();
+    expect(screen.getByText("No successful sample yet")).toBeInTheDocument();
+    expect(screen.getByText("Paused while disconnected")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Connect the server to collect CPU, memory, filesystem, and network snapshots. Polling never runs while the server is disconnected.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh server overview" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Refresh identity" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Refresh monitoring" })).toBeDisabled();
+    expect(screen.queryByText("0.42")).not.toBeInTheDocument();
+    expect(screen.queryByText("25.0%")).not.toBeInTheDocument();
+    expect(getSystemIdentity).not.toHaveBeenCalled();
+    expect(getMonitoringSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("refreshes identity and monitoring together without a page reload", async () => {
+    enableTauriRuntime();
+    vi.mocked(getConnectionState).mockResolvedValue(connected);
+    vi.mocked(getSystemIdentity)
+      .mockResolvedValueOnce(identity)
+      .mockResolvedValueOnce({
+        ...identity,
+        hostname: "prod-os-host-2",
+        uptimeSeconds: 372_125,
+        sampledAt: identity.sampledAt + 60_000,
+      });
+    vi.mocked(getMonitoringSnapshot)
+      .mockResolvedValueOnce(monitoringSnapshot)
+      .mockResolvedValueOnce({
+        ...monitoringSnapshot,
+        sampledAt: monitoringSnapshot.sampledAt + 60_000,
+        cpu: {
+          ...monitoringSnapshot.cpu,
+          data: { load1m: 1.24, load5m: 0.75, load15m: 0.5, logicalCpus: 8 },
+        },
+      });
+    useServerStore.setState({ servers: [server], status: "ready", error: null });
+    useConnectionStore.setState({
+      connections: { [server.id]: connected },
+      busy: {},
+      error: null,
+    });
+    const user = userEvent.setup();
+
+    render(
+      <MemoryRouter>
+        <OverviewPage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("prod-os-host")).toBeInTheDocument();
+    expect(await screen.findByText("0.42")).toBeInTheDocument();
+    expect(getSystemIdentity).toHaveBeenCalledTimes(1);
+    expect(getMonitoringSnapshot).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: "Refresh server overview" }));
+
+    expect(await screen.findByText("prod-os-host-2")).toBeInTheDocument();
+    expect(await screen.findByText("1.24")).toBeInTheDocument();
+    expect(getSystemIdentity).toHaveBeenCalledTimes(2);
+    expect(getMonitoringSnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it("marks a retained identity sample stale with its last successful sample time", async () => {
+    enableTauriRuntime();
+    vi.mocked(getConnectionState).mockResolvedValue(connected);
+    vi.mocked(getSystemIdentity).mockResolvedValueOnce(identity).mockRejectedValueOnce({
+      code: "timeout",
+      message: "The remote command timed out.",
+    });
+    useServerStore.setState({ servers: [server], status: "ready", error: null });
+    useConnectionStore.setState({
+      connections: { [server.id]: connected },
+      busy: {},
+      error: null,
+    });
+    const user = userEvent.setup();
+
+    render(
+      <MemoryRouter>
+        <OverviewPage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("prod-os-host")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Refresh identity" }));
+
+    expect(await screen.findByText("Stale sample")).toBeInTheDocument();
+    expect(screen.getByText("Could not collect server identity")).toBeInTheDocument();
+    expect(screen.getByText(/Showing the last successful sample from/)).toBeInTheDocument();
+    expect(screen.getByText(/These values are stale and are not live/)).toBeInTheDocument();
+    expect(screen.getByText("prod-os-host")).toBeInTheDocument();
+    expect(screen.getAllByText(/Last successful sample/).length).toBeGreaterThan(0);
   });
 });

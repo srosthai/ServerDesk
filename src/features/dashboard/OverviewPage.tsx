@@ -47,7 +47,7 @@ function OverviewPage() {
     <div className="space-y-6">
       <PageHeader
         title="Overview"
-        description="Connect to a server, inspect its identity, and run verified remote commands."
+        description="Server health at a glance: connection state, identity, resource metrics, and sample freshness."
         actions={
           <>
             <Button asChild variant="secondary" size="sm">
