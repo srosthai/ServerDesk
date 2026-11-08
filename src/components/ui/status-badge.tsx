@@ -1,7 +1,7 @@
 import { cn } from "@/lib/utils";
+import type { ConnectionState } from "@/types/contracts";
 
-export type ConnectionState =
-  "disconnected" | "connecting" | "host-key-verification" | "connected" | "reconnecting" | "error";
+export type { ConnectionState };
 
 const stateConfig: Record<
   ConnectionState,

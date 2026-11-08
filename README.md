@@ -52,7 +52,13 @@ GitHub Actions runs the frontend and Rust checks on pushes and pull requests to 
 
 ## Credentials
 
-SSH passwords and key passphrases are stored in the operating system credential store through the Rust keyring integration. SQLite stores only a credential reference. Secret input is available in the desktop build, not the browser preview.
+SSH passwords and private key material are stored in the operating system credential store through the Rust keyring integration. SQLite stores only a credential reference. Secret input is available in the desktop build, not the browser preview.
+
+## Connections
+
+A Rust connection manager owns one SSH session per server profile, reuses healthy sessions, rejects duplicate concurrent connects, and emits `connection-state-changed` events to the frontend. Connection states are `disconnected`, `connecting`, `host-key-verification`, `connected`, `reconnecting`, and `error`.
+
+Host keys are checked against the local `known_hosts` records before authentication. An unknown or changed fingerprint blocks the connection with a typed `host_key` error; accepting a new fingerprint from the UI is tracked separately in issue #12.
 
 ## Command contracts
 
