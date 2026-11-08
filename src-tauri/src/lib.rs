@@ -58,6 +58,7 @@ pub fn run() {
             commands::connections::disconnect_server,
             commands::connections::get_connection_state,
             commands::connections::test_server_connection,
+            commands::remote::run_remote_command,
             commands::known_hosts::list_known_hosts,
             commands::known_hosts::trust_host_key,
             commands::known_hosts::reject_host_key,

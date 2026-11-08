@@ -64,6 +64,12 @@ Host keys are checked against the local `known_hosts` records before authenticat
 
 The add/edit server form includes a connection test. It reports visible progress, keeps non-secret field values after a failed test, and uses the same host-key verification flow before sending credentials. Auth failures, host-key mismatches, timeouts, DNS failures, and network loss keep distinct error codes and UI labels. Tests against an unsaved profile trust an accepted key only for that test; saving and connecting verifies the key again.
 
+## Remote commands
+
+The Overview page provides the first end-to-end vertical slice: add a profile, connect, verify the host key, authenticate, run fixed `hostname` and `uptime` commands, inspect real stdout, stderr, the exit code, and the connection state, then disconnect and release the session. The Rust command path accepts a closed `RemoteCommand` enum and maps it to fixed command templates, so user text is never concatenated into a shell command. A non-zero exit status is returned as a structured result rather than lost as a transport error.
+
+`cargo test --manifest-path src-tauri/Cargo.toml --test remote_commands` starts an in-process `russh` server and exercises the real client transport, host-key verification, password authentication, command execution, failure output, and disconnect cleanup.
+
 ## Command contracts
 
 React calls typed Tauri commands through `src/services/`. Contract types live in `src/types/contracts.ts`, and every command returns a structured `AppError` when it fails. Components do not call `invoke` directly. Tauri event subscriptions use `useTauriEvent`, which cleans up its listener on unmount.
