@@ -82,6 +82,14 @@ The Overview page collects lightweight, snapshot-based monitoring over the authe
 
 Each metric group carries its own sample timestamp and an explicit status: `available`, `unsupported`, or `unavailable`. A transport failure aborts the refresh; the frontend keeps the last successful snapshot, marks it stale, and keeps showing its original sample time. Polling uses the monitoring interval from Settings, clamped to a five-second minimum, and stops whenever no server is selected or the session is disconnected. Manual refresh always remains available while connected.
 
+## Systemd service discovery
+
+The Services page discovers service units that actually exist on the target machine instead of assuming a fixed package list. One fixed read-only template runs over the authenticated session: `systemctl list-units --type=service --all --no-pager --no-legend --full`. Every returned unit is parsed generically, so common units such as nginx, apache2, mysql, postgresql, redis, supervisor, versioned PHP-FPM units, and unlisted custom services all appear when the server reports them. ServerDesk never adds a common name that systemd did not return.
+
+The command has a 64 KiB output bound, a 10 second duration bound, and a 512 unit parse limit. Active, inactive, failed, and unknown states stay distinct; the raw systemd active and sub states are retained for units such as `activating` that do not fit those four labels.
+
+The typed `get_systemd_services` Tauri command returns an `available`, `unsupported`, or `unavailable` discovery result. Systems without systemd return `unsupported` with a bounded explanation rather than an empty successful list. The frontend calls it through `src/services/services.ts`, stores per-server results in `useServiceStore`, and renders a read-only unit list. Start, stop, and restart actions are intentionally not implemented yet. Discovery output is only held in memory and is never written to SQLite or logs.
+
 ## Server overview
 
 The default Overview workspace is the server health dashboard. It shows the selected server's connection state, hostname, distribution, kernel, architecture, and uptime alongside CPU load, memory, disk, and network cards. Every metric carries a unit and a sample time, and the dashboard summary reports whether the latest data is live, stale, or unavailable.
