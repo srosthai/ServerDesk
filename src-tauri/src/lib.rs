@@ -60,6 +60,7 @@ pub fn run() {
             commands::connections::test_server_connection,
             commands::remote::run_remote_command,
             commands::identity::get_system_identity,
+            commands::monitoring::get_monitoring_snapshot,
             commands::known_hosts::list_known_hosts,
             commands::known_hosts::trust_host_key,
             commands::known_hosts::reject_host_key,

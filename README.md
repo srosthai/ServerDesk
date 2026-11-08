@@ -76,6 +76,12 @@ The Overview page samples server identity over the authenticated session. Hostna
 
 Every identity command has a 16 KiB output bound and uses the connection manager's command timeout. The typed `get_system_identity` Tauri command returns a `SystemIdentity` sample with a local sample timestamp, duration, and connection state. The frontend calls it through `src/services/identity.ts` and stores per-server samples in `useSystemIdentityStore`.
 
+## Monitoring snapshots
+
+The Overview page collects lightweight, snapshot-based monitoring over the authenticated session. CPU load averages come from `/proc/loadavg`, the logical CPU count from `nproc`, memory from `/proc/meminfo`, filesystem usage from `df -Pk`, and interface counters from `/proc/net/dev`. Every command is a fixed read-only template with a 32 KiB output bound and the connection manager's command timeout.
+
+Each metric group carries its own sample timestamp and an explicit status: `available`, `unsupported`, or `unavailable`. A transport failure aborts the refresh; the frontend keeps the last successful snapshot, marks it stale, and keeps showing its original sample time. Polling uses the monitoring interval from Settings, clamped to a five-second minimum, and stops whenever no server is selected or the session is disconnected. Manual refresh always remains available while connected.
+
 ## Command contracts
 
 React calls typed Tauri commands through `src/services/`. Contract types live in `src/types/contracts.ts`, and every command returns a structured `AppError` when it fails. Components do not call `invoke` directly. Tauri event subscriptions use `useTauriEvent`, which cleans up its listener on unmount.

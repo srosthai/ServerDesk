@@ -5,13 +5,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { OverviewPage } from "@/features/dashboard/OverviewPage";
 import { getConnectionState } from "@/services/connections";
 import { getSystemIdentity } from "@/services/identity";
+import { getMonitoringSnapshot } from "@/services/monitoring";
 import { runRemoteCommand } from "@/services/remote";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { useMonitoringStore } from "@/stores/monitoringStore";
 import { useRemoteCommandStore } from "@/stores/remoteCommandStore";
 import { useServerStore } from "@/stores/serverStore";
 import { useSystemIdentityStore } from "@/stores/systemIdentityStore";
 import type {
   ConnectionSnapshot,
+  MonitoringSnapshot,
   RemoteCommandResult,
   ServerProfile,
   SystemIdentity,
@@ -40,6 +43,14 @@ vi.mock("@/services/identity", async (importOriginal) => {
   return {
     ...actual,
     getSystemIdentity: vi.fn(),
+  };
+});
+
+vi.mock("@/services/monitoring", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/services/monitoring")>();
+  return {
+    ...actual,
+    getMonitoringSnapshot: vi.fn(),
   };
 });
 
@@ -101,6 +112,59 @@ const identity: SystemIdentity = {
   connectionState: "connected",
 };
 
+const monitoringSnapshot: MonitoringSnapshot = {
+  serverId: server.id,
+  sampledAt: 1_762_665_720_000,
+  durationMs: 42,
+  connectionState: "connected",
+  cpu: {
+    status: "available",
+    sampledAt: 1_762_665_720_000,
+    detail: null,
+    data: { load1m: 0.42, load5m: 0.31, load15m: 0.28, logicalCpus: 8 },
+  },
+  memory: {
+    status: "available",
+    sampledAt: 1_762_665_720_000,
+    detail: null,
+    data: {
+      totalBytes: 8 * 1024 ** 3,
+      usedBytes: 2 * 1024 ** 3,
+      availableBytes: 6 * 1024 ** 3,
+      usedPercent: 25,
+    },
+  },
+  filesystems: {
+    status: "available",
+    sampledAt: 1_762_665_720_000,
+    detail: null,
+    data: [
+      {
+        filesystem: "/dev/vda1",
+        mount: "/",
+        totalBytes: 100 * 1024 ** 3,
+        usedBytes: 40 * 1024 ** 3,
+        availableBytes: 60 * 1024 ** 3,
+        usedPercent: 40,
+      },
+    ],
+  },
+  network: {
+    status: "available",
+    sampledAt: 1_762_665_720_000,
+    detail: null,
+    data: [
+      {
+        interface: "eth0",
+        receivedBytes: 1_500_000_000,
+        transmittedBytes: 750_000_000,
+        receivedPackets: 12_345,
+        transmittedPackets: 6_789,
+      },
+    ],
+  },
+};
+
 function enableTauriRuntime() {
   Object.defineProperty(window, "__TAURI_INTERNALS__", {
     configurable: true,
@@ -118,7 +182,9 @@ describe("OverviewPage", () => {
     useConnectionStore.setState({ connections: {}, busy: {}, error: null });
     useRemoteCommandStore.setState({ results: {}, pending: {}, error: null });
     useSystemIdentityStore.setState({ identities: {}, pending: {}, error: null });
+    useMonitoringStore.setState({ entries: {} });
     vi.mocked(getSystemIdentity).mockResolvedValue(identity);
+    vi.mocked(getMonitoringSnapshot).mockResolvedValue(monitoringSnapshot);
   });
 
   it("adds a server profile from the first screen", async () => {
@@ -175,13 +241,20 @@ describe("OverviewPage", () => {
     expect(screen.getByText("6.8.0-45-generic")).toBeInTheDocument();
     expect(screen.getByText("x86_64")).toBeInTheDocument();
     expect(screen.getByText("4 days, 7 hours")).toBeInTheDocument();
-    expect(screen.getByText("Sampled")).toBeInTheDocument();
+    expect(screen.getAllByText("Sampled").length).toBeGreaterThan(0);
     expect(screen.getByText(/Read-only sample completed in 18 ms/)).toBeInTheDocument();
     expect(getSystemIdentity).toHaveBeenCalledWith(server.id);
     expect(document.querySelector("time")).toHaveAttribute(
       "dateTime",
       new Date(identity.sampledAt).toISOString(),
     );
+
+    expect(await screen.findByText("Resource monitoring")).toBeInTheDocument();
+    expect(await screen.findByText("0.42")).toBeInTheDocument();
+    expect(screen.getByText("25.0%")).toBeInTheDocument();
+    expect(screen.getByText("Current")).toBeInTheDocument();
+    expect(getMonitoringSnapshot).toHaveBeenCalledWith(server.id);
+    expect(screen.getAllByText(/Sampled/).length).toBeGreaterThanOrEqual(4);
 
     await user.click(screen.getByRole("button", { name: "Run hostname" }));
 
