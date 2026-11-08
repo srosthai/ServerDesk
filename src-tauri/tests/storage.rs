@@ -17,10 +17,10 @@ fn server_input(name: &str) -> NewServer {
 }
 
 #[test]
-fn initializes_schema_at_version_one() {
+fn initializes_schema_at_current_version() {
     let database = Database::in_memory().expect("in-memory database");
 
-    assert_eq!(database.schema_version().expect("schema version"), 1);
+    assert_eq!(database.schema_version().expect("schema version"), 2);
     assert!(database.list_servers().expect("server list").is_empty());
 }
 
@@ -226,5 +226,25 @@ fn saved_commands_history_and_preferences_round_trip() {
             .get_preference("theme")
             .expect("get preference")
             .is_none()
+    );
+}
+
+#[test]
+fn duplicate_server_names_are_rejected_case_insensitively() {
+    let database = Database::in_memory().expect("in-memory database");
+    let created = database
+        .create_server(&server_input("Production"))
+        .expect("create server");
+
+    assert!(database.create_server(&server_input("production")).is_err());
+    assert!(
+        database
+            .server_name_exists("PRODUCTION", None)
+            .expect("name lookup")
+    );
+    assert!(
+        !database
+            .server_name_exists("PRODUCTION", Some(&created.id))
+            .expect("name lookup excluding self")
     );
 }

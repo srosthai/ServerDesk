@@ -2,10 +2,16 @@ use rusqlite::Connection;
 
 use crate::storage::StorageError;
 
-const MIGRATIONS: &[(&str, &str)] = &[(
-    "0001_initial",
-    include_str!("../../../migrations/0001_initial.sql"),
-)];
+const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "0001_initial",
+        include_str!("../../../migrations/0001_initial.sql"),
+    ),
+    (
+        "0002_unique_server_names",
+        include_str!("../../../migrations/0002_unique_server_names.sql"),
+    ),
+];
 
 pub(crate) fn run_migrations(connection: &mut Connection) -> Result<(), StorageError> {
     let current_version: i32 =
