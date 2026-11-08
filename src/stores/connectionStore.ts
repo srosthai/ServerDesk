@@ -6,6 +6,10 @@ import {
   disconnectServer as disconnectServerCommand,
   getConnectionState,
 } from "@/services/connections";
+import {
+  rejectHostKey as rejectHostKeyCommand,
+  trustHostKey as trustHostKeyCommand,
+} from "@/services/knownHosts";
 import type { ConnectionSnapshot } from "@/types/contracts";
 
 type ConnectionStore = {
@@ -16,6 +20,8 @@ type ConnectionStore = {
   refreshStates: (serverIds: string[]) => Promise<void>;
   connect: (serverId: string) => Promise<boolean>;
   disconnect: (serverId: string) => Promise<boolean>;
+  trustHostKey: (serverId: string, keyType: string, fingerprint: string) => Promise<boolean>;
+  rejectHostKey: (serverId: string, keyType: string, fingerprint: string) => Promise<boolean>;
   clearError: () => void;
 };
 
@@ -87,6 +93,14 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
       const message = getCommandErrorMessage(error);
       const commandError = isCommandError(error) ? error : null;
 
+      if (commandError?.code === "host_key") {
+        try {
+          get().applySnapshot(await getConnectionState(serverId));
+        } catch {
+          // The state-change event carries the same details when available.
+        }
+      }
+
       set((state) => {
         const current = state.connections[serverId];
         const transitional =
@@ -129,6 +143,58 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
 
     try {
       const snapshot = await disconnectServerCommand(serverId);
+      get().applySnapshot(snapshot);
+      return true;
+    } catch (error) {
+      set({ error: getCommandErrorMessage(error) });
+      return false;
+    } finally {
+      set((state) => ({
+        busy: { ...state.busy, [serverId]: false },
+      }));
+    }
+  },
+
+  trustHostKey: async (serverId, keyType, fingerprint) => {
+    if (!isTauriRuntime()) {
+      set({ error: "SSH connections are available in the desktop application." });
+      return false;
+    }
+
+    set((state) => ({
+      busy: { ...state.busy, [serverId]: true },
+      error: null,
+    }));
+
+    try {
+      await trustHostKeyCommand(serverId, keyType, fingerprint);
+    } catch (error) {
+      set({ error: getCommandErrorMessage(error) });
+      set((state) => ({
+        busy: { ...state.busy, [serverId]: false },
+      }));
+      return false;
+    }
+
+    set((state) => ({
+      busy: { ...state.busy, [serverId]: false },
+    }));
+    return get().connect(serverId);
+  },
+
+  rejectHostKey: async (serverId, keyType, fingerprint) => {
+    if (!isTauriRuntime()) {
+      set({ error: "SSH connections are available in the desktop application." });
+      return false;
+    }
+
+    set((state) => ({
+      busy: { ...state.busy, [serverId]: true },
+      error: null,
+    }));
+
+    try {
+      const snapshot = await rejectHostKeyCommand(serverId, keyType, fingerprint);
       get().applySnapshot(snapshot);
       return true;
     } catch (error) {

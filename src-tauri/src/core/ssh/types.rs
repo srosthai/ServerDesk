@@ -35,6 +35,8 @@ impl ConnectionState {
 pub struct HostKeyDetails {
     pub key_type: String,
     pub fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,6 +68,39 @@ impl ConnectionSnapshot {
 pub struct TrustedHostKey {
     pub key_type: String,
     pub fingerprint: String,
+}
+
+/// Validates host-key metadata before it is persisted or compared.
+///
+/// Fingerprints use the standard OpenSSH SHA256 representation:
+/// `SHA256:` followed by the unpadded base64 digest (43 characters).
+pub fn validate_host_key_metadata(key_type: &str, fingerprint: &str) -> Result<(), AppError> {
+    if key_type.is_empty()
+        || key_type.len() > 64
+        || !key_type.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '@')
+        })
+    {
+        return Err(AppError::validation("The SSH host key type is not valid."));
+    }
+
+    let Some(encoded) = fingerprint.strip_prefix("SHA256:") else {
+        return Err(AppError::validation(
+            "Host key fingerprints must use the SHA256 format.",
+        ));
+    };
+
+    if encoded.len() != 43
+        || !encoded
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '+' | '/'))
+    {
+        return Err(AppError::validation(
+            "The host key fingerprint is not a valid SHA256 fingerprint.",
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -287,5 +322,44 @@ mod tests {
                 .code,
             ErrorCode::Credential
         );
+    }
+
+    #[test]
+    fn accepts_standard_openssh_sha256_fingerprints() {
+        let fingerprint = format!("SHA256:{}", "A".repeat(43));
+
+        assert!(validate_host_key_metadata("ssh-ed25519", &fingerprint).is_ok());
+        assert!(
+            validate_host_key_metadata(
+                "ecdsa-sha2-nistp256",
+                &format!(
+                    "SHA256:{}",
+                    "abc+/".repeat(10).chars().take(43).collect::<String>()
+                )
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_host_key_metadata() {
+        for (key_type, fingerprint) in [
+            ("", "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            (
+                "ssh ed25519",
+                "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ),
+            ("ssh-ed25519", "MD5:aa:bb:cc"),
+            ("ssh-ed25519", "SHA256:short"),
+            (
+                "ssh-ed25519",
+                "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            ),
+        ] {
+            assert!(
+                validate_host_key_metadata(key_type, fingerprint).is_err(),
+                "{key_type} {fingerprint} should be rejected"
+            );
+        }
     }
 }

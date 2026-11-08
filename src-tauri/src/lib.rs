@@ -56,7 +56,11 @@ pub fn run() {
             commands::credentials::store_private_key_credential,
             commands::connections::connect_server,
             commands::connections::disconnect_server,
-            commands::connections::get_connection_state
+            commands::connections::get_connection_state,
+            commands::known_hosts::list_known_hosts,
+            commands::known_hosts::trust_host_key,
+            commands::known_hosts::reject_host_key,
+            commands::known_hosts::delete_known_host
         ])
         .build(tauri::generate_context!())
         .expect("error while building ServerDesk");
