@@ -13,7 +13,7 @@ use serverdesk_lib::core::{
     AppError, ErrorCode,
     ssh::{
         Authentication, CommandOutput, ConnectionEventSink, ConnectionManager, ConnectionRequest,
-        ConnectionSnapshot, ConnectionTimeouts, RusshTransport, TrustedHostKey,
+        ConnectionSnapshot, ConnectionState, ConnectionTimeouts, RusshTransport, TrustedHostKey,
     },
 };
 use tokio::net::TcpListener;
@@ -107,6 +107,31 @@ impl FixtureServer {
                 key_type: self.host_key_type.clone(),
                 fingerprint: self.host_fingerprint.clone(),
             }],
+        }
+    }
+
+    fn untrusted_request(
+        &self,
+        username: &str,
+        authentication: Authentication,
+    ) -> ConnectionRequest {
+        ConnectionRequest {
+            trusted_host_keys: Vec::new(),
+            ..self.request(username, authentication)
+        }
+    }
+
+    fn changed_key_request(
+        &self,
+        username: &str,
+        authentication: Authentication,
+    ) -> ConnectionRequest {
+        ConnectionRequest {
+            trusted_host_keys: vec![TrustedHostKey {
+                key_type: self.host_key_type.clone(),
+                fingerprint: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            }],
+            ..self.request(username, authentication)
         }
     }
 
@@ -326,6 +351,81 @@ fn private_key_authentication(key: &str, passphrase: Option<&str>) -> Authentica
         key: key.to_string(),
         passphrase: passphrase.map(str::to_string),
     }
+}
+
+#[tokio::test]
+async fn unknown_host_key_is_presented_before_authentication() {
+    let fixture = FixtureServer::start().await;
+    let manager = manager();
+
+    let error = manager
+        .connect(fixture.untrusted_request(USERNAME, password_authentication(PASSWORD)))
+        .await
+        .expect_err("an unknown host key must not be trusted automatically");
+
+    assert_eq!(error.code, ErrorCode::HostKey);
+    assert!(
+        error
+            .details
+            .as_deref()
+            .unwrap_or_default()
+            .contains(&fixture.host_fingerprint)
+    );
+    assert!(
+        fixture.accepted().is_empty(),
+        "authentication must not run before the host key is accepted"
+    );
+
+    let snapshot = manager.connection_state("fixture-server").expect("state");
+    assert_eq!(snapshot.state, ConnectionState::HostKeyVerification);
+    let host_key = snapshot.host_key.expect("observed host key");
+    assert_eq!(host_key.key_type, fixture.host_key_type);
+    assert_eq!(host_key.fingerprint, fixture.host_fingerprint);
+    assert!(host_key.fingerprint.starts_with("SHA256:"));
+    assert!(host_key.expected_fingerprint.is_none());
+
+    let snapshot = manager
+        .reject_host_key("fixture-server", &host_key.key_type, &host_key.fingerprint)
+        .expect("reject host key");
+    assert_eq!(snapshot.state, ConnectionState::Disconnected);
+    assert!(
+        fixture.accepted().is_empty(),
+        "rejecting a host key must abort before authentication"
+    );
+}
+
+#[tokio::test]
+async fn changed_host_key_blocks_the_connection_without_authentication() {
+    let fixture = FixtureServer::start().await;
+    let manager = manager();
+
+    let error = manager
+        .connect(fixture.changed_key_request(USERNAME, password_authentication(PASSWORD)))
+        .await
+        .expect_err("a changed host key must block the connection");
+
+    assert_eq!(error.code, ErrorCode::HostKey);
+    assert!(error.message.contains("changed"));
+    assert!(
+        fixture.accepted().is_empty(),
+        "authentication must not run when the host key does not match"
+    );
+
+    let snapshot = manager.connection_state("fixture-server").expect("state");
+    assert_eq!(snapshot.state, ConnectionState::Error);
+    let host_key = snapshot.host_key.expect("observed host key");
+    assert_eq!(host_key.fingerprint, fixture.host_fingerprint);
+    assert_eq!(
+        host_key.expected_fingerprint.as_deref(),
+        Some("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    );
+    assert!(
+        manager
+            .pending_host_key("fixture-server")
+            .expect("pending host key")
+            .is_none(),
+        "a changed key must never become a trust-on-first-use candidate"
+    );
 }
 
 #[tokio::test]

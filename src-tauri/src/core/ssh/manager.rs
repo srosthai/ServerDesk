@@ -61,6 +61,81 @@ impl ConnectionManager {
             .unwrap_or_else(|| ConnectionSnapshot::disconnected(server_id)))
     }
 
+    pub fn pending_host_key(&self, server_id: &str) -> Result<Option<HostKeyDetails>, AppError> {
+        let inner = self.lock()?;
+        let details = inner.states.get(server_id).and_then(|snapshot| {
+            if snapshot.state != ConnectionState::HostKeyVerification {
+                return None;
+            }
+            snapshot.host_key.clone()
+        });
+
+        Ok(details)
+    }
+
+    pub fn approve_host_key(
+        &self,
+        server_id: &str,
+        key_type: &str,
+        fingerprint: &str,
+    ) -> Result<ConnectionSnapshot, AppError> {
+        self.resolve_host_key(server_id, key_type, fingerprint)
+    }
+
+    pub fn reject_host_key(
+        &self,
+        server_id: &str,
+        key_type: &str,
+        fingerprint: &str,
+    ) -> Result<ConnectionSnapshot, AppError> {
+        self.resolve_host_key(server_id, key_type, fingerprint)
+    }
+
+    fn resolve_host_key(
+        &self,
+        server_id: &str,
+        key_type: &str,
+        fingerprint: &str,
+    ) -> Result<ConnectionSnapshot, AppError> {
+        let snapshot = {
+            let mut inner = self.lock()?;
+            let current = inner
+                .states
+                .get(server_id)
+                .cloned()
+                .unwrap_or_else(|| ConnectionSnapshot::disconnected(server_id));
+            let Some(details) = current
+                .host_key
+                .as_ref()
+                .filter(|_| current.state == ConnectionState::HostKeyVerification)
+            else {
+                return Err(AppError::host_key(
+                    "There is no host key waiting for verification.",
+                ));
+            };
+
+            if details.key_type != key_type || details.fingerprint != fingerprint {
+                return Err(AppError::host_key(
+                    "The host key changed while it was being verified.",
+                )
+                .with_details(
+                    "Reconnect and verify the fingerprint shown by the new connection attempt.",
+                ));
+            }
+
+            inner.inflight.remove(server_id);
+            transition(
+                &mut inner,
+                server_id,
+                ConnectionState::Disconnected,
+                None,
+                None,
+            )
+        };
+        self.events.emit(&snapshot);
+        Ok(snapshot)
+    }
+
     pub async fn connect(
         &self,
         request: ConnectionRequest,
@@ -152,6 +227,7 @@ impl ConnectionManager {
                 let details = HostKeyDetails {
                     key_type: key_type.clone(),
                     fingerprint: fingerprint.clone(),
+                    expected_fingerprint: None,
                 };
                 let error = TransportError::HostKeyUnknown {
                     key_type,
@@ -175,6 +251,7 @@ impl ConnectionManager {
                 let details = HostKeyDetails {
                     key_type: key_type.clone(),
                     fingerprint: actual_fingerprint.clone(),
+                    expected_fingerprint: Some(expected_fingerprint.clone()),
                 };
                 let error = TransportError::HostKeyChanged {
                     key_type,
@@ -829,6 +906,89 @@ mod tests {
                 .map(|key| key.fingerprint.as_str()),
             Some("SHA256:new")
         );
+        assert_eq!(
+            snapshot
+                .host_key
+                .as_ref()
+                .and_then(|key| key.expected_fingerprint.as_deref()),
+            Some("SHA256:old")
+        );
+        assert_eq!(
+            manager
+                .pending_host_key("server-1")
+                .expect("pending host key"),
+            None
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_host_key_requires_an_explicit_decision() {
+        let transport = MockTransport::failing(TransportError::HostKeyUnknown {
+            key_type: "ssh-ed25519".to_string(),
+            fingerprint: "SHA256:new".to_string(),
+        });
+        let events = Arc::new(RecordingSink::default());
+        let manager = manager(transport, Arc::clone(&events));
+
+        manager
+            .connect(request("server-1"))
+            .await
+            .expect_err("host key must be rejected");
+
+        let pending = manager
+            .pending_host_key("server-1")
+            .expect("pending host key")
+            .expect("verification pending");
+        assert_eq!(pending.key_type, "ssh-ed25519");
+        assert_eq!(pending.fingerprint, "SHA256:new");
+
+        let error = manager
+            .approve_host_key("server-1", "ssh-ed25519", "SHA256:other")
+            .expect_err("a different fingerprint must not be approved");
+        assert_eq!(error.code, crate::core::ErrorCode::HostKey);
+        assert!(
+            manager
+                .pending_host_key("server-1")
+                .expect("pending host key")
+                .is_some()
+        );
+
+        let snapshot = manager
+            .approve_host_key("server-1", "ssh-ed25519", "SHA256:new")
+            .expect("approve pending host key");
+        assert_eq!(snapshot.state, ConnectionState::Disconnected);
+        assert_eq!(
+            manager
+                .pending_host_key("server-1")
+                .expect("pending host key"),
+            None
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejecting_a_host_key_clears_verification_without_a_session() {
+        let transport = Arc::new(MockTransport::failing(TransportError::HostKeyUnknown {
+            key_type: "ssh-ed25519".to_string(),
+            fingerprint: "SHA256:new".to_string(),
+        }));
+        let events = Arc::new(RecordingSink::default());
+        let manager = Arc::new(ConnectionManager::new(
+            Arc::clone(&transport) as Arc<dyn SshTransport>,
+            Arc::clone(&events) as Arc<dyn ConnectionEventSink>,
+            test_timeouts(),
+        ));
+
+        manager
+            .connect(request("server-1"))
+            .await
+            .expect_err("host key must be rejected");
+        let snapshot = manager
+            .reject_host_key("server-1", "ssh-ed25519", "SHA256:new")
+            .expect("reject pending host key");
+
+        assert_eq!(snapshot.state, ConnectionState::Disconnected);
+        assert!(transport.sessions().is_empty());
+        assert_eq!(transport.connect_count(), 1);
     }
 
     #[tokio::test(start_paused = true)]

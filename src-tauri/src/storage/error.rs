@@ -12,6 +12,9 @@ pub enum StorageError {
     #[error("record not found")]
     NotFound,
 
+    #[error("conflicting record: {0}")]
+    Conflict(String),
+
     #[error("invalid stored value: {0}")]
     InvalidValue(String),
 }
