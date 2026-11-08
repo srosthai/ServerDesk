@@ -3,7 +3,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use russh::{
@@ -14,6 +14,7 @@ use russh::{
 use serverdesk_lib::core::{
     AppError, ErrorCode,
     identity::sample_system_identity,
+    monitoring::{MONITORING_COMMANDS, MetricStatus, sample_monitoring_snapshot},
     remote::{RemoteCommand, run_remote_command},
     ssh::{
         Authentication, ConnectionEventSink, ConnectionManager, ConnectionRequest,
@@ -42,6 +43,23 @@ BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
 const UNAME_OUTPUT: &str = "Linux 6.8.0-45-generic x86_64\n";
 const PROC_UPTIME_OUTPUT: &str = "372063.12 1234567.89\n";
 const OS_RELEASE_MISSING: &str = "cat: /etc/os-release: No such file or directory\n";
+const LOADAVG_OUTPUT: &str = "0.42 0.31 0.28 2/512 123456\n";
+const NPROC_OUTPUT: &str = "8\n";
+const MEMINFO_OUTPUT: &str = r#"MemTotal:       16316172 kB
+MemFree:          845624 kB
+MemAvailable:    9247520 kB
+Buffers:          123456 kB
+Cached:          5678901 kB
+"#;
+const DF_OUTPUT: &str = r#"Filesystem     1024-blocks      Used Available Capacity Mounted on
+/dev/vda1         41020672  12345678  26566840      32% /
+/dev/vdb1        103080624  23456789  74345678      24% /mnt/data
+"#;
+const NETDEV_OUTPUT: &str = r#"Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo:    1000      10    0    0    0     0          0         0     1000      10    0    0    0     0       0          0
+  eth0: 123456789   98765    0    0    0     0          0         0 987654321   54321    0    0    0     0       0          0
+"#;
 
 #[derive(Default)]
 struct FixtureState {
@@ -240,6 +258,11 @@ impl server::Handler for FixtureHandler {
             }
             "uname -srm" => respond(session, channel, UNAME_OUTPUT.as_bytes(), b"", 0),
             "cat /proc/uptime" => respond(session, channel, PROC_UPTIME_OUTPUT.as_bytes(), b"", 0),
+            "cat /proc/loadavg" => respond(session, channel, LOADAVG_OUTPUT.as_bytes(), b"", 0),
+            "nproc" => respond(session, channel, NPROC_OUTPUT.as_bytes(), b"", 0),
+            "cat /proc/meminfo" => respond(session, channel, MEMINFO_OUTPUT.as_bytes(), b"", 0),
+            "df -Pk" => respond(session, channel, DF_OUTPUT.as_bytes(), b"", 0),
+            "cat /proc/net/dev" => respond(session, channel, NETDEV_OUTPUT.as_bytes(), b"", 0),
             "uptime" if self.fail_uptime => {
                 respond(session, channel, b"", UPTIME_FAILURE.as_bytes(), 7)
             }
@@ -477,6 +500,89 @@ async fn discovers_system_identity_over_the_authenticated_session() {
             "cat /proc/uptime".to_string(),
         ],
         "identity discovery must send exactly the fixed templates"
+    );
+
+    manager
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+    fixture.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn collects_monitoring_snapshot_with_samples_and_counters() {
+    let fixture = FixtureServer::start(false).await;
+    let manager = manager();
+    manager
+        .connect(fixture.request(true))
+        .await
+        .expect("connect with the trusted host key");
+
+    let started = Instant::now();
+    let snapshot = sample_monitoring_snapshot(&manager, "fixture-server")
+        .await
+        .expect("sample monitoring");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a fixture snapshot must complete within the command timeout"
+    );
+
+    assert_eq!(snapshot.server_id, "fixture-server");
+    assert_eq!(snapshot.connection_state, ConnectionState::Connected);
+    assert!(snapshot.sampled_at > 0);
+
+    assert_eq!(snapshot.cpu.status, MetricStatus::Available);
+    let cpu = snapshot.cpu.data.as_ref().expect("CPU data");
+    assert!((cpu.load_1m - 0.42).abs() < f64::EPSILON);
+    assert!((cpu.load_5m - 0.31).abs() < f64::EPSILON);
+    assert!((cpu.load_15m - 0.28).abs() < f64::EPSILON);
+    assert_eq!(cpu.logical_cpus, Some(8));
+
+    assert_eq!(snapshot.memory.status, MetricStatus::Available);
+    let memory = snapshot.memory.data.as_ref().expect("memory data");
+    assert_eq!(memory.total_bytes, 16_316_172 * 1024);
+    assert_eq!(memory.available_bytes, 9_247_520 * 1024);
+    assert_eq!(
+        memory.used_bytes,
+        memory.total_bytes - memory.available_bytes
+    );
+
+    assert_eq!(snapshot.filesystems.status, MetricStatus::Available);
+    let filesystems = snapshot.filesystems.data.as_ref().expect("filesystem data");
+    assert_eq!(filesystems.len(), 2);
+    assert_eq!(filesystems[0].mount, "/");
+    assert_eq!(filesystems[1].mount, "/mnt/data");
+
+    assert_eq!(snapshot.network.status, MetricStatus::Available);
+    let network = snapshot.network.data.as_ref().expect("network data");
+    assert_eq!(network.len(), 2);
+    let eth0 = network
+        .iter()
+        .find(|interface| interface.interface == "eth0")
+        .expect("eth0");
+    assert_eq!(eth0.received_bytes, 123_456_789);
+    assert_eq!(eth0.transmitted_bytes, 987_654_321);
+
+    for group_time in [
+        snapshot.cpu.sampled_at,
+        snapshot.memory.sampled_at,
+        snapshot.filesystems.sampled_at,
+        snapshot.network.sampled_at,
+    ] {
+        assert!(group_time > 0);
+        assert!(group_time <= snapshot.sampled_at);
+    }
+
+    let mut expected = vec!["true".to_string()];
+    expected.extend(
+        MONITORING_COMMANDS
+            .iter()
+            .map(|command| command.to_string()),
+    );
+    assert_eq!(
+        fixture.executed(),
+        expected,
+        "monitoring must send exactly the fixed command templates"
     );
 
     manager

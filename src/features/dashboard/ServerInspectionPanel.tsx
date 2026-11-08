@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { OutputPanel } from "@/components/ui/output-panel";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { HostKeyVerificationDialog } from "@/features/servers/HostKeyDialogs";
+import { MonitoringCard } from "@/features/dashboard/MonitoringCard";
 import { ServerIdentityCard } from "@/features/dashboard/ServerIdentityCard";
 import { describeConnectionError } from "@/lib/connectionErrors";
 import { isTauriRuntime } from "@/lib/tauri";
@@ -224,6 +225,10 @@ function ServerInspectionPanel({ server }: ServerInspectionPanelProps) {
 
         <div className="border-t border-border px-4 py-4">
           <ServerIdentityCard serverId={server.id} connected={connected} />
+        </div>
+
+        <div className="border-t border-border px-4 py-4">
+          <MonitoringCard serverId={server.id} connected={connected} />
         </div>
 
         <div className="border-t border-border px-4 py-4">
