@@ -20,7 +20,7 @@ fn server_input(name: &str) -> NewServer {
 fn initializes_schema_at_current_version() {
     let database = Database::in_memory().expect("in-memory database");
 
-    assert_eq!(database.schema_version().expect("schema version"), 2);
+    assert_eq!(database.schema_version().expect("schema version"), 3);
     assert!(database.list_servers().expect("server list").is_empty());
 }
 
@@ -87,6 +87,10 @@ fn related_records_survive_and_cascade() {
             name: "storefront".to_string(),
             remote_path: "/var/www/storefront".to_string(),
             project_type: "laravel".to_string(),
+            laravel_version: Some("v11.30.0".to_string()),
+            php_version: Some("8.3.14".to_string()),
+            queue_hint: Some("Queue connection: redis".to_string()),
+            scheduler_hint: None,
         })
         .expect("create project");
     assert_eq!(
@@ -300,5 +304,108 @@ fn trusted_known_hosts_survive_a_database_restart() {
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].key_type, "ssh-ed25519");
         assert_eq!(hosts[0].fingerprint, "SHA256:trusted");
+    }
+}
+
+#[test]
+fn duplicate_project_paths_update_one_record() {
+    let database = Database::in_memory().expect("in-memory database");
+    let server = database
+        .create_server(&server_input("Production"))
+        .expect("create server");
+
+    let first = database
+        .upsert_project(&NewProject {
+            server_id: server.id.clone(),
+            name: "storefront".to_string(),
+            remote_path: "/var/www/storefront".to_string(),
+            project_type: "laravel".to_string(),
+            laravel_version: None,
+            php_version: None,
+            queue_hint: None,
+            scheduler_hint: None,
+        })
+        .expect("first detection");
+
+    let second = database
+        .upsert_project(&NewProject {
+            server_id: server.id.clone(),
+            name: "storefront".to_string(),
+            remote_path: "/var/www/storefront".to_string(),
+            project_type: "laravel".to_string(),
+            laravel_version: Some("v11.30.0".to_string()),
+            php_version: Some("8.3.14".to_string()),
+            queue_hint: Some("Queue connection: redis".to_string()),
+            scheduler_hint: Some("A cron entry runs schedule:run for this path".to_string()),
+        })
+        .expect("second detection");
+
+    assert_eq!(
+        first.id, second.id,
+        "rescanning must keep the existing record"
+    );
+    assert_eq!(
+        database
+            .list_projects(&server.id)
+            .expect("list projects")
+            .len(),
+        1,
+        "the same server and path must never create a duplicate"
+    );
+    assert_eq!(second.laravel_version.as_deref(), Some("v11.30.0"));
+    assert_eq!(second.php_version.as_deref(), Some("8.3.14"));
+    assert!(second.detected_at >= first.detected_at);
+    assert_eq!(
+        database
+            .get_project_by_path(&server.id, "/var/www/storefront")
+            .expect("get by path")
+            .expect("project exists")
+            .id,
+        first.id
+    );
+}
+
+#[test]
+fn projects_survive_a_database_restart() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("serverdesk.sqlite3");
+    let server_id;
+    let project_id;
+
+    {
+        let database = Database::open(&path).expect("open database");
+        let server = database
+            .create_server(&server_input("Production"))
+            .expect("create server");
+        server_id = server.id.clone();
+        project_id = database
+            .upsert_project(&NewProject {
+                server_id: server.id.clone(),
+                name: "storefront".to_string(),
+                remote_path: "/var/www/storefront".to_string(),
+                project_type: "laravel".to_string(),
+                laravel_version: Some("v11.30.0".to_string()),
+                php_version: Some("8.3.14".to_string()),
+                queue_hint: Some("Queue connection: redis".to_string()),
+                scheduler_hint: None,
+            })
+            .expect("create project")
+            .id;
+    }
+
+    {
+        let database = Database::open(&path).expect("reopen database");
+        let projects = database
+            .list_projects(&server_id)
+            .expect("list projects after restart");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, project_id);
+        assert_eq!(projects[0].remote_path, "/var/www/storefront");
+        assert_eq!(projects[0].laravel_version.as_deref(), Some("v11.30.0"));
+        assert_eq!(projects[0].php_version.as_deref(), Some("8.3.14"));
+        assert_eq!(
+            projects[0].queue_hint.as_deref(),
+            Some("Queue connection: redis")
+        );
     }
 }

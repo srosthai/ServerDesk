@@ -104,6 +104,21 @@ The default Overview workspace is the server health dashboard. It shows the sele
 
 Manual refresh updates identity and monitoring in place without a page reload. Monitoring polling uses the interval configured in Settings, clamped to a five-second minimum, and only runs while the selected session is connected. Identity refreshes on demand. A disconnected server never shows live values: the dashboard either shows an explicit unavailable state or retains the last successful sample with its original timestamp and a visible stale marker.
 
+## Laravel project detection
+
+The Projects page never scans a server automatically. The user enters an absolute remote path, browses only its immediate child directories, or explicitly scans that directory and at most one level of subdirectories. The Rust path normalizer collapses duplicate and trailing slashes, removes `.` segments, and rejects relative paths, parent (`..`) segments, control characters, and oversized paths before any remote command is sent. Each path is shell-quoted as a single argument and displayed before scan or navigation actions.
+
+A directory is accepted as a Laravel project only when `artisan`, `composer.json`, `bootstrap/`, and `storage/` are all present. Non-Laravel directories are rejected and never create a project record. Accepted projects are stored locally with the server ID, name, normalized remote path, type, detection time, optional Laravel and PHP versions, and optional queue and scheduler hints.
+
+Version and hint detection is bounded and non-secret:
+
+- The Laravel framework version comes from `vendor/composer/installed.json`; no project code is executed.
+- The PHP CLI version comes from the fixed `php --version` command and is reported as unavailable when the command is missing or its output cannot be parsed.
+- The queue hint extracts only `QUEUE_CONNECTION` from `.env` when readable, and notes Laravel Horizon when Composer reports it.
+- The scheduler hint notes a `schedule:run` cron entry that references the project path, or reports scheduler files without claiming a cron entry exists.
+
+Project records are upserted by the unique `(server_id, remote_path)` pair, so rescanning updates metadata and detection time instead of creating duplicates. Saved projects and their SQLite records survive application restarts. The dashboard shows recent recorded operations with success, failure, or unknown status, the Laravel log path, quick links to the terminal at the project path and the log viewer, and the stored queue and scheduler hints.
+
 ## Command contracts
 
 React calls typed Tauri commands through `src/services/`. Contract types live in `src/types/contracts.ts`, and every command returns a structured `AppError` when it fails. Components do not call `invoke` directly. Tauri event subscriptions use `useTauriEvent`, which cleans up its listener on unmount.
