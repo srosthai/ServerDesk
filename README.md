@@ -119,6 +119,14 @@ Version and hint detection is bounded and non-secret:
 
 Project records are upserted by the unique `(server_id, remote_path)` pair, so rescanning updates metadata and detection time instead of creating duplicates. Saved projects and their SQLite records survive application restarts. The dashboard shows recent recorded operations with success, failure, or unknown status, the Laravel log path, quick links to the terminal at the project path and the log viewer, and the stored queue and scheduler hints.
 
+## Safe Artisan actions
+
+The project dashboard exposes a closed allowlist of fixed commands: `about`, `route:list`, `config:cache`, `config:clear`, `cache:clear`, `optimize:clear`, `queue:restart`, and `migrate:status`. The frontend never sends command text or a project path for an action: it sends a typed action name and the saved project ID. The Rust backend looks up the stored path, validates it again, and builds the command as `cd -- '<project path>' && php artisan <fixed command>`.
+
+Every card shows the exact command and working directory before a button can run it. Cache clears, config cache changes, optimize, and queue restart require an explicit confirmation dialog that repeats the server, target path, and command. The backend independently rejects a destructive action unless the request includes confirmation, so bypassing the UI cannot run one. `queue:restart` is described as a graceful Laravel worker restart, not a Supervisor or systemd restart.
+
+Action output is bounded to 64 KiB per command and each stream is shortened at a display limit while the exit status, stdout, stderr, and duration stay visible. ANSI escapes are stripped. Environment-style lines, secret assignments, bearer tokens, credentialed URLs, and private-key blocks are redacted before output reaches the UI or local history. Operation history stores only the fixed action name and a safe summary with the target path and exit status; it never stores raw output or `.env` values.
+
 ## Command contracts
 
 React calls typed Tauri commands through `src/services/`. Contract types live in `src/types/contracts.ts`, and every command returns a structured `AppError` when it fails. Components do not call `invoke` directly. Tauri event subscriptions use `useTauriEvent`, which cleans up its listener on unmount.
