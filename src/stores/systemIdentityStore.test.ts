@@ -39,6 +39,9 @@ describe("system identity store", () => {
     useSystemIdentityStore.setState({
       identities: {},
       pending: {},
+      stale: {},
+      staleReason: {},
+      lastAttemptAt: {},
       error: null,
     });
   });
@@ -78,7 +81,44 @@ describe("system identity store", () => {
     const state = useSystemIdentityStore.getState();
     expect(state.error).toBe("The server is not connected.");
     expect(state.identities["server-1"]).toBeUndefined();
+    expect(state.stale["server-1"]).toBeUndefined();
     expect(state.pending["server-1"]).toBe(false);
+  });
+
+  it("keeps the last successful identity and marks it stale after a failed refresh", async () => {
+    vi.mocked(getSystemIdentity).mockResolvedValueOnce(identity);
+    await useSystemIdentityStore.getState().refresh("server-1");
+
+    vi.mocked(getSystemIdentity).mockRejectedValueOnce({
+      code: "timeout",
+      message: "The remote command timed out.",
+    });
+    await expect(useSystemIdentityStore.getState().refresh("server-1")).resolves.toBe(false);
+
+    const state = useSystemIdentityStore.getState();
+    expect(state.identities["server-1"]).toEqual(identity);
+    expect(state.stale["server-1"]).toBe(true);
+    expect(state.staleReason["server-1"]).toBe("The remote command timed out.");
+    expect(state.lastAttemptAt["server-1"]).not.toBeNull();
+  });
+
+  it("clears stale state after a later successful identity refresh", async () => {
+    vi.mocked(getSystemIdentity).mockResolvedValueOnce(identity);
+    await useSystemIdentityStore.getState().refresh("server-1");
+
+    vi.mocked(getSystemIdentity).mockRejectedValueOnce({
+      code: "timeout",
+      message: "The remote command timed out.",
+    });
+    await useSystemIdentityStore.getState().refresh("server-1");
+    expect(useSystemIdentityStore.getState().stale["server-1"]).toBe(true);
+
+    vi.mocked(getSystemIdentity).mockResolvedValueOnce(identity);
+    await useSystemIdentityStore.getState().refresh("server-1");
+
+    const state = useSystemIdentityStore.getState();
+    expect(state.stale["server-1"]).toBe(false);
+    expect(state.staleReason["server-1"]).toBeNull();
   });
 
   it("ignores a slow response after a newer refresh or disconnect", async () => {
@@ -109,6 +149,9 @@ describe("system identity store", () => {
 
     const state = useSystemIdentityStore.getState();
     expect(state.identities["server-1"]).toBeUndefined();
+    expect(state.stale["server-1"]).toBeUndefined();
+    expect(state.staleReason["server-1"]).toBeUndefined();
+    expect(state.lastAttemptAt["server-1"]).toBeUndefined();
     expect(state.pending["server-1"]).toBe(false);
     expect(state.error).toBeNull();
   });

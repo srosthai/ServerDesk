@@ -101,12 +101,17 @@ describe("MonitoringCard", () => {
 
     expect(await screen.findByText("Current")).toBeInTheDocument();
     expect(screen.getByText("0.42")).toBeInTheDocument();
+    expect(screen.getByText("5.3%")).toBeInTheDocument();
     expect(screen.getByText("8 logical CPUs available.")).toBeInTheDocument();
     expect(screen.getByText("25.0%")).toBeInTheDocument();
     expect(screen.getByText("8.00 GiB")).toBeInTheDocument();
     expect(screen.getByText("eth0")).toBeInTheDocument();
     expect(screen.getByText("1.40 GiB")).toBeInTheDocument();
     expect(screen.getByText("12,345 RX packets · 6,789 TX packets")).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "Disk used at /" })).toHaveAttribute(
+      "aria-valuenow",
+      "40",
+    );
     expect(screen.getAllByText(/Sampled/).length).toBeGreaterThanOrEqual(4);
     expect(screen.getByText(/Refreshes every 30 s while connected/)).toBeInTheDocument();
   });
@@ -184,5 +189,21 @@ describe("MonitoringCard", () => {
     expect(await screen.findByText("Current")).toBeInTheDocument();
     expect(screen.getByText("0.42")).toBeInTheDocument();
     expect(getMonitoringSnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it("never fabricates metrics before the first successful sample", () => {
+    render(<MonitoringCard serverId="server-1" connected={false} />);
+
+    expect(screen.getByText("No sample")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Connect the server to collect CPU, memory, filesystem, and network snapshots. Polling never runs while the server is disconnected.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("0.42")).not.toBeInTheDocument();
+    expect(screen.queryByText("25.0%")).not.toBeInTheDocument();
+    expect(screen.queryByText("eth0")).not.toBeInTheDocument();
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+    expect(getMonitoringSnapshot).not.toHaveBeenCalled();
   });
 });
