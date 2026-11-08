@@ -82,6 +82,12 @@ The Overview page collects lightweight, snapshot-based monitoring over the authe
 
 Each metric group carries its own sample timestamp and an explicit status: `available`, `unsupported`, or `unavailable`. A transport failure aborts the refresh; the frontend keeps the last successful snapshot, marks it stale, and keeps showing its original sample time. Polling uses the monitoring interval from Settings, clamped to a five-second minimum, and stops whenever no server is selected or the session is disconnected. Manual refresh always remains available while connected.
 
+## Server overview
+
+The default Overview workspace is the server health dashboard. It shows the selected server's connection state, hostname, distribution, kernel, architecture, and uptime alongside CPU load, memory, disk, and network cards. Every metric carries a unit and a sample time, and the dashboard summary reports whether the latest data is live, stale, or unavailable.
+
+Manual refresh updates identity and monitoring in place without a page reload. Monitoring polling uses the interval configured in Settings, clamped to a five-second minimum, and only runs while the selected session is connected. Identity refreshes on demand. A disconnected server never shows live values: the dashboard either shows an explicit unavailable state or retains the last successful sample with its original timestamp and a visible stale marker.
+
 ## Command contracts
 
 React calls typed Tauri commands through `src/services/`. Contract types live in `src/types/contracts.ts`, and every command returns a structured `AppError` when it fails. Components do not call `invoke` directly. Tauri event subscriptions use `useTauriEvent`, which cleans up its listener on unmount.

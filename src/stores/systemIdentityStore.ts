@@ -7,6 +7,9 @@ import type { SystemIdentity } from "@/types/contracts";
 type SystemIdentityStore = {
   identities: Record<string, SystemIdentity>;
   pending: Record<string, boolean>;
+  stale: Record<string, boolean>;
+  staleReason: Record<string, string | null>;
+  lastAttemptAt: Record<string, number | null>;
   error: string | null;
   refresh: (serverId: string) => Promise<boolean>;
   clearServer: (serverId: string) => void;
@@ -20,6 +23,9 @@ export const useSystemIdentityStore = create<SystemIdentityStore>((set) => {
   return {
     identities: {},
     pending: {},
+    stale: {},
+    staleReason: {},
+    lastAttemptAt: {},
     error: null,
 
     refresh: async (serverId) => {
@@ -42,11 +48,22 @@ export const useSystemIdentityStore = create<SystemIdentityStore>((set) => {
 
         set((state) => ({
           identities: { ...state.identities, [serverId]: identity },
+          stale: { ...state.stale, [serverId]: false },
+          staleReason: { ...state.staleReason, [serverId]: null },
+          lastAttemptAt: { ...state.lastAttemptAt, [serverId]: Date.now() },
         }));
         return true;
       } catch (error) {
         if (requestIds[serverId] === requestId) {
-          set({ error: getCommandErrorMessage(error) });
+          const message = getCommandErrorMessage(error);
+          set((state) => ({
+            error: message,
+            stale: state.identities[serverId] ? { ...state.stale, [serverId]: true } : state.stale,
+            staleReason: state.identities[serverId]
+              ? { ...state.staleReason, [serverId]: message }
+              : state.staleReason,
+            lastAttemptAt: { ...state.lastAttemptAt, [serverId]: Date.now() },
+          }));
         }
         return false;
       } finally {
@@ -62,10 +79,19 @@ export const useSystemIdentityStore = create<SystemIdentityStore>((set) => {
       requestIds[serverId] = ++requestCounter;
       set((state) => {
         const identities = { ...state.identities };
+        const stale = { ...state.stale };
+        const staleReason = { ...state.staleReason };
+        const lastAttemptAt = { ...state.lastAttemptAt };
         delete identities[serverId];
+        delete stale[serverId];
+        delete staleReason[serverId];
+        delete lastAttemptAt[serverId];
         return {
           identities,
           pending: { ...state.pending, [serverId]: false },
+          stale,
+          staleReason,
+          lastAttemptAt,
           error: null,
         };
       });

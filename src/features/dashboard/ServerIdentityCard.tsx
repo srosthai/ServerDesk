@@ -6,6 +6,7 @@ import {
   WarningCircleIcon,
 } from "@phosphor-icons/react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useSystemIdentityStore } from "@/stores/systemIdentityStore";
 import { cn } from "@/lib/utils";
@@ -73,6 +74,8 @@ function IdentityField({
 function ServerIdentityCard({ serverId, connected }: ServerIdentityCardProps) {
   const identity = useSystemIdentityStore((state) => state.identities[serverId]);
   const pending = useSystemIdentityStore((state) => state.pending[serverId] ?? false);
+  const stale = useSystemIdentityStore((state) => state.stale[serverId] ?? false);
+  const lastAttemptAt = useSystemIdentityStore((state) => state.lastAttemptAt[serverId] ?? null);
   const error = useSystemIdentityStore((state) => state.error);
   const refresh = useSystemIdentityStore((state) => state.refresh);
   const clearServer = useSystemIdentityStore((state) => state.clearServer);
@@ -110,20 +113,27 @@ function ServerIdentityCard({ serverId, connected }: ServerIdentityCardProps) {
             over the authenticated session.
           </p>
         </div>
-        <Button
-          variant="secondary"
-          size="sm"
-          onClick={handleRefresh}
-          disabled={!connected || pending}
-          aria-label="Refresh identity"
-        >
-          {pending ? (
-            <CircleNotchIcon className="size-3.5 animate-spin" aria-hidden="true" />
-          ) : (
-            <ArrowClockwiseIcon className="size-3.5" aria-hidden="true" />
-          )}
-          {pending ? "Sampling..." : "Refresh identity"}
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          {stale ? (
+            <Badge variant="warning" aria-label="Identity sample is stale">
+              Stale sample
+            </Badge>
+          ) : null}
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={handleRefresh}
+            disabled={!connected || pending}
+            aria-label="Refresh identity"
+          >
+            {pending ? (
+              <CircleNotchIcon className="size-3.5 animate-spin" aria-hidden="true" />
+            ) : (
+              <ArrowClockwiseIcon className="size-3.5" aria-hidden="true" />
+            )}
+            {pending ? "Sampling..." : "Refresh identity"}
+          </Button>
+        </div>
       </div>
 
       {error ? (
@@ -136,7 +146,16 @@ function ServerIdentityCard({ serverId, connected }: ServerIdentityCardProps) {
             <AlertTitle>Could not collect server identity</AlertTitle>
             <AlertDescription>
               {error}
-              {identity ? " Showing the last successful sample." : null}
+              {identity ? (
+                <>
+                  {" "}
+                  Showing the last successful sample from{" "}
+                  <time dateTime={new Date(identity.sampledAt).toISOString()}>
+                    {formatSampleTime(identity.sampledAt)}
+                  </time>
+                  . These values are stale and are not live.
+                </>
+              ) : null}
             </AlertDescription>
           </div>
           <Button variant="ghost" size="sm" onClick={clearError}>
@@ -189,6 +208,14 @@ function ServerIdentityCard({ serverId, connected }: ServerIdentityCardProps) {
             Read-only sample completed in {identity.durationMs} ms. Unavailable fields were not
             guessed from other system data.
           </p>
+          {stale && lastAttemptAt !== null ? (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Last refresh attempt{" "}
+              <time dateTime={new Date(lastAttemptAt).toISOString()}>
+                {formatSampleTime(lastAttemptAt)}
+              </time>
+            </p>
+          ) : null}
         </>
       ) : null}
     </section>

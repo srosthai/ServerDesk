@@ -164,6 +164,10 @@ function MetricGroupCard<T>({
 }
 
 function CpuContent({ data }: { data: CpuMetrics }) {
+  const hasCpuCount = data.logicalCpus !== null && data.logicalCpus > 0;
+  const capacityPercent = hasCpuCount ? (data.load1m / data.logicalCpus!) * 100 : null;
+  const barWidth = capacityPercent === null ? 0 : Math.min(100, Math.max(0, capacityPercent));
+
   return (
     <>
       <div className="grid grid-cols-3 gap-2">
@@ -171,11 +175,39 @@ function CpuContent({ data }: { data: CpuMetrics }) {
         <MetricValue label="5 min" value={formatLoad(data.load5m)} unit="load avg" />
         <MetricValue label="15 min" value={formatLoad(data.load15m)} unit="load avg" />
       </div>
-      <p className="mt-2 text-[11px] text-muted-foreground">
-        {data.logicalCpus === null
-          ? "Logical CPU count unavailable."
-          : `${formatCount(data.logicalCpus)} logical CPUs available.`}
-      </p>
+      {capacityPercent !== null ? (
+        <>
+          <div className="mt-3 flex items-baseline justify-between gap-2">
+            <span className="text-[10px] text-muted-foreground">
+              1 min load relative to {formatCount(data.logicalCpus!)} logical CPUs
+            </span>
+            <span className="shrink-0 font-mono text-[11px] text-foreground">
+              {formatPercent(capacityPercent)}
+            </span>
+          </div>
+          <div
+            role="progressbar"
+            aria-label="Load average relative to logical CPUs"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(barWidth)}
+            className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-muted"
+          >
+            <div className="h-full rounded-full bg-primary" style={{ width: `${barWidth}%` }} />
+          </div>
+          <p className="mt-1.5 text-[10px] text-muted-foreground">
+            {formatCount(data.logicalCpus!)} logical CPUs available.
+          </p>
+          <p className="mt-1 text-[10px] text-muted-foreground">
+            Load average is a run-queue measure, not CPU utilization; it can exceed 100% of the
+            available cores.
+          </p>
+        </>
+      ) : (
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          Logical CPU count unavailable, so relative load cannot be calculated.
+        </p>
+      )}
     </>
   );
 }
@@ -219,23 +251,42 @@ function FilesystemContent({ data }: { data: FilesystemMetrics[] }) {
 
   return (
     <div className="space-y-3">
-      {visible.map((filesystem, index) => (
-        <div key={`${filesystem.mount}-${index}`}>
-          <div className="flex items-baseline justify-between gap-2">
-            <code className="truncate font-mono text-[11px] text-foreground">
-              {filesystem.mount}
-            </code>
-            <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
-              {formatPercent(filesystem.usedPercent)}
-            </span>
+      {visible.map((filesystem, index) => {
+        const barWidth = Math.min(100, Math.max(0, filesystem.usedPercent));
+
+        return (
+          <div key={`${filesystem.mount}-${index}`}>
+            <div className="flex items-baseline justify-between gap-2">
+              <code className="truncate font-mono text-[11px] text-foreground">
+                {filesystem.mount}
+              </code>
+              <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
+                {formatPercent(filesystem.usedPercent)}
+              </span>
+            </div>
+            <div
+              role="progressbar"
+              aria-label={`Disk used at ${filesystem.mount}`}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(barWidth)}
+              className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-muted"
+            >
+              <div className="h-full rounded-full bg-primary" style={{ width: `${barWidth}%` }} />
+            </div>
+            <dl className="mt-1 grid grid-cols-3 gap-2">
+              <MetricValue label="Total" value={formatBytes(filesystem.totalBytes)} />
+              <MetricValue label="Used" value={formatBytes(filesystem.usedBytes)} />
+              <MetricValue label="Available" value={formatBytes(filesystem.availableBytes)} />
+            </dl>
+            {filesystem.filesystem ? (
+              <p className="mt-1 truncate font-mono text-[10px] text-muted-foreground">
+                {filesystem.filesystem}
+              </p>
+            ) : null}
           </div>
-          <dl className="mt-1 grid grid-cols-3 gap-2">
-            <MetricValue label="Total" value={formatBytes(filesystem.totalBytes)} />
-            <MetricValue label="Used" value={formatBytes(filesystem.usedBytes)} />
-            <MetricValue label="Available" value={formatBytes(filesystem.availableBytes)} />
-          </dl>
-        </div>
-      ))}
+        );
+      })}
       {top.length > visible.length ? (
         <p className="text-[10px] text-muted-foreground">
           + {top.length - visible.length} more mounted filesystems not shown.
@@ -274,20 +325,16 @@ function NetworkContent({ data }: { data: NetworkInterfaceMetrics[] }) {
 
 function SnapshotContent({
   snapshot,
-  connected,
-  stale,
   intervalSeconds,
 }: {
   snapshot: MonitoringSnapshot;
-  connected: boolean;
-  stale: boolean;
   intervalSeconds: number;
 }) {
   return (
     <>
       <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
         <span>
-          {stale || !connected ? "Last successful sample" : "Snapshot sampled"}{" "}
+          Last successful sample{" "}
           <time dateTime={dateTimeValue(snapshot.sampledAt)}>
             {formatSampleTime(snapshot.sampledAt)}
           </time>
@@ -305,7 +352,7 @@ function SnapshotContent({
         <MetricGroupCard title="Memory" group={snapshot.memory}>
           {(data: MemoryMetrics) => <MemoryContent data={data} />}
         </MetricGroupCard>
-        <MetricGroupCard title="Filesystems" group={snapshot.filesystems} className="xl:col-span-2">
+        <MetricGroupCard title="Disk" group={snapshot.filesystems} className="xl:col-span-2">
           {(data: FilesystemMetrics[]) => <FilesystemContent data={data} />}
         </MetricGroupCard>
         <MetricGroupCard title="Network" group={snapshot.network} className="xl:col-span-2">
@@ -400,12 +447,7 @@ function MonitoringCard({ serverId, connected }: MonitoringCardProps) {
       ) : null}
 
       {snapshot ? (
-        <SnapshotContent
-          snapshot={snapshot}
-          connected={connected}
-          stale={stale}
-          intervalSeconds={safeIntervalSeconds}
-        />
+        <SnapshotContent snapshot={snapshot} intervalSeconds={safeIntervalSeconds} />
       ) : pending ? (
         <div
           className="mt-3 flex items-center gap-2 text-[11px] text-muted-foreground"
