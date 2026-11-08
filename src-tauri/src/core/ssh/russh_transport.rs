@@ -209,9 +209,12 @@ struct RusshSession {
     closed: AtomicBool,
 }
 
-#[async_trait]
-impl SshSession for RusshSession {
-    async fn execute(&self, command: &str) -> Result<CommandOutput, TransportError> {
+impl RusshSession {
+    async fn execute_with_limit(
+        &self,
+        command: &str,
+        max_output_bytes: usize,
+    ) -> Result<CommandOutput, TransportError> {
         let handle = self.handle.lock().await;
         if self.closed.load(Ordering::SeqCst) || handle.is_closed() {
             return Err(TransportError::Network);
@@ -234,14 +237,24 @@ impl SshSession for RusshSession {
         while let Some(message) = channel.wait().await {
             match message {
                 ChannelMsg::Data { data } => {
-                    if stdout.len() + stderr.len() + data.len() > MAX_COMMAND_OUTPUT_BYTES {
+                    if stdout
+                        .len()
+                        .saturating_add(stderr.len())
+                        .saturating_add(data.len())
+                        > max_output_bytes
+                    {
                         output_too_large = true;
                         break;
                     }
                     stdout.extend_from_slice(&data);
                 }
                 ChannelMsg::ExtendedData { data, .. } => {
-                    if stdout.len() + stderr.len() + data.len() > MAX_COMMAND_OUTPUT_BYTES {
+                    if stdout
+                        .len()
+                        .saturating_add(stderr.len())
+                        .saturating_add(data.len())
+                        > max_output_bytes
+                    {
                         output_too_large = true;
                         break;
                     }
@@ -271,6 +284,23 @@ impl SshSession for RusshSession {
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
             exit_code,
         })
+    }
+}
+
+#[async_trait]
+impl SshSession for RusshSession {
+    async fn execute(&self, command: &str) -> Result<CommandOutput, TransportError> {
+        self.execute_with_limit(command, MAX_COMMAND_OUTPUT_BYTES)
+            .await
+    }
+
+    async fn execute_bounded(
+        &self,
+        command: &str,
+        max_output_bytes: usize,
+    ) -> Result<CommandOutput, TransportError> {
+        self.execute_with_limit(command, max_output_bytes.min(MAX_COMMAND_OUTPUT_BYTES))
+            .await
     }
 
     async fn is_healthy(&self) -> bool {
