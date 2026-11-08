@@ -96,6 +96,19 @@ export type RemoteCommandResult = {
   connectionState: ConnectionState;
 };
 
+export type SystemIdentity = {
+  serverId: string;
+  hostname: string | null;
+  distribution: string | null;
+  distributionVersion: string | null;
+  kernel: string | null;
+  architecture: string | null;
+  uptimeSeconds: number | null;
+  sampledAt: number;
+  durationMs: number;
+  connectionState: ConnectionState;
+};
+
 export type ServerProfile = {
   id: string;
   name: string;

@@ -70,6 +70,12 @@ The Overview page provides the first end-to-end vertical slice: add a profile, c
 
 `cargo test --manifest-path src-tauri/Cargo.toml --test remote_commands` starts an in-process `russh` server and exercises the real client transport, host-key verification, password authentication, command execution, failure output, and disconnect cleanup.
 
+## System identity
+
+The Overview page samples server identity over the authenticated session. Hostname, distribution, and version come from fixed read-only templates (`hostname` and `cat /etc/os-release`), kernel and architecture come from `uname -srm`, and uptime comes from `cat /proc/uptime`. Parsing is per field: if `/etc/os-release` is missing or a distribution does not publish `VERSION_ID`, only those values are shown as unavailable.
+
+Every identity command has a 16 KiB output bound and uses the connection manager's command timeout. The typed `get_system_identity` Tauri command returns a `SystemIdentity` sample with a local sample timestamp, duration, and connection state. The frontend calls it through `src/services/identity.ts` and stores per-server samples in `useSystemIdentityStore`.
+
 ## Command contracts
 
 React calls typed Tauri commands through `src/services/`. Contract types live in `src/types/contracts.ts`, and every command returns a structured `AppError` when it fails. Components do not call `invoke` directly. Tauri event subscriptions use `useTauriEvent`, which cleans up its listener on unmount.

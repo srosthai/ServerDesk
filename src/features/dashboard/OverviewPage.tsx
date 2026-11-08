@@ -47,7 +47,7 @@ function OverviewPage() {
     <div className="space-y-6">
       <PageHeader
         title="Overview"
-        description="Connect to a server and run the first verified remote commands."
+        description="Connect to a server, inspect its identity, and run verified remote commands."
         actions={
           <>
             <Button asChild variant="secondary" size="sm">
@@ -84,7 +84,7 @@ function OverviewPage() {
         <EmptyState
           icon={<SquaresFourIcon className="size-4" aria-hidden="true" />}
           title="No server profiles yet"
-          description="Add a server profile, then connect, verify its host key, authenticate, and run hostname and uptime. This is the first end-to-end ServerDesk flow."
+          description="Add a server profile, then connect, verify its host key, authenticate, inspect its operating system identity, and run hostname and uptime."
           action={
             <Button size="sm" onClick={() => setDialogOpen(true)}>
               <PlusIcon className="size-3.5" aria-hidden="true" />

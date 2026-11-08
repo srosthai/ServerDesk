@@ -12,11 +12,13 @@ import { Button } from "@/components/ui/button";
 import { OutputPanel } from "@/components/ui/output-panel";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { HostKeyVerificationDialog } from "@/features/servers/HostKeyDialogs";
+import { ServerIdentityCard } from "@/features/dashboard/ServerIdentityCard";
 import { describeConnectionError } from "@/lib/connectionErrors";
 import { isTauriRuntime } from "@/lib/tauri";
 import { remoteCommands } from "@/services/remote";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useRemoteCommandStore } from "@/stores/remoteCommandStore";
+import { useSystemIdentityStore } from "@/stores/systemIdentityStore";
 import type { RemoteCommandName, RemoteCommandResult, ServerProfile } from "@/types/contracts";
 
 type ServerInspectionPanelProps = {
@@ -93,6 +95,7 @@ function ServerInspectionPanel({ server }: ServerInspectionPanelProps) {
   const runCommand = useRemoteCommandStore((state) => state.run);
   const clearServer = useRemoteCommandStore((state) => state.clearServer);
   const clearRemoteError = useRemoteCommandStore((state) => state.clearError);
+  const clearIdentity = useSystemIdentityStore((state) => state.clearServer);
 
   const [dismissedConnectionError, setDismissedConnectionError] = useState(false);
 
@@ -114,6 +117,7 @@ function ServerInspectionPanel({ server }: ServerInspectionPanelProps) {
     const disconnected = await disconnect(server.id);
     if (disconnected) {
       clearServer(server.id);
+      clearIdentity(server.id);
     }
   }
 
@@ -217,6 +221,10 @@ function ServerInspectionPanel({ server }: ServerInspectionPanelProps) {
             </Alert>
           </div>
         ) : null}
+
+        <div className="border-t border-border px-4 py-4">
+          <ServerIdentityCard serverId={server.id} connected={connected} />
+        </div>
 
         <div className="border-t border-border px-4 py-4">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
