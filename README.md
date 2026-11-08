@@ -46,10 +46,17 @@ npm run build
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
+## UI system
+
+The interface uses Tailwind CSS with shadcn/ui primitives and IBM Plex typography. Design tokens and theme values live in `src/styles/globals.css`. Shared primitives live in `src/components/ui/`.
+
 ## Project layout
 
 ```text
 src/                  React frontend
+src/components/ui/    Shared UI primitives
+src/features/         Feature modules
+src/styles/           Design tokens and global styles
 src-tauri/            Rust backend and Tauri configuration
 src-tauri/src/        Application entry points and Rust modules
 ```
