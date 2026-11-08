@@ -1,8 +1,19 @@
 import { create } from "zustand";
-import { getCommandErrorMessage } from "@/lib/errors";
+import { getCommandErrorDetails, getCommandErrorMessage } from "@/lib/errors";
 import { isTauriRuntime } from "@/lib/tauri";
-import { browseRemoteDirectories, listProjects, scanRemoteProjects } from "@/services/projects";
-import type { ProjectRecord, ProjectScanResult, RemoteDirectoryListing } from "@/types/contracts";
+import {
+  browseRemoteDirectories,
+  listProjects,
+  runProjectArtisanAction,
+  scanRemoteProjects,
+} from "@/services/projects";
+import type {
+  ArtisanActionName,
+  ProjectArtisanRun,
+  ProjectRecord,
+  ProjectScanResult,
+  RemoteDirectoryListing,
+} from "@/types/contracts";
 
 export type ProjectEntry = {
   projects: ProjectRecord[];
@@ -16,16 +27,37 @@ export type ProjectEntry = {
   scanError: string | null;
 };
 
+export type ProjectActionEntry = {
+  pending: ArtisanActionName | null;
+  run: ProjectArtisanRun | null;
+  error: string | null;
+  errorDetails: string | null;
+};
+
+export type ProjectActionKey = `${string}:${string}`;
+
 type ProjectStore = {
   entries: Record<string, ProjectEntry>;
+  actions: Record<string, ProjectActionEntry>;
   fetchProjects: (serverId: string) => Promise<boolean>;
   browse: (serverId: string, path: string) => Promise<boolean>;
   scan: (serverId: string, path: string, includeChildren: boolean) => Promise<boolean>;
+  runAction: (
+    serverId: string,
+    projectId: string,
+    action: ArtisanActionName,
+    confirmed: boolean,
+  ) => Promise<boolean>;
+  clearActionResult: (serverId: string, projectId: string) => void;
   clearScan: (serverId: string) => void;
   clearBrowse: (serverId: string) => void;
   clearError: (serverId: string) => void;
   clearServer: (serverId: string) => void;
 };
+
+export function projectActionKey(serverId: string, projectId: string): ProjectActionKey {
+  return `${serverId}:${projectId}`;
+}
 
 export function emptyProjectEntry(): ProjectEntry {
   return {
@@ -62,11 +94,12 @@ function mergeProjects(current: ProjectRecord[], incoming: ProjectRecord[]): Pro
   );
 }
 
-export const useProjectStore = create<ProjectStore>((set) => {
+export const useProjectStore = create<ProjectStore>((set, get) => {
   let requestCounter = 0;
   const fetchIds: Record<string, number> = {};
   const browseIds: Record<string, number> = {};
   const scanIds: Record<string, number> = {};
+  const actionIds: Record<string, number> = {};
 
   function updateEntry(serverId: string, update: (entry: ProjectEntry) => ProjectEntry) {
     set((state) => ({
@@ -79,6 +112,7 @@ export const useProjectStore = create<ProjectStore>((set) => {
 
   return {
     entries: {},
+    actions: {},
 
     fetchProjects: async (serverId) => {
       if (!isTauriRuntime()) {
@@ -188,6 +222,75 @@ export const useProjectStore = create<ProjectStore>((set) => {
       }
     },
 
+    runAction: async (serverId, projectId, action, confirmed) => {
+      if (!isTauriRuntime()) {
+        return false;
+      }
+
+      const key = projectActionKey(serverId, projectId);
+      const requestId = ++requestCounter;
+      actionIds[key] = requestId;
+      set((state) => ({
+        actions: {
+          ...state.actions,
+          [key]: {
+            pending: action,
+            run: null,
+            error: null,
+            errorDetails: null,
+          },
+        },
+      }));
+
+      try {
+        const run = await runProjectArtisanAction(serverId, projectId, action, confirmed);
+        if (actionIds[key] !== requestId) {
+          return false;
+        }
+        set((state) => ({
+          actions: {
+            ...state.actions,
+            [key]: {
+              pending: null,
+              run,
+              error: null,
+              errorDetails: null,
+            },
+          },
+        }));
+
+        // The backend records every executed action locally. Refresh the saved
+        // project so the dashboard shows its new recent-operation status.
+        await get().fetchProjects(serverId);
+        return run.result.succeeded;
+      } catch (error) {
+        if (actionIds[key] === requestId) {
+          set((state) => ({
+            actions: {
+              ...state.actions,
+              [key]: {
+                pending: null,
+                run: null,
+                error: getCommandErrorMessage(error),
+                errorDetails: getCommandErrorDetails(error),
+              },
+            },
+          }));
+        }
+        return false;
+      }
+    },
+
+    clearActionResult: (serverId, projectId) => {
+      const key = projectActionKey(serverId, projectId);
+      actionIds[key] = ++requestCounter;
+      set((state) => {
+        const actions = { ...state.actions };
+        delete actions[key];
+        return { actions };
+      });
+    },
+
     clearScan: (serverId) =>
       updateEntry(serverId, (entry) => ({
         ...entry,
@@ -208,10 +311,19 @@ export const useProjectStore = create<ProjectStore>((set) => {
       fetchIds[serverId] = ++requestCounter;
       browseIds[serverId] = ++requestCounter;
       scanIds[serverId] = ++requestCounter;
+      const prefix = `${serverId}:`;
+      for (const key of Object.keys(actionIds)) {
+        if (key.startsWith(prefix)) {
+          actionIds[key] = ++requestCounter;
+        }
+      }
       set((state) => {
         const entries = { ...state.entries };
         delete entries[serverId];
-        return { entries };
+        const actions = Object.fromEntries(
+          Object.entries(state.actions).filter(([key]) => !key.startsWith(prefix)),
+        );
+        return { entries, actions };
       });
     },
   };

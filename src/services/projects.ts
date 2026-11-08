@@ -1,10 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ProjectRecord, ProjectScanResult, RemoteDirectoryListing } from "@/types/contracts";
+import type {
+  ArtisanActionName,
+  ProjectArtisanRun,
+  ProjectRecord,
+  ProjectScanResult,
+  RemoteDirectoryListing,
+} from "@/types/contracts";
 
 export const projectCommands = {
   list: "list_projects",
   browse: "browse_remote_directories",
   scan: "scan_remote_projects",
+  action: "run_project_artisan_action",
   delete: "delete_project",
 } as const;
 
@@ -28,6 +35,20 @@ export function scanRemoteProjects(
     id: serverId,
     path,
     includeChildren,
+  });
+}
+
+export function runProjectArtisanAction(
+  serverId: string,
+  projectId: string,
+  action: ArtisanActionName,
+  confirmed: boolean,
+): Promise<ProjectArtisanRun> {
+  return invoke<ProjectArtisanRun>(projectCommands.action, {
+    id: serverId,
+    projectId,
+    action,
+    confirmed,
   });
 }
 

@@ -4,14 +4,22 @@ import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectsPage } from "@/features/projects/ProjectsPage";
 import { getConnectionState } from "@/services/connections";
-import { browseRemoteDirectories, listProjects, scanRemoteProjects } from "@/services/projects";
+import {
+  browseRemoteDirectories,
+  listProjects,
+  runProjectArtisanAction,
+  scanRemoteProjects,
+} from "@/services/projects";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useProjectStore } from "@/stores/projectStore";
 import { useServerStore } from "@/stores/serverStore";
 import { DEFAULT_PREFERENCES } from "@/lib/preferences";
 import type {
+  ArtisanActionName,
+  ArtisanActionResult,
   ConnectionSnapshot,
+  ProjectArtisanRun,
   ProjectRecord,
   ProjectScanResult,
   RemoteDirectoryListing,
@@ -30,6 +38,7 @@ vi.mock("@/services/projects", () => ({
   listProjects: vi.fn(),
   browseRemoteDirectories: vi.fn(),
   scanRemoteProjects: vi.fn(),
+  runProjectArtisanAction: vi.fn(),
   deleteProject: vi.fn(),
 }));
 
@@ -116,6 +125,38 @@ function scanResult(overrides: Partial<ProjectScanResult> = {}): ProjectScanResu
   };
 }
 
+function artisanRun(
+  action: ArtisanActionName = "about",
+  resultOverrides: Partial<ArtisanActionResult> = {},
+  runOverrides: Partial<ProjectArtisanRun> = {},
+): ProjectArtisanRun {
+  const command = `cd -- '/var/www/storefront' && php artisan ${
+    action === "route-list" ? "route:list" : action === "cache-clear" ? "cache:clear" : action
+  }`;
+  return {
+    result: {
+      serverId: server.id,
+      projectId: project.id,
+      action,
+      command,
+      targetPath: "/var/www/storefront",
+      stdout: "pwd=/var/www/storefront\n",
+      stderr: "",
+      exitCode: 0,
+      succeeded: true,
+      startedAt: 1_762_665_720,
+      durationMs: 42,
+      secretsRedacted: false,
+      outputTruncated: false,
+      connectionState: "connected",
+      ...resultOverrides,
+    },
+    historyRecorded: true,
+    historyError: null,
+    ...runOverrides,
+  };
+}
+
 function enableTauriRuntime() {
   Object.defineProperty(window, "__TAURI_INTERNALS__", {
     configurable: true,
@@ -149,6 +190,7 @@ describe("ProjectsPage", () => {
     vi.mocked(listProjects).mockResolvedValue([]);
     vi.mocked(browseRemoteDirectories).mockReset();
     vi.mocked(scanRemoteProjects).mockReset();
+    vi.mocked(runProjectArtisanAction).mockReset();
   });
 
   it("loads saved projects without scanning automatically", async () => {
@@ -166,7 +208,7 @@ describe("ProjectsPage", () => {
     renderPage();
 
     const card = await screen.findByLabelText("Project storefront");
-    expect(within(card).getByText("/var/www/storefront")).toBeInTheDocument();
+    expect(within(card).getAllByText("/var/www/storefront").length).toBeGreaterThan(0);
     expect(within(card).getByText("v11.30.0")).toBeInTheDocument();
     expect(within(card).getByText("8.3.14")).toBeInTheDocument();
     expect(within(card).getByText(/Laravel Horizon/)).toBeInTheDocument();
@@ -275,5 +317,102 @@ describe("ProjectsPage", () => {
     expect(screen.getByRole("button", { name: "Browse" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Scan directory" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Scan subdirectories" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Run About" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Run Clear application cache" })).toBeDisabled();
+  });
+
+  it("shows the exact fixed command and working directory before execution", async () => {
+    vi.mocked(listProjects).mockResolvedValue([project]);
+    renderPage();
+
+    const card = await screen.findByLabelText("Project storefront");
+    expect(within(card).getByText("Artisan actions")).toBeInTheDocument();
+    expect(
+      within(card).getByText(
+        (_, element) =>
+          element?.tagName === "P" &&
+          (element.textContent ?? "").includes("Fixed commands only") &&
+          (element.textContent ?? "").includes("/var/www/storefront"),
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(card).getByText("cd -- '/var/www/storefront' && php artisan about"),
+    ).toBeInTheDocument();
+    expect(
+      within(card).getByText("cd -- '/var/www/storefront' && php artisan route:list"),
+    ).toBeInTheDocument();
+    expect(
+      within(card).getByText("cd -- '/var/www/storefront' && php artisan migrate:status"),
+    ).toBeInTheDocument();
+    expect(runProjectArtisanAction).not.toHaveBeenCalled();
+  });
+
+  it("runs a read-only action directly but requires confirmation for cache clear", async () => {
+    vi.mocked(listProjects).mockResolvedValue([project]);
+    vi.mocked(runProjectArtisanAction).mockImplementation(async (_serverId, _projectId, action) =>
+      artisanRun(action),
+    );
+    const user = userEvent.setup();
+    renderPage();
+
+    await screen.findByLabelText("Project storefront");
+    await user.click(screen.getByRole("button", { name: "Run About" }));
+
+    await waitFor(() =>
+      expect(runProjectArtisanAction).toHaveBeenCalledWith(server.id, project.id, "about", false),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Run Clear application cache" }));
+
+    expect(runProjectArtisanAction).toHaveBeenCalledTimes(1);
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Clear application cache on storefront?")).toBeInTheDocument();
+    expect(within(dialog).getByText("/var/www/storefront")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("cd -- '/var/www/storefront' && php artisan cache:clear"),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Run command" }));
+
+    await waitFor(() =>
+      expect(runProjectArtisanAction).toHaveBeenCalledWith(
+        server.id,
+        project.id,
+        "cache-clear",
+        true,
+      ),
+    );
+  });
+
+  it("shows failed command output, exit status, and the exact command", async () => {
+    vi.mocked(listProjects).mockResolvedValue([project]);
+    vi.mocked(runProjectArtisanAction).mockResolvedValue(
+      artisanRun("route-list", {
+        exitCode: 3,
+        succeeded: false,
+        stdout: "route output\n",
+        stderr: "route failure detail\n",
+      }),
+    );
+    const user = userEvent.setup();
+    renderPage();
+
+    await screen.findByLabelText("Project storefront");
+    await user.click(screen.getByRole("button", { name: "Run Route list" }));
+
+    const resultSection = await screen.findByLabelText("Route list result");
+    expect(within(resultSection).getByText("Failed")).toBeInTheDocument();
+    expect(within(resultSection).getByText("Exit 3")).toBeInTheDocument();
+    expect(within(resultSection).getByText(/route failure detail/)).toBeInTheDocument();
+    expect(
+      within(resultSection).getByText("cd -- '/var/www/storefront' && php artisan route:list"),
+    ).toBeInTheDocument();
+    expect(
+      within(resultSection).getByText(
+        (content) =>
+          content.includes("Working directory: /var/www/storefront") &&
+          content.includes("route output"),
+      ),
+    ).toBeInTheDocument();
   });
 });

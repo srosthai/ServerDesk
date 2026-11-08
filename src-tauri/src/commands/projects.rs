@@ -1,17 +1,19 @@
 use std::sync::Arc;
 
+use serde::Serialize;
 use tauri::State;
 
 use crate::{
     core::{
         AppError,
+        artisan::{ArtisanAction, ArtisanActionResult, run_artisan_action as run_artisan},
         projects::{
             ProjectRecord, ProjectScanResult, RemoteDirectoryListing,
             list_remote_directories as browse, project_record, scan_remote_projects as scan,
         },
         ssh::ConnectionManager,
     },
-    storage::{Database, NewProject},
+    storage::{Database, NewOperationRecord, NewProject},
 };
 
 #[tauri::command]
@@ -82,6 +84,75 @@ pub async fn scan_remote_projects(
     }
 
     Ok(ProjectScanResult::from_scan(scan, records))
+}
+
+/// One Artisan action result plus the local history write outcome.
+///
+/// A history failure never hides the execution result: the command already
+/// ran, so the UI still receives its bounded output and exit status.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectArtisanRun {
+    pub result: ArtisanActionResult,
+    pub history_recorded: bool,
+    pub history_error: Option<String>,
+}
+
+#[tauri::command]
+pub async fn run_project_artisan_action(
+    database: State<'_, Database>,
+    manager: State<'_, Arc<ConnectionManager>>,
+    id: String,
+    project_id: String,
+    action: ArtisanAction,
+    confirmed: bool,
+) -> Result<ProjectArtisanRun, AppError> {
+    if id.trim().is_empty() {
+        return Err(AppError::validation("Server ID is required."));
+    }
+    if project_id.trim().is_empty() {
+        return Err(AppError::validation("Project ID is required."));
+    }
+
+    let project = database
+        .get_project(&project_id)?
+        .ok_or_else(|| AppError::not_found("The saved project no longer exists."))?;
+    if project.server_id != id {
+        return Err(AppError::validation(
+            "The saved project does not belong to the selected server.",
+        ));
+    }
+
+    let project_id = project.id;
+    let result = run_artisan(
+        manager.inner().as_ref(),
+        &id,
+        &project_id,
+        &project.remote_path,
+        action,
+        confirmed,
+    )
+    .await?;
+
+    let record = NewOperationRecord {
+        server_id: Some(id),
+        project_id: Some(project_id),
+        operation: result.action.operation_name().to_string(),
+        safe_summary: result.safe_summary(),
+        exit_code: result.exit_code.and_then(|code| i32::try_from(code).ok()),
+        started_at: result.started_at,
+        duration_ms: i64::try_from(result.duration_ms).unwrap_or(i64::MAX),
+    };
+    let (history_recorded, history_error) = match database.record_operation(&record) {
+        Ok(_) => (true, None),
+        Err(error) => (false, Some(error.to_string())),
+    };
+
+    Ok(ProjectArtisanRun {
+        result,
+        history_recorded,
+        history_error,
+    })
 }
 
 #[tauri::command]

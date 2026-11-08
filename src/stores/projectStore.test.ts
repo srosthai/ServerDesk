@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { browseRemoteDirectories, listProjects, scanRemoteProjects } from "@/services/projects";
+import {
+  browseRemoteDirectories,
+  listProjects,
+  runProjectArtisanAction,
+  scanRemoteProjects,
+} from "@/services/projects";
 import { useProjectStore } from "@/stores/projectStore";
 import type { ProjectRecord, ProjectScanResult, RemoteDirectoryListing } from "@/types/contracts";
 
@@ -7,6 +12,7 @@ vi.mock("@/services/projects", () => ({
   listProjects: vi.fn(),
   browseRemoteDirectories: vi.fn(),
   scanRemoteProjects: vi.fn(),
+  runProjectArtisanAction: vi.fn(),
   deleteProject: vi.fn(),
 }));
 
@@ -66,10 +72,11 @@ function enableTauriRuntime() {
 describe("project store", () => {
   beforeEach(() => {
     enableTauriRuntime();
-    useProjectStore.setState({ entries: {} });
+    useProjectStore.setState({ entries: {}, actions: {} });
     vi.mocked(listProjects).mockReset();
     vi.mocked(browseRemoteDirectories).mockReset();
     vi.mocked(scanRemoteProjects).mockReset();
+    vi.mocked(runProjectArtisanAction).mockReset();
   });
 
   it("loads saved projects for one server without scanning", async () => {
@@ -165,5 +172,62 @@ describe("project store", () => {
     const entry = useProjectStore.getState().entries["server-1"];
     expect(entry?.listing).toBeNull();
     expect(entry?.browseError).toBe("Permission denied.");
+  });
+
+  it("runs a fixed Artisan action and refreshes the project dashboard", async () => {
+    vi.mocked(listProjects).mockResolvedValue([project()]);
+    vi.mocked(runProjectArtisanAction).mockResolvedValue({
+      result: {
+        serverId: "server-1",
+        projectId: "project-1",
+        action: "cache-clear",
+        command: "cd -- '/var/www/storefront' && php artisan cache:clear",
+        targetPath: "/var/www/storefront",
+        stdout: "Cache cleared successfully.\n",
+        stderr: "",
+        exitCode: 0,
+        succeeded: true,
+        startedAt: 1_762_665_720,
+        durationMs: 42,
+        secretsRedacted: false,
+        outputTruncated: false,
+        connectionState: "connected",
+      },
+      historyRecorded: true,
+      historyError: null,
+    });
+
+    await expect(
+      useProjectStore.getState().runAction("server-1", "project-1", "cache-clear", true),
+    ).resolves.toBe(true);
+
+    expect(runProjectArtisanAction).toHaveBeenCalledWith(
+      "server-1",
+      "project-1",
+      "cache-clear",
+      true,
+    );
+    expect(listProjects).toHaveBeenCalledWith("server-1");
+    const actionEntry = useProjectStore.getState().actions["server-1:project-1"];
+    expect(actionEntry?.pending).toBeNull();
+    expect(actionEntry?.run?.result.command).toContain("php artisan cache:clear");
+  });
+
+  it("keeps a rejected action visible as an error without inventing a result", async () => {
+    vi.mocked(runProjectArtisanAction).mockRejectedValueOnce({
+      code: "validation",
+      message: "Cache clear requires explicit confirmation before it can run.",
+      details: "Review the target project path and the exact fixed command.",
+    });
+
+    await expect(
+      useProjectStore.getState().runAction("server-1", "project-1", "cache-clear", false),
+    ).resolves.toBe(false);
+
+    const actionEntry = useProjectStore.getState().actions["server-1:project-1"];
+    expect(actionEntry?.run).toBeNull();
+    expect(actionEntry?.pending).toBeNull();
+    expect(actionEntry?.error).toContain("explicit confirmation");
+    expect(actionEntry?.errorDetails).toContain("exact fixed command");
   });
 });
