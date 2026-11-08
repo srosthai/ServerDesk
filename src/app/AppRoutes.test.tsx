@@ -15,7 +15,7 @@ describe("application shell", () => {
 
     expect(await screen.findByRole("heading", { name: "Servers" })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Servers" })).toHaveAttribute("aria-current", "page");
-    expect(screen.getByText("No server profiles yet")).toBeInTheDocument();
+    expect(await screen.findByText("No server profiles yet")).toBeInTheDocument();
   });
 
   it("opens settings from navigation", async () => {
