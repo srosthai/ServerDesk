@@ -1,0 +1,147 @@
+:root {
+  font-family:
+    ui-sans-serif,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    "IBM Plex Sans",
+    sans-serif;
+  color: #171b18;
+  background: #f3f4f0;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --surface: #f3f4f0;
+  --ink: #171b18;
+  --muted: #626a63;
+  --line: #d8dbd3;
+  --accent: #a5480e;
+  --mark-surface: #171b18;
+  --mark-ink: #f3f4f0;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color: #eceee8;
+    background: #0f1412;
+    --surface: #0f1412;
+    --ink: #eceee8;
+    --muted: #98a199;
+    --line: #2a332e;
+    --accent: #e7a44a;
+    --mark-surface: #eceee8;
+    --mark-ink: #0f1412;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-width: 320px;
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  min-height: 100dvh;
+}
+
+.launch {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  min-height: 100dvh;
+  padding: clamp(1.5rem, 4vw, 3.5rem);
+  color: var(--ink);
+  background:
+    radial-gradient(
+      circle at 92% 8%,
+      color-mix(in srgb, var(--accent) 10%, transparent),
+      transparent 30%
+    ),
+    var(--surface);
+}
+
+.launch__brand {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.launch__mark {
+  display: grid;
+  width: 1.85rem;
+  height: 1.85rem;
+  place-items: center;
+  color: var(--mark-ink);
+  background: var(--mark-surface);
+  border-radius: 0.25rem;
+  font-size: 0.95rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.launch__body {
+  align-self: center;
+  max-width: 62rem;
+  padding: 4rem 0;
+}
+
+.launch__status {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin: 0 0 1.75rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.launch__dot {
+  width: 0.45rem;
+  height: 0.45rem;
+  background: var(--accent);
+  border-radius: 999px;
+}
+
+.launch h1 {
+  max-width: 11ch;
+  margin: 0;
+  font-size: clamp(2.75rem, 7vw, 6rem);
+  font-weight: 620;
+  letter-spacing: -0.055em;
+  line-height: 0.94;
+}
+
+.launch__lede {
+  max-width: 47ch;
+  margin: 1.75rem 0 0;
+  color: var(--muted);
+  font-size: clamp(1rem, 1.4vw, 1.15rem);
+  line-height: 1.6;
+}
+
+.launch__footer {
+  display: flex;
+  justify-content: space-between;
+  padding-top: 1.25rem;
+  color: var(--muted);
+  border-top: 1px solid var(--line);
+  font-family: ui-monospace, "SFMono-Regular", "Cascadia Mono", monospace;
+  font-size: 0.75rem;
+}
+
+@media (max-width: 640px) {
+  .launch__body {
+    padding: 2.5rem 0;
+  }
+
+  .launch h1 {
+    max-width: 9ch;
+  }
+}
