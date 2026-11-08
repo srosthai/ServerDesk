@@ -31,3 +31,22 @@ export type UserPreferences = {
   monitoringIntervalSeconds: number;
   lastActiveServerId: string | null;
 };
+
+export type AuthType = "password" | "private_key";
+
+export type ServerProfile = {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  authType: AuthType;
+  credentialRef: string | null;
+  groupName: string | null;
+  tags: string[];
+  notes: string | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type ServerProfileInput = Omit<ServerProfile, "id" | "createdAt" | "updatedAt">;
