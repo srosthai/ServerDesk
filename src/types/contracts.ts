@@ -82,6 +82,20 @@ export type ConnectionTestOutcome =
   | { status: "connected"; durationMs: number }
   | { status: "hostKeyVerification"; hostKey: HostKeyDetails };
 
+export type RemoteCommandName = "hostname" | "uptime";
+
+export type RemoteCommandResult = {
+  serverId: string;
+  command: RemoteCommandName;
+  template: string;
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  succeeded: boolean;
+  durationMs: number;
+  connectionState: ConnectionState;
+};
+
 export type ServerProfile = {
   id: string;
   name: string;
