@@ -109,6 +109,57 @@ export type SystemIdentity = {
   connectionState: ConnectionState;
 };
 
+export type MetricStatus = "available" | "unsupported" | "unavailable";
+
+export type MetricGroup<T> = {
+  status: MetricStatus;
+  sampledAt: number;
+  data: T | null;
+  detail: string | null;
+};
+
+export type CpuMetrics = {
+  load1m: number;
+  load5m: number;
+  load15m: number;
+  logicalCpus: number | null;
+};
+
+export type MemoryMetrics = {
+  totalBytes: number;
+  usedBytes: number;
+  availableBytes: number;
+  usedPercent: number;
+};
+
+export type FilesystemMetrics = {
+  filesystem: string | null;
+  mount: string;
+  totalBytes: number;
+  usedBytes: number;
+  availableBytes: number;
+  usedPercent: number;
+};
+
+export type NetworkInterfaceMetrics = {
+  interface: string;
+  receivedBytes: number;
+  transmittedBytes: number;
+  receivedPackets: number;
+  transmittedPackets: number;
+};
+
+export type MonitoringSnapshot = {
+  serverId: string;
+  sampledAt: number;
+  durationMs: number;
+  connectionState: ConnectionState;
+  cpu: MetricGroup<CpuMetrics>;
+  memory: MetricGroup<MemoryMetrics>;
+  filesystems: MetricGroup<FilesystemMetrics[]>;
+  network: MetricGroup<NetworkInterfaceMetrics[]>;
+};
+
 export type ServerProfile = {
   id: string;
   name: string;
