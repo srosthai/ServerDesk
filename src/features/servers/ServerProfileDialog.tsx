@@ -209,22 +209,40 @@ function ServerProfileDialog({ server, onOpenChange }: ServerProfileDialogProps)
             {isTauriRuntime() ? (
               <div className="space-y-2 sm:col-span-2">
                 <Label htmlFor="server-secret">
-                  {authType === "password" ? "SSH password" : "Key passphrase"}
+                  {authType === "password" ? "SSH password" : "Private key"}
                 </Label>
-                <Input
-                  id="server-secret"
-                  type="password"
-                  value={secret}
-                  onChange={(event) => setSecret(event.currentTarget.value)}
-                  placeholder={
-                    server?.credentialRef
-                      ? "Leave blank to keep the existing secret"
-                      : "Optional now; stored in the OS credential store"
-                  }
-                  autoComplete="new-password"
-                />
+                {authType === "password" ? (
+                  <Input
+                    id="server-secret"
+                    type="password"
+                    value={secret}
+                    onChange={(event) => setSecret(event.currentTarget.value)}
+                    placeholder={
+                      server?.credentialRef
+                        ? "Leave blank to keep the existing secret"
+                        : "Optional now; stored in the OS credential store"
+                    }
+                    autoComplete="new-password"
+                  />
+                ) : (
+                  <Textarea
+                    id="server-secret"
+                    value={secret}
+                    onChange={(event) => setSecret(event.currentTarget.value)}
+                    placeholder={
+                      server?.credentialRef
+                        ? "Leave blank to keep the existing key"
+                        : "Paste an unencrypted OpenSSH private key, or enter a key file path"
+                    }
+                    className="min-h-20 font-mono text-[11px]"
+                    spellCheck={false}
+                  />
+                )}
                 <p className="text-[11px] leading-relaxed text-muted-foreground">
                   Secrets are stored in the OS credential store, never in SQLite or logs.
+                  {authType === "private_key"
+                    ? " Encrypted keys are not supported yet; save an unencrypted key or a path to one."
+                    : null}
                 </p>
               </div>
             ) : null}

@@ -7,8 +7,9 @@ use crate::{
         AppError,
         credentials::CredentialStore,
         servers::{ServerProfile, ServerProfileInput},
+        ssh::ConnectionManager,
     },
-    storage::Database,
+    storage::{Database, NewServer, Server},
 };
 
 #[tauri::command]
@@ -47,8 +48,9 @@ pub fn create_server(
 }
 
 #[tauri::command]
-pub fn update_server(
+pub async fn update_server(
     database: State<'_, Database>,
+    connection_manager: State<'_, Arc<ConnectionManager>>,
     id: String,
     input: ServerProfileInput,
 ) -> Result<ServerProfile, AppError> {
@@ -60,17 +62,34 @@ pub fn update_server(
         ));
     }
 
+    if let Some(existing) = database.get_server(&id)?
+        && connection_details_changed(&existing, &new_server)
+    {
+        connection_manager.disconnect(&id).await?;
+    }
+
     Ok(ServerProfile::from(
         database.update_server(&id, &new_server)?,
     ))
 }
 
+fn connection_details_changed(existing: &Server, updated: &NewServer) -> bool {
+    existing.host != updated.host
+        || existing.port != updated.port
+        || existing.username != updated.username
+        || existing.auth_type != updated.auth_type
+        || existing.credential_ref != updated.credential_ref
+}
+
 #[tauri::command]
-pub fn delete_server(
+pub async fn delete_server(
     database: State<'_, Database>,
     credentials: State<'_, Arc<dyn CredentialStore>>,
+    connection_manager: State<'_, Arc<ConnectionManager>>,
     id: String,
 ) -> Result<(), AppError> {
+    connection_manager.disconnect(&id).await?;
+
     if let Some(reference) = database
         .get_server(&id)?
         .and_then(|server| server.credential_ref)

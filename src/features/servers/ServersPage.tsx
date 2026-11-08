@@ -2,8 +2,10 @@ import { useEffect, useState } from "react";
 import {
   HardDrivesIcon,
   InfoIcon,
+  LinkBreakIcon,
   MagnifyingGlassIcon,
   PencilSimpleIcon,
+  PlugsIcon,
   PlusIcon,
   TrashIcon,
   WarningCircleIcon,
@@ -31,8 +33,10 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { StatusBadge } from "@/components/ui/status-badge";
 import { ServerProfileDialog } from "@/features/servers/ServerProfileDialog";
 import { isTauriRuntime } from "@/lib/tauri";
+import { useConnectionStore } from "@/stores/connectionStore";
 import { useServerStore } from "@/stores/serverStore";
 import type { AuthType, ServerProfile } from "@/types/contracts";
 
@@ -49,6 +53,14 @@ function ServersPage() {
   const deleteServer = useServerStore((state) => state.deleteServer);
   const clearError = useServerStore((state) => state.clearError);
 
+  const connections = useConnectionStore((state) => state.connections);
+  const connectionBusy = useConnectionStore((state) => state.busy);
+  const connectionError = useConnectionStore((state) => state.error);
+  const refreshConnectionStates = useConnectionStore((state) => state.refreshStates);
+  const connect = useConnectionStore((state) => state.connect);
+  const disconnect = useConnectionStore((state) => state.disconnect);
+  const clearConnectionError = useConnectionStore((state) => state.clearError);
+
   const [query, setQuery] = useState("");
   const [groupFilter, setGroupFilter] = useState("all");
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -61,6 +73,12 @@ function ServersPage() {
       void fetchServers();
     }
   }, [status, fetchServers]);
+
+  useEffect(() => {
+    if (status === "ready" && servers.length > 0) {
+      void refreshConnectionStates(servers.map((server) => server.id));
+    }
+  }, [status, servers, refreshConnectionStates]);
 
   const groups = Array.from(
     new Set(
@@ -153,6 +171,22 @@ function ServersPage() {
         </Alert>
       ) : null}
 
+      {connectionError ? (
+        <Alert variant="destructive">
+          <WarningCircleIcon
+            className="mt-0.5 size-4 shrink-0 text-destructive"
+            aria-hidden="true"
+          />
+          <div className="flex-1">
+            <AlertTitle>Connection action failed</AlertTitle>
+            <AlertDescription>{connectionError}</AlertDescription>
+          </div>
+          <Button variant="ghost" size="sm" onClick={clearConnectionError}>
+            Dismiss
+          </Button>
+        </Alert>
+      ) : null}
+
       {servers.length > 0 ? (
         <div className="flex flex-col gap-2 sm:flex-row">
           <div className="relative flex-1">
@@ -226,68 +260,125 @@ function ServersPage() {
                 <TableHead>Auth</TableHead>
                 <TableHead>Group</TableHead>
                 <TableHead className="hidden xl:table-cell">Tags</TableHead>
-                <TableHead className="w-20 text-right">Actions</TableHead>
+                <TableHead>Connection</TableHead>
+                <TableHead className="w-24 text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {filtered.map((server) => (
-                <TableRow key={server.id}>
-                  <TableCell>
-                    <div className="font-medium text-foreground">{server.name}</div>
-                    <div className="mt-0.5 font-mono text-[11px] text-muted-foreground">
-                      {server.host}:{server.port}
-                    </div>
-                  </TableCell>
-                  <TableCell className="font-mono text-[12px]">{server.username}</TableCell>
-                  <TableCell className="text-[12px] text-muted-foreground">
-                    {authLabels[server.authType]}
-                  </TableCell>
-                  <TableCell>
-                    {server.groupName ? (
-                      <Badge variant="secondary">{server.groupName}</Badge>
-                    ) : (
-                      <span className="text-[12px] text-muted-foreground">None</span>
-                    )}
-                  </TableCell>
-                  <TableCell className="hidden xl:table-cell">
-                    <div className="flex flex-wrap gap-1">
-                      {server.tags.slice(0, 2).map((tag) => (
-                        <Badge key={tag} variant="outline">
-                          {tag}
-                        </Badge>
-                      ))}
-                      {server.tags.length > 2 ? (
-                        <Badge variant="outline">+{server.tags.length - 2}</Badge>
-                      ) : null}
-                      {server.tags.length === 0 ? (
+              {filtered.map((server) => {
+                const connection = connections[server.id];
+                const connectionState = connection?.state ?? "disconnected";
+                const busy = connectionBusy[server.id] ?? false;
+                const canConnect =
+                  connectionState === "disconnected" || connectionState === "error";
+
+                return (
+                  <TableRow key={server.id}>
+                    <TableCell>
+                      <div className="font-medium text-foreground">{server.name}</div>
+                      <div className="mt-0.5 font-mono text-[11px] text-muted-foreground">
+                        {server.host}:{server.port}
+                      </div>
+                    </TableCell>
+                    <TableCell className="font-mono text-[12px]">{server.username}</TableCell>
+                    <TableCell className="text-[12px] text-muted-foreground">
+                      {authLabels[server.authType]}
+                    </TableCell>
+                    <TableCell>
+                      {server.groupName ? (
+                        <Badge variant="secondary">{server.groupName}</Badge>
+                      ) : (
                         <span className="text-[12px] text-muted-foreground">None</span>
-                      ) : null}
-                    </div>
-                  </TableCell>
-                  <TableCell>
-                    <div className="flex justify-end gap-1">
-                      <Button
-                        variant="ghost"
-                        size="icon-sm"
-                        onClick={() => openEditDialog(server)}
-                        aria-label={`Edit ${server.name}`}
-                        title="Edit server"
-                      >
-                        <PencilSimpleIcon className="size-3.5" aria-hidden="true" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon-sm"
-                        onClick={() => setDeleteTarget(server)}
-                        aria-label={`Delete ${server.name}`}
-                        title="Delete server"
-                      >
-                        <TrashIcon className="size-3.5" aria-hidden="true" />
-                      </Button>
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ))}
+                      )}
+                    </TableCell>
+                    <TableCell className="hidden xl:table-cell">
+                      <div className="flex flex-wrap gap-1">
+                        {server.tags.slice(0, 2).map((tag) => (
+                          <Badge key={tag} variant="outline">
+                            {tag}
+                          </Badge>
+                        ))}
+                        {server.tags.length > 2 ? (
+                          <Badge variant="outline">+{server.tags.length - 2}</Badge>
+                        ) : null}
+                        {server.tags.length === 0 ? (
+                          <span className="text-[12px] text-muted-foreground">None</span>
+                        ) : null}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <div className="max-w-56 space-y-1">
+                        <StatusBadge state={connectionState} />
+                        {connection?.error ? (
+                          <div
+                            className="truncate text-[11px] text-destructive"
+                            title={connection.error.message}
+                          >
+                            {connection.error.message}
+                          </div>
+                        ) : null}
+                        {connection?.hostKey ? (
+                          <div
+                            className="truncate font-mono text-[10px] text-muted-foreground"
+                            title={`${connection.hostKey.keyType} ${connection.hostKey.fingerprint}`}
+                          >
+                            {connection.hostKey.fingerprint}
+                          </div>
+                        ) : null}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex justify-end gap-1">
+                        {isTauriRuntime() ? (
+                          canConnect ? (
+                            <Button
+                              variant="secondary"
+                              size="icon-sm"
+                              onClick={() => void connect(server.id)}
+                              disabled={busy}
+                              aria-label={`Connect ${server.name}`}
+                              title="Connect"
+                            >
+                              <PlugsIcon className="size-3.5" aria-hidden="true" />
+                            </Button>
+                          ) : (
+                            <Button
+                              variant="ghost"
+                              size="icon-sm"
+                              onClick={() => void disconnect(server.id)}
+                              disabled={busy}
+                              aria-label={`Disconnect ${server.name}`}
+                              title={
+                                connectionState === "connected" ? "Disconnect" : "Cancel connection"
+                              }
+                            >
+                              <LinkBreakIcon className="size-3.5" aria-hidden="true" />
+                            </Button>
+                          )
+                        ) : null}
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={() => openEditDialog(server)}
+                          aria-label={`Edit ${server.name}`}
+                          title="Edit server"
+                        >
+                          <PencilSimpleIcon className="size-3.5" aria-hidden="true" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={() => setDeleteTarget(server)}
+                          aria-label={`Delete ${server.name}`}
+                          title="Delete server"
+                        >
+                          <TrashIcon className="size-3.5" aria-hidden="true" />
+                        </Button>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
             </TableBody>
           </Table>
         </div>
