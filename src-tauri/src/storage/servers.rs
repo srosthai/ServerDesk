@@ -148,3 +148,32 @@ fn row_to_server(row: &Row<'_>) -> rusqlite::Result<Server> {
         updated_at: row.get(11)?,
     })
 }
+
+impl Database {
+    pub fn server_name_exists(
+        &self,
+        name: &str,
+        exclude_id: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        self.with_connection(|connection| {
+            let exists: i64 = match exclude_id {
+                Some(id) => connection.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM servers WHERE name = ?1 COLLATE NOCASE AND id <> ?2
+                    )",
+                    params![name, id],
+                    |row| row.get(0),
+                )?,
+                None => connection.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM servers WHERE name = ?1 COLLATE NOCASE
+                    )",
+                    params![name],
+                    |row| row.get(0),
+                )?,
+            };
+
+            Ok(exists != 0)
+        })
+    }
+}
