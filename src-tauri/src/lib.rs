@@ -1,5 +1,7 @@
 use tauri::Manager;
 
+pub mod commands;
+pub mod core;
 pub mod storage;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -15,6 +17,7 @@ pub fn run() {
 
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![commands::system::get_app_info])
         .run(tauri::generate_context!())
         .expect("error while running ServerDesk");
 }

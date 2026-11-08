@@ -46,6 +46,10 @@ npm run build
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
+## Command contracts
+
+React calls typed Tauri commands through `src/services/`. Contract types live in `src/types/contracts.ts`, and every command returns a structured `AppError` when it fails. Components do not call `invoke` directly. Tauri event subscriptions use `useTauriEvent`, which cleans up its listener on unmount.
+
 ## UI system
 
 The interface uses Tailwind CSS with shadcn/ui primitives and IBM Plex typography. Design tokens and theme values live in `src/styles/globals.css`. Shared primitives live in `src/components/ui/`.
