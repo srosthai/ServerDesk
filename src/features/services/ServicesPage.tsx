@@ -1,17 +1,30 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   ArrowClockwiseIcon,
+  CaretDownIcon,
+  CaretLeftIcon,
+  CaretRightIcon,
+  CaretUpDownIcon,
+  CaretUpIcon,
+  CheckCircleIcon,
   CircleNotchIcon,
   GaugeIcon,
   InfoIcon,
+  MagnifyingGlassIcon,
+  MinusCircleIcon,
+  PlayIcon,
+  QuestionIcon,
+  StopIcon,
   WarningCircleIcon,
+  XCircleIcon,
 } from "@phosphor-icons/react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/ui/empty-state";
+import { Input } from "@/components/ui/input";
 import { OutputPanel } from "@/components/ui/output-panel";
 import { PageHeader } from "@/components/ui/page-header";
 import {
@@ -31,6 +44,13 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import {
+  filterAndSortServices,
+  serviceActionTranscript,
+  type ServiceSort,
+  type ServiceSortKey,
+  type ServiceStateFilter,
+} from "@/features/services/serviceView";
 import { isTauriRuntime } from "@/lib/tauri";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
@@ -48,17 +68,33 @@ import type {
   ServiceState,
 } from "@/types/contracts";
 
-type ServiceStateBadge = {
+const SERVICE_PAGE_SIZE = 25;
+
+type ServiceStateBadgeConfig = {
   label: string;
   variant: "success" | "warning" | "danger" | "outline";
+  Icon: typeof CheckCircleIcon;
 };
 
-const serviceStateBadges: Record<ServiceState, ServiceStateBadge> = {
-  active: { label: "Active", variant: "success" },
-  inactive: { label: "Inactive", variant: "outline" },
-  failed: { label: "Failed", variant: "danger" },
-  unknown: { label: "Unknown", variant: "warning" },
+const serviceStateBadges: Record<ServiceState, ServiceStateBadgeConfig> = {
+  active: { label: "Active", variant: "success", Icon: CheckCircleIcon },
+  inactive: { label: "Inactive", variant: "outline", Icon: MinusCircleIcon },
+  failed: { label: "Failed", variant: "danger", Icon: XCircleIcon },
+  unknown: { label: "Unknown", variant: "warning", Icon: QuestionIcon },
 };
+
+const serviceStates: ServiceState[] = ["active", "inactive", "failed", "unknown"];
+
+function ServiceStateBadge({ state }: { state: ServiceState }) {
+  const config = serviceStateBadges[state];
+
+  return (
+    <Badge variant={config.variant}>
+      <config.Icon className="size-3" aria-hidden="true" />
+      {config.label}
+    </Badge>
+  );
+}
 
 function formatSampleTime(sampledAt: number) {
   const date = new Date(sampledAt);
@@ -160,8 +196,8 @@ function ServicesToolbar({
             <span aria-hidden="true">·</span>
             <span>
               {connected
-                ? "Read-only systemd discovery"
-                : "Connect this server to discover its actual units"}
+                ? "Systemd units are read live; every action re-queries the unit"
+                : "Connect this server to discover and control its actual units"}
             </span>
           </p>
         </div>
@@ -181,7 +217,7 @@ function ServicesToolbar({
             ) : (
               <ArrowClockwiseIcon className="size-3.5" aria-hidden="true" />
             )}
-            {pending ? "Discovering..." : "Refresh now"}
+            {pending ? "Refreshing..." : "Refresh now"}
           </Button>
         </div>
       </div>
@@ -189,28 +225,92 @@ function ServicesToolbar({
   );
 }
 
-const serviceActionLabels: Record<ServiceActionName, string> = {
-  status: "Status",
-  start: "Start",
-  stop: "Stop",
-  restart: "Restart",
+type ServiceActionConfig = {
+  label: string;
+  Icon: typeof InfoIcon;
 };
+
+const serviceActionConfig: Record<ServiceActionName, ServiceActionConfig> = {
+  status: { label: "Inspect", Icon: InfoIcon },
+  start: { label: "Start", Icon: PlayIcon },
+  stop: { label: "Stop", Icon: StopIcon },
+  restart: { label: "Restart", Icon: ArrowClockwiseIcon },
+};
+
+const serviceActionOrder: ServiceActionName[] = ["status", "start", "stop", "restart"];
+
+function SortableTableHead({
+  label,
+  sortKey,
+  sort,
+  onSort,
+  className,
+}: {
+  label: string;
+  sortKey: ServiceSortKey;
+  sort: ServiceSort;
+  onSort: (key: ServiceSortKey) => void;
+  className?: string;
+}) {
+  const active = sort.key === sortKey;
+  const ariaSort = active ? (sort.direction === "asc" ? "ascending" : "descending") : "none";
+
+  return (
+    <TableHead aria-sort={ariaSort} className={className}>
+      <button
+        type="button"
+        onClick={() => onSort(sortKey)}
+        className="inline-flex items-center gap-1 rounded-sm text-[11px] font-medium text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/30"
+        aria-label={`Sort by ${label.toLowerCase()}`}
+      >
+        {label}
+        {active ? (
+          sort.direction === "asc" ? (
+            <CaretUpIcon className="size-3" aria-hidden="true" />
+          ) : (
+            <CaretDownIcon className="size-3" aria-hidden="true" />
+          )
+        ) : (
+          <CaretUpDownIcon className="size-3 opacity-50" aria-hidden="true" />
+        )}
+      </button>
+    </TableHead>
+  );
+}
 
 function ServiceList({
   discovery,
   actionEntry,
+  discoveryPending,
   connected,
   onAction,
 }: {
   discovery: ServiceDiscovery;
   actionEntry: ServiceActionEntry | undefined;
+  discoveryPending: boolean;
   connected: boolean;
   onAction: (unit: string, action: ServiceActionName) => void;
 }) {
-  const counts = stateCounts(discovery);
-  const pending = Boolean(actionEntry?.pending);
+  const [query, setQuery] = useState("");
+  const [stateFilter, setStateFilter] = useState<ServiceStateFilter>("all");
+  const [sort, setSort] = useState<ServiceSort>({ key: "name", direction: "asc" });
+  const [page, setPage] = useState(0);
 
-  if (discovery.services.length === 0) {
+  const counts = stateCounts(discovery);
+  const total = discovery.services.length;
+  const filtered = useMemo(
+    () => filterAndSortServices(discovery.services, query, stateFilter, sort),
+    [discovery.services, query, stateFilter, sort],
+  );
+  const pageCount = Math.max(1, Math.ceil(filtered.length / SERVICE_PAGE_SIZE));
+  const currentPage = Math.min(page, pageCount - 1);
+  const start = currentPage * SERVICE_PAGE_SIZE;
+  const visible = filtered.slice(start, start + SERVICE_PAGE_SIZE);
+  const filtersActive = query.trim().length > 0 || stateFilter !== "all";
+  const actionPending = actionEntry?.pending ?? null;
+  const busy = Boolean(actionPending) || discoveryPending;
+
+  if (total === 0) {
     return (
       <EmptyState
         icon={<GaugeIcon className="size-4" aria-hidden="true" />}
@@ -220,97 +320,245 @@ function ServiceList({
     );
   }
 
+  function changeQuery(nextQuery: string) {
+    setQuery(nextQuery);
+    setPage(0);
+  }
+
+  function changeStateFilter(nextFilter: ServiceStateFilter) {
+    setStateFilter(nextFilter);
+    setPage(0);
+  }
+
+  function toggleSort(key: ServiceSortKey) {
+    setSort((current) =>
+      current.key === key
+        ? { key, direction: current.direction === "asc" ? "desc" : "asc" }
+        : { key, direction: "asc" },
+    );
+    setPage(0);
+  }
+
+  function clearFilters() {
+    setQuery("");
+    setStateFilter("all");
+    setPage(0);
+  }
+
   return (
     <section
       aria-label="Discovered systemd services"
       className="overflow-hidden rounded-md border border-border bg-card"
     >
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-3 py-2.5">
-        <div className="min-w-0">
-          <h2 className="text-[13px] font-semibold text-foreground">Discovered systemd units</h2>
-          <p className="mt-0.5 text-[11px] text-muted-foreground">
-            {discovery.services.length} unit{discovery.services.length === 1 ? "" : "s"} reported by
-            systemctl
-            {discovery.truncated ? " · output was truncated at the safety limit" : ""}
-          </p>
+      <div className="border-b border-border px-3 py-2.5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h2 className="text-[13px] font-semibold text-foreground">Discovered systemd units</h2>
+            <p className="mt-0.5 text-[11px] text-muted-foreground">
+              {total} unit{total === 1 ? "" : "s"} reported by systemctl
+              {discovery.truncated ? " · output was truncated at the safety limit" : ""}
+            </p>
+          </div>
+          <div
+            role="group"
+            aria-label="Filter by service state"
+            className="flex flex-wrap items-center gap-1.5"
+          >
+            <Button
+              type="button"
+              variant={stateFilter === "all" ? "default" : "secondary"}
+              size="sm"
+              className="h-7 gap-1 px-2 text-[11px]"
+              aria-pressed={stateFilter === "all"}
+              onClick={() => changeStateFilter("all")}
+            >
+              All {total}
+            </Button>
+            {serviceStates.map((state) => {
+              const config = serviceStateBadges[state];
+              return (
+                <Button
+                  key={state}
+                  type="button"
+                  variant={stateFilter === state ? "default" : "secondary"}
+                  size="sm"
+                  className="h-7 gap-1 px-2 text-[11px]"
+                  aria-pressed={stateFilter === state}
+                  aria-label={`Show ${config.label.toLowerCase()} units (${counts[state].toString()})`}
+                  onClick={() => changeStateFilter(state)}
+                >
+                  <config.Icon className="size-3" aria-hidden="true" />
+                  {config.label} {counts[state]}
+                </Button>
+              );
+            })}
+          </div>
         </div>
-        <div className="flex flex-wrap items-center gap-1.5">
-          {(["active", "inactive", "failed", "unknown"] as const).map((state) => (
-            <Badge key={state} variant={serviceStateBadges[state].variant}>
-              {serviceStateBadges[state].label} {counts[state]}
-            </Badge>
-          ))}
+
+        <div className="mt-2.5 flex flex-wrap items-center gap-2">
+          <div className="relative w-full max-w-sm min-w-[210px]">
+            <label htmlFor="service-filter" className="sr-only">
+              Filter units
+            </label>
+            <MagnifyingGlassIcon
+              className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground"
+              aria-hidden="true"
+            />
+            <Input
+              id="service-filter"
+              type="search"
+              value={query}
+              onChange={(event) => changeQuery(event.target.value)}
+              placeholder="Filter by unit, state, or description"
+              className="h-8 pl-8 text-[12px]"
+            />
+          </div>
+          {filtersActive ? (
+            <Button type="button" variant="ghost" size="sm" onClick={clearFilters}>
+              Clear filters
+            </Button>
+          ) : null}
+          <p className="text-[11px] text-muted-foreground" aria-live="polite">
+            {filtered.length} of {total} units
+          </p>
         </div>
       </div>
 
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead>Unit</TableHead>
-            <TableHead>State</TableHead>
-            <TableHead>Active / sub</TableHead>
-            <TableHead>Load</TableHead>
-            <TableHead>Description</TableHead>
-            <TableHead>Actions</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {discovery.services.map((service) => (
-            <TableRow key={service.name} data-service-state={service.state}>
-              <TableCell className="font-mono text-[12px] font-medium">{service.name}</TableCell>
-              <TableCell>
-                <Badge variant={serviceStateBadges[service.state].variant}>
-                  {serviceStateBadges[service.state].label}
-                </Badge>
-              </TableCell>
-              <TableCell className="font-mono text-[11px] text-muted-foreground">
-                {service.activeState}
-                {service.subState ? ` / ${service.subState}` : ""}
-              </TableCell>
-              <TableCell className="text-[11px] text-muted-foreground">
-                {service.loadState ?? "Unknown"}
-              </TableCell>
-              <TableCell className="max-w-[48ch] text-[12px] text-muted-foreground">
-                {service.description ?? "No description reported"}
-              </TableCell>
-              <TableCell>
-                <div className="flex flex-wrap gap-1">
-                  {(["status", "start", "stop", "restart"] as const).map((action) => {
-                    const actionPending =
-                      actionEntry?.pending === action && actionEntry.pendingUnit === service.name;
-                    return (
-                      <Button
-                        key={action}
-                        variant={action === "status" ? "ghost" : "secondary"}
-                        size="sm"
-                        className="h-7 px-2 text-[11px]"
-                        aria-label={`${serviceActionLabels[action]} ${service.name}`}
-                        disabled={pending || !connected}
-                        onClick={() => onAction(service.name, action)}
-                      >
-                        {actionPending ? (
-                          <CircleNotchIcon className="size-3 animate-spin" aria-hidden="true" />
-                        ) : null}
-                        {serviceActionLabels[action]}
-                      </Button>
-                    );
-                  })}
-                </div>
-              </TableCell>
+      {filtered.length === 0 ? (
+        <div className="px-3 py-8">
+          <p className="text-[13px] font-medium text-foreground">No units match this filter</p>
+          <p className="mt-1 max-w-[56ch] text-[12px] text-muted-foreground">
+            Search covers unit names, descriptions, load state, and raw systemd active and sub
+            states. Try a different term or clear the filters.
+          </p>
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            className="mt-3"
+            onClick={clearFilters}
+          >
+            Clear filters
+          </Button>
+        </div>
+      ) : (
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <SortableTableHead label="Unit" sortKey="name" sort={sort} onSort={toggleSort} />
+              <SortableTableHead label="State" sortKey="state" sort={sort} onSort={toggleSort} />
+              <SortableTableHead
+                label="Description"
+                sortKey="description"
+                sort={sort}
+                onSort={toggleSort}
+              />
+              <TableHead className="text-right">Actions</TableHead>
             </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+          </TableHeader>
+          <TableBody>
+            {visible.map((service) => (
+              <TableRow key={service.name} data-service-state={service.state}>
+                <TableCell className="align-top">
+                  <div className="font-mono text-[12px] font-medium">{service.name}</div>
+                  <div className="mt-0.5 font-mono text-[10px] text-muted-foreground">
+                    {service.loadState ? `load ${service.loadState}` : "load unknown"}
+                  </div>
+                </TableCell>
+                <TableCell className="align-top">
+                  <ServiceStateBadge state={service.state} />
+                  <div className="mt-0.5 font-mono text-[10px] text-muted-foreground">
+                    {service.activeState}
+                    {service.subState ? ` / ${service.subState}` : ""}
+                  </div>
+                </TableCell>
+                <TableCell className="max-w-[52ch] align-top text-[12px] text-muted-foreground">
+                  <span className="line-clamp-2" title={service.description ?? undefined}>
+                    {service.description ?? "No description reported"}
+                  </span>
+                </TableCell>
+                <TableCell className="align-top">
+                  <div
+                    role="group"
+                    aria-label={`Actions for ${service.name}`}
+                    className="flex flex-wrap justify-end gap-1"
+                  >
+                    {serviceActionOrder.map((action) => {
+                      const config = serviceActionConfig[action];
+                      const actionIsPending =
+                        actionPending === action && actionEntry?.pendingUnit === service.name;
+                      return (
+                        <Button
+                          key={action}
+                          type="button"
+                          variant={action === "status" ? "ghost" : "secondary"}
+                          size="sm"
+                          className="h-7 gap-1 px-2 text-[11px]"
+                          aria-label={`${config.label} ${service.name}`}
+                          title={`${config.label} ${service.name}`}
+                          disabled={busy || !connected}
+                          onClick={() => onAction(service.name, action)}
+                        >
+                          {actionIsPending ? (
+                            <CircleNotchIcon className="size-3 animate-spin" aria-hidden="true" />
+                          ) : (
+                            <config.Icon className="size-3" aria-hidden="true" />
+                          )}
+                          {config.label}
+                        </Button>
+                      );
+                    })}
+                  </div>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
 
       <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border px-3 py-2 text-[10px] text-muted-foreground">
         <span>
-          Sampled{" "}
+          Showing{" "}
+          {filtered.length === 0
+            ? "0"
+            : `${(start + 1).toString()}-${(start + visible.length).toString()}`}{" "}
+          of {filtered.length}
+          {filtered.length !== total ? ` filtered (${total.toString()} discovered)` : ""} units ·
+          sampled{" "}
           <time dateTime={dateTimeValue(discovery.sampledAt)}>
             {formatSampleTime(discovery.sampledAt)}
           </time>{" "}
           in {discovery.durationMs} ms.
         </span>
-        <span>Every action re-queries the unit; only the verified state is shown.</span>
+        <nav aria-label="Service table pages" className="flex items-center gap-1">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-7 gap-1 px-2"
+            aria-label="Previous page"
+            disabled={currentPage === 0}
+            onClick={() => setPage(currentPage - 1)}
+          >
+            <CaretLeftIcon className="size-3" aria-hidden="true" />
+            Previous
+          </Button>
+          <span className="px-1 font-mono">
+            Page {(currentPage + 1).toString()} of {pageCount.toString()}
+          </span>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-7 gap-1 px-2"
+            aria-label="Next page"
+            disabled={currentPage >= pageCount - 1}
+            onClick={() => setPage(currentPage + 1)}
+          >
+            Next
+            <CaretRightIcon className="size-3" aria-hidden="true" />
+          </Button>
+        </nav>
       </div>
     </section>
   );
@@ -325,32 +573,48 @@ function ServiceActionResultPanel({
 }) {
   const verified = result.verifiedStatus;
   const verifiedBadge = verified ? serviceStateBadges[verified.state] : null;
-  const actionLabel = serviceActionLabels[result.action];
+  const actionLabel = serviceActionConfig[result.action].label;
   const verifiedSuccess = result.succeeded && result.stateVerified === true;
   const verificationMismatch = result.succeeded && result.stateVerified === false;
+  const outcome = !result.succeeded
+    ? { label: "Command failed", variant: "danger" as const }
+    : verificationMismatch
+      ? { label: "State mismatch", variant: "warning" as const }
+      : result.action === "status"
+        ? { label: "Inspected", variant: "info" as const }
+        : result.stateVerified === true
+          ? { label: "Verified", variant: "success" as const }
+          : { label: "Unverified", variant: "warning" as const };
 
   return (
     <section
       aria-label="Service action result"
       className="rounded-md border border-border bg-card px-3 py-3"
     >
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h2 className="text-[13px] font-semibold text-foreground">
-            {actionLabel} {result.unit}
-          </h2>
-          <p className="mt-0.5 font-mono text-[10px] text-muted-foreground">{result.command}</p>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="text-[13px] font-semibold text-foreground">
+              {actionLabel} {result.unit}
+            </h2>
+            <Badge variant={outcome.variant}>{outcome.label}</Badge>
+          </div>
+          <p className="mt-0.5 break-all font-mono text-[10px] text-muted-foreground">
+            {result.command}
+          </p>
         </div>
-        <Button variant="ghost" size="sm" onClick={onDismiss}>
+        <Button variant="ghost" size="sm" className="shrink-0" onClick={onDismiss}>
           Dismiss
         </Button>
       </div>
 
       <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 rounded-md border border-border bg-muted/35 px-3 py-2.5 text-[11px] sm:grid-cols-4">
         <div>
-          <dt className="text-muted-foreground">Action exit</dt>
+          <dt className="text-muted-foreground">Exit status</dt>
           <dd className="font-mono text-foreground">
-            {result.exitCode === null ? "No exit status" : `Exit code ${result.exitCode}`}
+            {result.exitCode === null
+              ? "No exit status"
+              : `Exit code ${result.exitCode.toString()}`}
           </dd>
         </div>
         <div>
@@ -361,7 +625,7 @@ function ServiceActionResultPanel({
           <dt className="text-muted-foreground">Verified state</dt>
           <dd>
             {verified && verifiedBadge ? (
-              <Badge variant={verifiedBadge.variant}>{verifiedBadge.label}</Badge>
+              <ServiceStateBadge state={verified.state} />
             ) : (
               <Badge variant="warning">Unverified</Badge>
             )}
@@ -411,8 +675,8 @@ function ServiceActionResultPanel({
           <div>
             <AlertTitle>Verified state after the action</AlertTitle>
             <AlertDescription>
-              systemd reports {result.unit} as {verified?.state}. This is the state the UI keeps
-              showing.
+              systemd reports {result.unit} as {verified?.state}. This is the state the unit list
+              keeps showing after its refresh.
             </AlertDescription>
           </div>
         </Alert>
@@ -454,20 +718,17 @@ function ServiceActionResultPanel({
         </Alert>
       ) : null}
 
-      <div className="mt-3 grid gap-2 lg:grid-cols-2">
-        <OutputPanel
-          title="stdout"
-          content={result.stdout}
-          emptyText="No stdout."
-          maxHeightClassName="max-h-48"
-        />
-        <OutputPanel
-          title="stderr"
-          content={result.stderr}
-          emptyText="No stderr."
-          maxHeightClassName="max-h-48"
-        />
-      </div>
+      <OutputPanel
+        title="Command output"
+        content={serviceActionTranscript(result)}
+        meta={
+          result.exitCode === null
+            ? "no exit status"
+            : `exit ${result.exitCode.toString()} · ${result.durationMs.toString()} ms`
+        }
+        className="mt-3"
+        maxHeightClassName="max-h-64"
+      />
     </section>
   );
 }
@@ -488,7 +749,7 @@ function ServicesPage() {
   const [selectedId, setSelectedId] = useState<string | null>(lastActiveServerId);
   const [pendingAction, setPendingAction] = useState<{
     unit: string;
-    action: Exclude<ServiceActionName, "status">;
+    action: Extract<ServiceActionName, "stop" | "restart">;
   } | null>(null);
 
   const selected =
@@ -504,16 +765,23 @@ function ServicesPage() {
     selected ? state.actions[selected.id] : undefined,
   );
   const discovery = entry?.discovery ?? null;
+  const resultRef = useRef<HTMLDivElement>(null);
 
   const requestAction = (unit: string, action: ServiceActionName) => {
     if (!selectedServerId || !connected) {
       return;
     }
-    if (action === "status") {
-      void runAction(selectedServerId, unit, action);
+    if (action === "stop" || action === "restart") {
+      setPendingAction({ unit, action });
       return;
     }
-    setPendingAction({ unit, action });
+
+    void runAction(selectedServerId, unit, action);
+  };
+
+  const selectServer = (serverId: string) => {
+    setPendingAction(null);
+    setSelectedId(serverId);
   };
 
   useEffect(() => {
@@ -539,11 +807,17 @@ function ServicesPage() {
     void refresh(selectedServerId);
   }, [connected, selectedServerId, entry?.pending, entry?.discovery, entry?.error, refresh]);
 
+  useEffect(() => {
+    if (actionEntry?.result) {
+      resultRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [actionEntry?.result]);
+
   return (
     <div className="space-y-6">
       <PageHeader
         title="Services"
-        description="Discover the systemd service units that actually exist on the target machine, including versioned PHP-FPM units and unlisted custom services."
+        description="Discover the systemd service units that actually exist on the target machine, filter and sort large unit lists, and run verified actions with copyable command output."
         actions={
           <Button asChild variant="secondary" size="sm">
             <Link to="/servers">Open servers</Link>
@@ -589,7 +863,7 @@ function ServicesPage() {
           <ServicesToolbar
             servers={servers}
             selected={selected}
-            onSelect={setSelectedId}
+            onSelect={selectServer}
             connected={connected}
             entry={entry}
             onRefresh={() => void refresh(selected.id)}
@@ -649,8 +923,10 @@ function ServicesPage() {
 
           {discovery?.status === "available" ? (
             <ServiceList
+              key={discovery.serverId}
               discovery={discovery}
               actionEntry={actionEntry}
+              discoveryPending={entry?.pending ?? false}
               connected={connected}
               onAction={requestAction}
             />
@@ -680,10 +956,12 @@ function ServicesPage() {
           ) : null}
 
           {actionEntry?.result ? (
-            <ServiceActionResultPanel
-              result={actionEntry.result}
-              onDismiss={() => clearActionResult(selected.id)}
-            />
+            <div ref={resultRef}>
+              <ServiceActionResultPanel
+                result={actionEntry.result}
+                onDismiss={() => clearActionResult(selected.id)}
+              />
+            </div>
           ) : null}
 
           {!entry?.pending && !discovery && !entry?.error ? (
@@ -714,19 +992,31 @@ function ServicesPage() {
             }}
             title={
               pendingAction
-                ? `${serviceActionLabels[pendingAction.action]} ${pendingAction.unit}?`
+                ? `${serviceActionConfig[pendingAction.action].label} ${pendingAction.unit} on ${selected.name}?`
                 : "Confirm service action"
             }
-            description="ServerDesk will send the fixed action command, then immediately query the unit again. Only the state systemd reports is shown as verified."
+            description={
+              pendingAction?.action === "stop"
+                ? "Stopping this unit can interrupt connections and dependent services. ServerDesk sends the fixed command, then immediately queries the unit again."
+                : "Restarting this unit can interrupt connections while it starts again. ServerDesk sends the fixed command, then immediately queries the unit again."
+            }
             confirmLabel={
-              pendingAction ? `${serviceActionLabels[pendingAction.action]} unit` : "Run action"
+              pendingAction
+                ? `${serviceActionConfig[pendingAction.action].label} unit`
+                : "Run action"
             }
             details={
               pendingAction
                 ? [
-                    { label: "Server", value: `${selected.name} (${selected.host})` },
+                    {
+                      label: "Server",
+                      value: `${selected.name} (${selected.username}@${selected.host}:${selected.port})`,
+                    },
                     { label: "Unit", value: pendingAction.unit },
-                    { label: "Action", value: pendingAction.action },
+                    {
+                      label: "Action",
+                      value: `systemctl ${pendingAction.action} -- ${pendingAction.unit}`,
+                    },
                   ]
                 : undefined
             }

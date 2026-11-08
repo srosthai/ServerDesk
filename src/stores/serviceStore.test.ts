@@ -43,6 +43,22 @@ const unsupported: ServiceDiscovery = {
   detail: "Systemd is not available on this server (exit code 127).",
 };
 
+const stoppedDiscovery: ServiceDiscovery = {
+  ...discovery,
+  services: discovery.services.map((service) =>
+    service.name === "nginx.service"
+      ? {
+          ...service,
+          state: "inactive",
+          activeState: "inactive",
+          subState: "dead",
+        }
+      : service,
+  ),
+  sampledAt: 1_762_665_735_000,
+  durationMs: 18,
+};
+
 function verifiedStatus(overrides: Partial<ServiceStatus> = {}): ServiceStatus {
   return {
     serverId: "server-1",
@@ -169,8 +185,11 @@ describe("service store", () => {
     expect(useServiceStore.getState().entries["server-1"]?.discovery).toEqual(newer);
   });
 
-  it("stores the action result and replaces the row with the verified state", async () => {
-    vi.mocked(getSystemdServices).mockResolvedValue(discovery);
+  it("stores the action result and refreshes the row from discovery", async () => {
+    vi.mocked(getSystemdServices)
+      .mockReset()
+      .mockResolvedValueOnce(discovery)
+      .mockResolvedValue(stoppedDiscovery);
     await useServiceStore.getState().refresh("server-1");
     vi.mocked(runServiceAction).mockResolvedValue(actionResult());
 
@@ -179,6 +198,7 @@ describe("service store", () => {
     ).resolves.toBe(true);
 
     expect(runServiceAction).toHaveBeenCalledWith("server-1", "nginx.service", "stop");
+    expect(getSystemdServices).toHaveBeenCalledTimes(2);
     const actionEntry = useServiceStore.getState().actions["server-1"];
     expect(actionEntry?.pending).toBeNull();
     expect(actionEntry?.pendingUnit).toBeNull();
@@ -191,8 +211,35 @@ describe("service store", () => {
     expect(nginx?.state).toBe("inactive");
     expect(nginx?.activeState).toBe("inactive");
     expect(useServiceStore.getState().entries["server-1"]?.discovery?.sampledAt).toBe(
-      verifiedStatus().sampledAt,
+      stoppedDiscovery.sampledAt,
     );
+  });
+
+  it("keeps the action result visible when the post-action refresh fails", async () => {
+    vi.mocked(getSystemdServices)
+      .mockReset()
+      .mockResolvedValueOnce(discovery)
+      .mockRejectedValueOnce({
+        code: "timeout",
+        message: "The remote command timed out.",
+      });
+    await useServiceStore.getState().refresh("server-1");
+    vi.mocked(runServiceAction).mockResolvedValue(actionResult());
+
+    await expect(
+      useServiceStore.getState().runAction("server-1", "nginx.service", "stop"),
+    ).resolves.toBe(true);
+
+    const actionEntry = useServiceStore.getState().actions["server-1"];
+    expect(actionEntry?.result?.stdout).toBe("stopped\n");
+    expect(actionEntry?.error).toBeNull();
+    expect(useServiceStore.getState().entries["server-1"]?.error).toBe(
+      "The remote command timed out.",
+    );
+    const nginx = useServiceStore
+      .getState()
+      .entries["server-1"]?.discovery?.services.find((service) => service.name === "nginx.service");
+    expect(nginx?.state).toBe("inactive");
   });
 
   it("keeps permission denial visible with sudo guidance and the verified state", async () => {
