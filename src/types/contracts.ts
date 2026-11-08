@@ -11,6 +11,7 @@ export type ErrorCode =
   | "cancelled"
   | "not_found"
   | "storage"
+  | "credential"
   | "internal";
 
 export type CommandError = {

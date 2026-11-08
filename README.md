@@ -50,6 +50,10 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 GitHub Actions runs the frontend and Rust checks on pushes and pull requests to `dev`, `production`, and `main`.
 
+## Credentials
+
+SSH passwords and key passphrases are stored in the operating system credential store through the Rust keyring integration. SQLite stores only a credential reference. Secret input is available in the desktop build, not the browser preview.
+
 ## Command contracts
 
 React calls typed Tauri commands through `src/services/`. Contract types live in `src/types/contracts.ts`, and every command returns a structured `AppError` when it fails. Components do not call `invoke` directly. Tauri event subscriptions use `useTauriEvent`, which cleans up its listener on unmount.
