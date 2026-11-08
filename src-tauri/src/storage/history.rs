@@ -53,6 +53,23 @@ impl Database {
         })
     }
 
+    pub fn list_project_operations(
+        &self,
+        project_id: &str,
+        limit: u32,
+    ) -> Result<Vec<OperationRecord>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT {OPERATION_COLUMNS} FROM operation_history \
+                 WHERE project_id = ?1 ORDER BY started_at DESC LIMIT ?2"
+            ))?;
+            let operations = statement
+                .query_map(params![project_id, i64::from(limit)], row_to_operation)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(operations)
+        })
+    }
+
     pub fn clear_operation_history(&self) -> Result<(), StorageError> {
         self.with_connection(|connection| {
             connection.execute("DELETE FROM operation_history", [])?;

@@ -11,6 +11,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0002_unique_server_names",
         include_str!("../../../migrations/0002_unique_server_names.sql"),
     ),
+    (
+        "0003_project_detection",
+        include_str!("../../../migrations/0003_project_detection.sql"),
+    ),
 ];
 
 pub(crate) fn run_migrations(connection: &mut Connection) -> Result<(), StorageError> {
