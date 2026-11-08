@@ -88,7 +88,13 @@ The Services page discovers service units that actually exist on the target mach
 
 The command has a 64 KiB output bound, a 10 second duration bound, and a 512 unit parse limit. Active, inactive, failed, and unknown states stay distinct; the raw systemd active and sub states are retained for units such as `activating` that do not fit those four labels.
 
-The typed `get_systemd_services` Tauri command returns an `available`, `unsupported`, or `unavailable` discovery result. Systems without systemd return `unsupported` with a bounded explanation rather than an empty successful list. The frontend calls it through `src/services/services.ts`, stores per-server results in `useServiceStore`, and renders a read-only unit list. Start, stop, and restart actions are intentionally not implemented yet. Discovery output is only held in memory and is never written to SQLite or logs.
+The typed `get_systemd_services` Tauri command returns an `available`, `unsupported`, or `unavailable` discovery result. Systems without systemd return `unsupported` with a bounded explanation rather than an empty successful list. The frontend calls it through `src/services/services.ts`, stores per-server results in `useServiceStore`, and renders the unit list with status, start, stop, and restart actions.
+
+## Verified service actions
+
+Status inspection, start, stop, and restart use fixed command templates and a validated unit name. Actions run through non-interactive, narrowly scoped sudo: `/usr/bin/sudo -n -- /usr/bin/systemctl <verb> -- <unit>`, and status uses the same non-interactive path with `systemctl show`. The SSH account is expected to be a dedicated non-root account. ServerDesk never prompts for a sudo password and never assumes unrestricted sudo. If sudo denies an action, the result includes the exact `NOPASSWD` sudoers rule for that single unit, plus the remote stdout, stderr, and exit status.
+
+After every action the unit is queried again with `systemctl show`. The UI updates the row only from that re-query and labels the result as verified, mismatched, or unverified; a zero exit status alone is never treated as proof that the service reached the requested state. Action output, exit code, and duration are returned to the UI and kept in memory only. They are never written to SQLite or logs. Invalid unit names, including shell operators, whitespace, slashes, option-like names, and non-`.service` units, are rejected before any remote command is sent. There is no generic shell command endpoint.
 
 ## Server overview
 
