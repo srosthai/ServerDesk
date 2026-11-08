@@ -35,6 +35,22 @@ export type UserPreferences = {
 
 export type AuthType = "password" | "private_key";
 
+export type ConnectionState =
+  "disconnected" | "connecting" | "host-key-verification" | "connected" | "reconnecting" | "error";
+
+export type HostKeyDetails = {
+  keyType: string;
+  fingerprint: string;
+};
+
+export type ConnectionSnapshot = {
+  serverId: string;
+  state: ConnectionState;
+  changedAt: number;
+  error?: CommandError;
+  hostKey?: HostKeyDetails;
+};
+
 export type ServerProfile = {
   id: string;
   name: string;
