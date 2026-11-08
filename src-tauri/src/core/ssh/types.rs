@@ -217,6 +217,27 @@ impl TransportError {
 #[async_trait::async_trait]
 pub trait SshSession: Send + Sync {
     async fn execute(&self, command: &str) -> Result<CommandOutput, TransportError>;
+
+    /// Executes a command while refusing to return more than `max_output_bytes`.
+    ///
+    /// Transports can override this to stop buffering as soon as the limit is
+    /// crossed. The default implementation checks the completed output, so
+    /// callers still get a hard bound even for simple test sessions.
+    async fn execute_bounded(
+        &self,
+        command: &str,
+        max_output_bytes: usize,
+    ) -> Result<CommandOutput, TransportError> {
+        let output = self.execute(command).await?;
+        let output_bytes = output.stdout.len().saturating_add(output.stderr.len());
+        if output_bytes > max_output_bytes {
+            return Err(TransportError::Remote(
+                "The remote command produced more output than ServerDesk allows.".to_string(),
+            ));
+        }
+        Ok(output)
+    }
+
     async fn is_healthy(&self) -> bool;
     async fn close(&self) -> Result<(), TransportError>;
 }

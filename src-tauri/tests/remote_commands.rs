@@ -13,6 +13,7 @@ use russh::{
 };
 use serverdesk_lib::core::{
     AppError, ErrorCode,
+    identity::sample_system_identity,
     remote::{RemoteCommand, run_remote_command},
     ssh::{
         Authentication, ConnectionEventSink, ConnectionManager, ConnectionRequest,
@@ -27,6 +28,20 @@ const HOSTNAME_OUTPUT: &str = "fixture-host\n";
 const UPTIME_OUTPUT: &str =
     " 10:42:00 up 4 days,  2:03,  1 user,  load average: 0.01, 0.02, 0.03\n";
 const UPTIME_FAILURE: &str = "uptime: fixture failure\n";
+const OS_RELEASE_OUTPUT: &str = r#"PRETTY_NAME="Ubuntu 24.04.1 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+VERSION="24.04.1 LTS (Noble Numbat)"
+VERSION_CODENAME=noble
+ID=ubuntu
+ID_LIKE=debian
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
+"#;
+const UNAME_OUTPUT: &str = "Linux 6.8.0-45-generic x86_64\n";
+const PROC_UPTIME_OUTPUT: &str = "372063.12 1234567.89\n";
+const OS_RELEASE_MISSING: &str = "cat: /etc/os-release: No such file or directory\n";
 
 #[derive(Default)]
 struct FixtureState {
@@ -45,6 +60,14 @@ struct FixtureServer {
 
 impl FixtureServer {
     async fn start(fail_uptime: bool) -> Self {
+        Self::start_with(fail_uptime, true).await
+    }
+
+    async fn start_without_os_release() -> Self {
+        Self::start_with(false, false).await
+    }
+
+    async fn start_with(fail_uptime: bool, has_os_release: bool) -> Self {
         let host_key = generate_private_key();
         let host_key_type = host_key.public_key().algorithm().as_str().to_string();
         let host_fingerprint = host_key
@@ -69,6 +92,7 @@ impl FixtureServer {
             config,
             Arc::clone(&state),
             fail_uptime,
+            has_os_release,
         ));
 
         Self {
@@ -141,6 +165,7 @@ async fn run_fixture_server(
     config: Arc<server::Config>,
     state: Arc<FixtureState>,
     fail_uptime: bool,
+    has_os_release: bool,
 ) {
     loop {
         let Ok((socket, _)) = listener.accept().await else {
@@ -151,7 +176,11 @@ async fn run_fixture_server(
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             let _guard = ConnectionGuard(Arc::clone(&state));
-            let handler = FixtureHandler { state, fail_uptime };
+            let handler = FixtureHandler {
+                state,
+                fail_uptime,
+                has_os_release,
+            };
             if let Ok(session) = server::run_stream(config, socket, handler).await {
                 let _ = session.await;
             }
@@ -162,6 +191,7 @@ async fn run_fixture_server(
 struct FixtureHandler {
     state: Arc<FixtureState>,
     fail_uptime: bool,
+    has_os_release: bool,
 }
 
 impl server::Handler for FixtureHandler {
@@ -202,6 +232,14 @@ impl server::Handler for FixtureHandler {
         match command.as_str() {
             "true" => respond(session, channel, b"", b"", 0),
             "hostname" => respond(session, channel, HOSTNAME_OUTPUT.as_bytes(), b"", 0),
+            "cat /etc/os-release" if self.has_os_release => {
+                respond(session, channel, OS_RELEASE_OUTPUT.as_bytes(), b"", 0)
+            }
+            "cat /etc/os-release" => {
+                respond(session, channel, b"", OS_RELEASE_MISSING.as_bytes(), 1)
+            }
+            "uname -srm" => respond(session, channel, UNAME_OUTPUT.as_bytes(), b"", 0),
+            "cat /proc/uptime" => respond(session, channel, PROC_UPTIME_OUTPUT.as_bytes(), b"", 0),
             "uptime" if self.fail_uptime => {
                 respond(session, channel, b"", UPTIME_FAILURE.as_bytes(), 7)
             }
@@ -389,6 +427,85 @@ async fn a_failing_command_keeps_stdout_stderr_exit_code_and_a_usable_session() 
         .expect("the session remains usable after a non-zero command");
     assert_eq!(hostname.stdout, HOSTNAME_OUTPUT);
     assert!(hostname.succeeded);
+
+    manager
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+    fixture.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn discovers_system_identity_over_the_authenticated_session() {
+    let fixture = FixtureServer::start(false).await;
+    let manager = manager();
+    manager
+        .connect(fixture.request(true))
+        .await
+        .expect("connect with the trusted host key");
+
+    let identity = sample_system_identity(&manager, "fixture-server")
+        .await
+        .expect("sample identity");
+
+    assert_eq!(identity.server_id, "fixture-server");
+    assert_eq!(identity.hostname.as_deref(), Some("fixture-host"));
+    assert_eq!(identity.distribution.as_deref(), Some("Ubuntu"));
+    assert_eq!(identity.distribution_version.as_deref(), Some("24.04"));
+    assert_eq!(identity.kernel.as_deref(), Some("6.8.0-45-generic"));
+    assert_eq!(identity.architecture.as_deref(), Some("x86_64"));
+    assert_eq!(identity.uptime_seconds, Some(372_063));
+    assert_eq!(identity.connection_state, ConnectionState::Connected);
+    assert!(identity.sampled_at > 0);
+    println!(
+        "[fixture] identity hostname={:?} distribution={:?} version={:?} kernel={:?} arch={:?} uptime={:?}",
+        identity.hostname,
+        identity.distribution,
+        identity.distribution_version,
+        identity.kernel,
+        identity.architecture,
+        identity.uptime_seconds
+    );
+
+    assert_eq!(
+        fixture.executed(),
+        vec![
+            "true".to_string(),
+            "hostname".to_string(),
+            "cat /etc/os-release".to_string(),
+            "uname -srm".to_string(),
+            "cat /proc/uptime".to_string(),
+        ],
+        "identity discovery must send exactly the fixed templates"
+    );
+
+    manager
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+    fixture.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn unsupported_distribution_returns_partial_identity() {
+    let fixture = FixtureServer::start_without_os_release().await;
+    let manager = manager();
+    manager
+        .connect(fixture.request(true))
+        .await
+        .expect("connect with the trusted host key");
+
+    let identity = sample_system_identity(&manager, "fixture-server")
+        .await
+        .expect("partial identity is still a successful sample");
+
+    assert_eq!(identity.hostname.as_deref(), Some("fixture-host"));
+    assert_eq!(identity.distribution, None);
+    assert_eq!(identity.distribution_version, None);
+    assert_eq!(identity.kernel.as_deref(), Some("6.8.0-45-generic"));
+    assert_eq!(identity.architecture.as_deref(), Some("x86_64"));
+    assert_eq!(identity.uptime_seconds, Some(372_063));
+    assert_eq!(identity.connection_state, ConnectionState::Connected);
 
     manager
         .disconnect("fixture-server")
