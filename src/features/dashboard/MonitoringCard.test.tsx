@@ -77,6 +77,7 @@ function storeSnapshot(value: MonitoringSnapshot = snapshot) {
     entries: {
       "server-1": {
         snapshot: value,
+        history: [{ attemptedAt: value.sampledAt, snapshot: value }],
         stale: false,
         staleReason: null,
         error: null,

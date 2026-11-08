@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getMonitoringSnapshot } from "@/services/monitoring";
-import { useMonitoringStore } from "@/stores/monitoringStore";
+import { MAX_MONITORING_HISTORY_SAMPLES, useMonitoringStore } from "@/stores/monitoringStore";
 import type { MonitoringSnapshot } from "@/types/contracts";
 
 vi.mock("@/services/monitoring", () => ({
@@ -88,6 +88,8 @@ describe("monitoring store", () => {
     expect(entry.error).toBeNull();
     expect(entry.pending).toBe(false);
     expect(entry.lastAttemptAt).not.toBeNull();
+    expect(entry.history).toHaveLength(1);
+    expect(entry.history[0]).toMatchObject({ snapshot });
   });
 
   it("preserves the last snapshot and marks it stale when a refresh fails", async () => {
@@ -108,6 +110,8 @@ describe("monitoring store", () => {
     expect(entry.staleReason).toBe("The remote command timed out.");
     expect(entry.error).toBe("The remote command timed out.");
     expect(entry.pending).toBe(false);
+    expect(entry.history).toHaveLength(2);
+    expect(entry.history[1]).toMatchObject({ snapshot: null });
   });
 
   it("reports a failed first refresh without inventing a snapshot", async () => {
@@ -123,6 +127,7 @@ describe("monitoring store", () => {
     expect(entry.stale).toBe(true);
     expect(entry.error).toBe("The server is not connected.");
     expect(entry.pending).toBe(false);
+    expect(entry.history).toEqual([expect.objectContaining({ snapshot: null })]);
   });
 
   it("clears stale state after a later successful refresh", async () => {
@@ -141,6 +146,9 @@ describe("monitoring store", () => {
     expect(entry.stale).toBe(false);
     expect(entry.staleReason).toBeNull();
     expect(entry.error).toBeNull();
+    expect(entry.history).toHaveLength(2);
+    expect(entry.history[0].snapshot).toBeNull();
+    expect(entry.history[1].snapshot).toEqual(snapshot);
   });
 
   it("marks a retained snapshot stale when polling pauses", async () => {
@@ -155,6 +163,8 @@ describe("monitoring store", () => {
     expect(entry.snapshot).toEqual(snapshot);
     expect(entry.stale).toBe(true);
     expect(entry.staleReason).toBe("Polling is paused because the server is disconnected.");
+    expect(entry.history).toHaveLength(2);
+    expect(entry.history[1]).toMatchObject({ snapshot: null });
   });
 
   it("does not mark a server without a snapshot as stale on pause", () => {
@@ -180,7 +190,24 @@ describe("monitoring store", () => {
     resolveFirst?.(snapshot);
     await first;
 
-    expect(useMonitoringStore.getState().entries["server-1"].snapshot).toEqual(newer);
+    const entry = useMonitoringStore.getState().entries["server-1"];
+    expect(entry.snapshot).toEqual(newer);
+    expect(entry.history).toEqual([expect.objectContaining({ snapshot: newer })]);
+  });
+
+  it("caps retained history and keeps the newest attempts", async () => {
+    for (let index = 0; index < MAX_MONITORING_HISTORY_SAMPLES + 5; index += 1) {
+      const sampled = sampledAt + index * 1_000;
+      vi.mocked(getMonitoringSnapshot).mockResolvedValueOnce({ ...snapshot, sampledAt: sampled });
+      await useMonitoringStore.getState().refresh("server-1");
+    }
+
+    const history = useMonitoringStore.getState().entries["server-1"].history;
+    expect(history).toHaveLength(MAX_MONITORING_HISTORY_SAMPLES);
+    expect(history[0].snapshot?.sampledAt).toBe(sampledAt + 5 * 1_000);
+    expect(history.at(-1)?.snapshot?.sampledAt).toBe(
+      sampledAt + (MAX_MONITORING_HISTORY_SAMPLES + 4) * 1_000,
+    );
   });
 
   it("clears a server entry when it is no longer tracked", async () => {
