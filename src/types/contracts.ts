@@ -307,6 +307,40 @@ export type ProjectArtisanRun = {
   historyError: string | null;
 };
 
+export type SystemLogSource = {
+  path: string;
+  label: string;
+  description: string;
+};
+
+export type LogSourceKind = "system" | "laravel";
+
+export type LogTailStatus = "available" | "missing" | "not_file" | "unreadable" | "unavailable";
+
+export type LogTail = {
+  serverId: string;
+  requestedPath: string;
+  resolvedPath: string | null;
+  sourceKind: LogSourceKind;
+  status: LogTailStatus;
+  detail: string | null;
+  content: string;
+  returnedLines: number;
+  returnedBytes: number;
+  fileSizeBytes: number | null;
+  lineLimit: number;
+  byteLimit: number;
+  truncated: boolean;
+  truncatedBytes: boolean;
+  truncatedLines: boolean;
+  partialFirstLine: boolean;
+  rotated: boolean;
+  rotationDetail: string | null;
+  retrievedAt: number;
+  durationMs: number;
+  connectionState: ConnectionState;
+};
+
 export type ServerProfile = {
   id: string;
   name: string;
