@@ -23,7 +23,13 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { WarningCircleIcon } from "@phosphor-icons/react";
 import { getCommandErrorMessage } from "@/lib/errors";
 import { isTauriRuntime } from "@/lib/tauri";
-import { createCredential, deleteCredential, storeCredential } from "@/services/credentials";
+import {
+  createCredential,
+  createPrivateKeyCredential,
+  deleteCredential,
+  storeCredential,
+  storePrivateKeyCredential,
+} from "@/services/credentials";
 import { useServerStore } from "@/stores/serverStore";
 import type { AuthType, ServerProfile, ServerProfileInput } from "@/types/contracts";
 
@@ -44,20 +50,47 @@ function ServerProfileDialog({ server, onOpenChange }: ServerProfileDialogProps)
   const [tags, setTags] = useState(server?.tags.join(", ") ?? "");
   const [notes, setNotes] = useState(server?.notes ?? "");
   const [secret, setSecret] = useState("");
+  const [passphrase, setPassphrase] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const authChanged = server !== null && authType !== server.authType;
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setPending(true);
     setError(null);
 
+    if (isTauriRuntime()) {
+      if (authChanged && secret.length === 0) {
+        setError(
+          authType === "private_key"
+            ? "Enter a private key before switching this server to key authentication."
+            : "Enter the SSH password before switching this server to password authentication.",
+        );
+        setPending(false);
+        return;
+      }
+      if (authType === "private_key" && secret.length === 0 && passphrase.length > 0) {
+        setError("Enter the private key again to change its passphrase.");
+        setPending(false);
+        return;
+      }
+    }
+
     let credentialRef = server?.credentialRef ?? null;
     let createdReference: string | null = null;
 
     if (secret.length > 0 && isTauriRuntime()) {
       try {
-        if (credentialRef) {
+        if (authType === "private_key") {
+          const keyPassphrase = passphrase.length > 0 ? passphrase : null;
+          if (credentialRef) {
+            await storePrivateKeyCredential(credentialRef, secret, keyPassphrase);
+          } else {
+            credentialRef = await createPrivateKeyCredential(secret, keyPassphrase);
+            createdReference = credentialRef;
+          }
+        } else if (credentialRef) {
           await storeCredential(credentialRef, secret);
         } else {
           credentialRef = await createCredential(secret);
@@ -187,7 +220,16 @@ function ServerProfileDialog({ server, onOpenChange }: ServerProfileDialogProps)
             </div>
             <div className="space-y-2">
               <Label htmlFor="server-auth">Authentication</Label>
-              <Select value={authType} onValueChange={(value) => setAuthType(value as AuthType)}>
+              <Select
+                value={authType}
+                onValueChange={(value) => {
+                  if (value !== authType) {
+                    setAuthType(value as AuthType);
+                    setSecret("");
+                    setPassphrase("");
+                  }
+                }}
+              >
                 <SelectTrigger id="server-auth">
                   <SelectValue />
                 </SelectTrigger>
@@ -225,23 +267,42 @@ function ServerProfileDialog({ server, onOpenChange }: ServerProfileDialogProps)
                     autoComplete="new-password"
                   />
                 ) : (
-                  <Textarea
-                    id="server-secret"
-                    value={secret}
-                    onChange={(event) => setSecret(event.currentTarget.value)}
-                    placeholder={
-                      server?.credentialRef
-                        ? "Leave blank to keep the existing key"
-                        : "Paste an unencrypted OpenSSH private key, or enter a key file path"
-                    }
-                    className="min-h-20 font-mono text-[11px]"
-                    spellCheck={false}
-                  />
+                  <>
+                    <Textarea
+                      id="server-secret"
+                      value={secret}
+                      onChange={(event) => setSecret(event.currentTarget.value)}
+                      placeholder={
+                        server?.credentialRef
+                          ? "Leave blank to keep the existing key"
+                          : "Paste an OpenSSH or PEM private key, or enter a key file path"
+                      }
+                      className="min-h-20 font-mono text-[11px]"
+                      spellCheck={false}
+                    />
+                    <div className="space-y-2 pt-1">
+                      <Label htmlFor="server-passphrase">Key passphrase (optional)</Label>
+                      <Input
+                        id="server-passphrase"
+                        type="password"
+                        value={passphrase}
+                        onChange={(event) => setPassphrase(event.currentTarget.value)}
+                        placeholder={
+                          secret.length > 0
+                            ? "Leave blank if the key is not encrypted"
+                            : server?.credentialRef
+                              ? "Leave blank to keep the saved key and passphrase"
+                              : "Leave blank if the key is not encrypted"
+                        }
+                        autoComplete="new-password"
+                      />
+                    </div>
+                  </>
                 )}
                 <p className="text-[11px] leading-relaxed text-muted-foreground">
                   Secrets are stored in the OS credential store, never in SQLite or logs.
                   {authType === "private_key"
-                    ? " Encrypted keys are not supported yet; save an unencrypted key or a path to one."
+                    ? " OpenSSH, PEM (RSA, ECDSA, Ed25519), and PuTTY PPK keys are supported; encrypted keys use the passphrase above."
                     : null}
                 </p>
               </div>

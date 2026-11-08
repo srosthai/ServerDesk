@@ -96,4 +96,33 @@ describe("ServersPage", () => {
     expect(await screen.findByText("Connection timed out after 15 seconds.")).toBeInTheDocument();
     expect(screen.getByText("Connection error")).toBeInTheDocument();
   });
+
+  it("shows a distinct authentication error instead of a generic failure", async () => {
+    useServerStore.setState({
+      servers: [server],
+      status: "ready",
+      error: null,
+    });
+    useConnectionStore.setState({
+      connections: {
+        [server.id]: {
+          serverId: server.id,
+          state: "error",
+          changedAt: 3,
+          error: {
+            code: "authentication",
+            message: "SSH authentication failed. Check the username and credentials.",
+          },
+        },
+      },
+      busy: {},
+      error: null,
+    });
+
+    render(<ServersPage />);
+
+    expect(
+      screen.getByText("SSH authentication failed. Check the username and credentials."),
+    ).toBeInTheDocument();
+  });
 });

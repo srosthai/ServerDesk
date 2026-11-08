@@ -52,6 +52,8 @@ pub fn run() {
             commands::credentials::create_credential,
             commands::credentials::store_credential,
             commands::credentials::delete_credential,
+            commands::credentials::create_private_key_credential,
+            commands::credentials::store_private_key_credential,
             commands::connections::connect_server,
             commands::connections::disconnect_server,
             commands::connections::get_connection_state

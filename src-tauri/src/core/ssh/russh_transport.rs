@@ -1,6 +1,4 @@
 use std::{
-    borrow::Cow,
-    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -12,13 +10,13 @@ use async_trait::async_trait;
 use russh::{
     ChannelMsg, Disconnect,
     client::{self, Config, Handle},
-    keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, decode_secret_key},
+    keys::{HashAlg, PrivateKeyWithHashAlg},
 };
 use tokio::net::TcpStream;
 
 use super::{
     Authentication, CommandOutput, ConnectionRequest, SshSession, SshTransport, TransportError,
-    TrustedHostKey,
+    TrustedHostKey, private_key::load_private_key,
 };
 
 const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -178,8 +176,8 @@ impl SshTransport for RusshTransport {
                 .authenticate_password(request.username.clone(), password.clone())
                 .await
                 .map_err(map_russh_error)?,
-            Authentication::PrivateKey(secret) => {
-                let key = load_private_key(secret)?;
+            Authentication::PrivateKey { key, passphrase } => {
+                let key = load_private_key(key, passphrase.as_deref())?;
                 let hash_alg = handle
                     .best_supported_rsa_hash()
                     .await
@@ -297,56 +295,6 @@ impl SshSession for RusshSession {
     }
 }
 
-fn load_private_key(secret: &str) -> Result<PrivateKey, TransportError> {
-    let secret = secret.trim();
-    if secret.is_empty() {
-        return Err(TransportError::Credential(
-            "No private key is saved for this server.".to_string(),
-        ));
-    }
-
-    let contents = if looks_like_private_key(secret) {
-        Cow::Borrowed(secret)
-    } else {
-        let path = expand_home(secret);
-        Cow::Owned(std::fs::read_to_string(path).map_err(|_| {
-            TransportError::Credential(
-                "The saved private key could not be read. Save the OpenSSH key contents or a valid key path."
-                    .to_string(),
-            )
-        })?)
-    };
-
-    decode_secret_key(&contents, None).map_err(|error| match error {
-        russh::keys::Error::KeyIsEncrypted => TransportError::Credential(
-            "The private key is encrypted. Passphrase-protected keys are not supported yet."
-                .to_string(),
-        ),
-        _ => TransportError::Credential(
-            "The saved private key could not be decoded. Save an unencrypted OpenSSH private key."
-                .to_string(),
-        ),
-    })
-}
-
-fn looks_like_private_key(secret: &str) -> bool {
-    secret.contains("BEGIN OPENSSH PRIVATE KEY")
-        || secret.contains("BEGIN RSA PRIVATE KEY")
-        || secret.contains("BEGIN EC PRIVATE KEY")
-        || secret.contains("BEGIN PRIVATE KEY")
-        || secret.starts_with("PuTTY-User-Key-File-")
-}
-
-fn expand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
-    {
-        return PathBuf::from(home).join(rest);
-    }
-
-    PathBuf::from(path)
-}
-
 fn map_io_error(error: std::io::Error) -> TransportError {
     match error.kind() {
         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => TransportError::Timeout,
@@ -385,21 +333,6 @@ fn map_russh_error(error: russh::Error) -> TransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rejects_empty_private_key_material() {
-        assert!(matches!(
-            load_private_key("   "),
-            Err(TransportError::Credential(_))
-        ));
-    }
-
-    #[test]
-    fn expands_home_paths() {
-        if std::env::var_os("HOME").is_some() {
-            assert!(expand_home("~/key").is_absolute());
-        }
-    }
 
     #[test]
     fn maps_internal_timeouts_to_timeout_errors() {

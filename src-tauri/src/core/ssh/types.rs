@@ -71,14 +71,21 @@ pub struct TrustedHostKey {
 #[derive(Clone)]
 pub enum Authentication {
     Password(String),
-    PrivateKey(String),
+    PrivateKey {
+        key: String,
+        passphrase: Option<String>,
+    },
 }
 
 impl fmt::Debug for Authentication {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Password(_) => formatter.write_str("Password(<redacted>)"),
-            Self::PrivateKey(_) => formatter.write_str("PrivateKey(<redacted>)"),
+            Self::PrivateKey { passphrase, .. } => formatter
+                .debug_struct("PrivateKey")
+                .field("key", &"<redacted>")
+                .field("passphrase", &passphrase.as_ref().map(|_| "<redacted>"))
+                .finish(),
         }
     }
 }
@@ -153,7 +160,9 @@ impl TransportError {
                 .with_details(format!(
                     "{key_type} expected {expected_fingerprint}, received {actual_fingerprint}"
                 )),
-            Self::Authentication => AppError::authentication("SSH authentication failed."),
+            Self::Authentication => AppError::authentication(
+                "SSH authentication failed. Check the username and credentials.",
+            ),
             Self::Credential(message) => AppError::credential(message.clone()),
             Self::Dns => AppError::dns("Could not resolve the server hostname."),
             Self::Network => AppError::network("Could not reach the SSH server."),
@@ -241,7 +250,7 @@ mod tests {
 
     #[test]
     fn debug_output_redacts_credentials() {
-        let request = ConnectionRequest {
+        let password_request = ConnectionRequest {
             server_id: "server-1".to_string(),
             host: "198.51.100.24".to_string(),
             port: 22,
@@ -249,9 +258,34 @@ mod tests {
             authentication: Authentication::Password("super-secret".to_string()),
             trusted_host_keys: Vec::new(),
         };
+        let key_request = ConnectionRequest {
+            authentication: Authentication::PrivateKey {
+                key: "-----BEGIN OPENSSH PRIVATE KEY-----secret".to_string(),
+                passphrase: Some("key-passphrase".to_string()),
+            },
+            ..password_request.clone()
+        };
 
-        let debug = format!("{request:?}");
-        assert!(debug.contains("<redacted>"));
-        assert!(!debug.contains("super-secret"));
+        for request in [password_request, key_request] {
+            let debug = format!("{request:?}");
+            assert!(debug.contains("<redacted>"));
+            assert!(!debug.contains("super-secret"));
+            assert!(!debug.contains("BEGIN OPENSSH PRIVATE KEY"));
+            assert!(!debug.contains("key-passphrase"));
+        }
+    }
+
+    #[test]
+    fn authentication_errors_are_distinct_from_credentials() {
+        assert_eq!(
+            TransportError::Authentication.to_app_error().code,
+            ErrorCode::Authentication
+        );
+        assert_eq!(
+            TransportError::Credential("bad key".to_string())
+                .to_app_error()
+                .code,
+            ErrorCode::Credential
+        );
     }
 }
