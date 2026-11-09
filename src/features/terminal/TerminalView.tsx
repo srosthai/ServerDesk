@@ -8,10 +8,10 @@ import type { TerminalSessionState } from "@/stores/terminalStore";
 import type { TerminalSize } from "@/types/contracts";
 
 const TERMINAL_THEME: ITheme = {
-  background: "#07100c",
+  background: "#000000",
   foreground: "#d7e4dc",
   cursor: "#f08a4b",
-  cursorAccent: "#07100c",
+  cursorAccent: "#000000",
   selectionBackground: "#315843",
   selectionForeground: "#f4f8f5",
   selectionInactiveBackground: "#243c2f",
@@ -23,20 +23,20 @@ const TERMINAL_THEME: ITheme = {
   magenta: "#c678dd",
   cyan: "#56b6c2",
   white: "#d7e4dc",
-  brightBlack: "#6f8177",
+  brightBlack: "#7d8d84",
   brightRed: "#ff7b72",
   brightGreen: "#7ee787",
   brightYellow: "#f2cc60",
   brightBlue: "#79c0ff",
   brightMagenta: "#d2a8ff",
   brightCyan: "#76e3ea",
-  brightWhite: "#f0f6fc",
+  brightWhite: "#f1f5f2",
 };
 
 const TERMINAL_SCROLLBACK = 5_000;
 
 const toolbarButtonClass =
-  "inline-flex h-6 items-center gap-1 rounded-sm px-1.5 text-[11px] text-[#9fb0a6] transition-colors outline-none hover:bg-white/10 hover:text-[#f0f6fc] focus-visible:ring-2 focus-visible:ring-[#f08a4b]/60 disabled:pointer-events-none disabled:opacity-40";
+  "inline-flex h-6 items-center gap-1 rounded-sm px-1.5 text-[11px] text-[#a2b0a7] transition-colors outline-none hover:bg-white/10 hover:text-[#f1f5f2] focus-visible:ring-2 focus-visible:ring-[#f08a4b]/60 disabled:pointer-events-none disabled:opacity-40";
 
 async function copyToClipboard(value: string): Promise<boolean> {
   if (navigator.clipboard?.writeText) {
@@ -383,7 +383,7 @@ function TerminalView({
 
   return (
     <div
-      className={cn("flex h-full min-h-0 flex-col bg-[#07100c]", active ? "flex" : "hidden")}
+      className={cn("flex h-full min-h-0 flex-col bg-[#000000]", active ? "flex" : "hidden")}
       data-terminal-session={session.info.sessionId}
       id={id}
       role="tabpanel"
@@ -435,10 +435,10 @@ function TerminalView({
           <BroomIcon aria-hidden="true" className="size-3.5" />
           Clear
         </button>
-        <span className="ml-auto font-mono text-[10px] text-[#6f8177]">
+        <span className="ml-auto font-mono text-[10px] text-[#7d8d84]">
           {dimensions.cols}×{dimensions.rows} · {TERMINAL_SCROLLBACK.toLocaleString()} lines
         </span>
-        <span className="min-w-[22ch] truncate text-right text-[10px] text-[#9fb0a6]" role="status">
+        <span className="min-w-[22ch] truncate text-right text-[10px] text-[#a2b0a7]" role="status">
           {notice ?? ""}
         </span>
       </div>

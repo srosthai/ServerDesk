@@ -22,17 +22,17 @@ function OutputPanel({
   return (
     <section
       className={cn(
-        "overflow-hidden rounded-md border border-[#26332c] bg-[#0b110e] text-[#dfe7e1]",
+        "overflow-hidden rounded-md border border-[#1b241f] bg-[#050806] text-[#e2eae4]",
         className,
       )}
     >
-      <header className="flex h-9 items-center justify-between gap-3 border-b border-[#26332c] px-3">
-        <span className="text-[11px] font-medium text-[#91a198]">{title}</span>
+      <header className="flex h-9 items-center justify-between gap-3 border-b border-[#1b241f] px-3">
+        <span className="text-[11px] font-medium text-[#98a79e]">{title}</span>
         <div className="flex items-center gap-2">
-          {meta ? <span className="font-mono text-[10px] text-[#91a198]">{meta}</span> : null}
+          {meta ? <span className="font-mono text-[10px] text-[#98a79e]">{meta}</span> : null}
           <CopyButton
             value={content}
-            className="text-[#91a198] hover:bg-[#18221d] hover:text-[#dfe7e1]"
+            className="text-[#98a79e] hover:bg-[#101713] hover:text-[#e2eae4]"
           />
         </div>
       </header>
@@ -42,7 +42,7 @@ function OutputPanel({
           maxHeightClassName,
         )}
       >
-        {content || <span className="text-[#6f8077]">{emptyText}</span>}
+        {content || <span className="text-[#7d8d84]">{emptyText}</span>}
       </pre>
     </section>
   );

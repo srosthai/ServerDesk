@@ -43,16 +43,16 @@ function readPalette(theme: "light" | "dark"): ChartPalette {
   const dark = theme === "dark";
 
   return {
-    text: readCssVariable("--foreground", dark ? "#e6ece8" : "#151d19"),
-    mutedText: readCssVariable("--muted-foreground", dark ? "#94a39a" : "#5c6861"),
-    axis: readCssVariable("--border", dark ? "#26332c" : "#d3dad5"),
-    grid: readCssVariable("--border", dark ? "#26332c" : "#d3dad5"),
-    tooltipBackground: readCssVariable("--popover", dark ? "#16211c" : "#fbfcfa"),
-    tooltipBorder: readCssVariable("--border", dark ? "#26332c" : "#d3dad5"),
-    tooltipText: readCssVariable("--popover-foreground", dark ? "#e6ece8" : "#151d19"),
-    cpu: readCssVariable("--primary", dark ? "#f08a4b" : "#c2410c"),
-    memory: readCssVariable("--info", dark ? "#6bb6e8" : "#1f5f8b"),
-    disk: readCssVariable("--success", dark ? "#5bc46d" : "#236b34"),
+    text: readCssVariable("--foreground", dark ? "#f1f5f2" : "#151d19"),
+    mutedText: readCssVariable("--muted-foreground", dark ? "#a2b0a7" : "#5c6861"),
+    axis: readCssVariable("--border", dark ? "#1b241f" : "#d3dad5"),
+    grid: readCssVariable("--border", dark ? "#1b241f" : "#d3dad5"),
+    tooltipBackground: readCssVariable("--popover", dark ? "#0b0f0c" : "#fbfcfa"),
+    tooltipBorder: readCssVariable("--border", dark ? "#1b241f" : "#d3dad5"),
+    tooltipText: readCssVariable("--popover-foreground", dark ? "#f1f5f2" : "#151d19"),
+    cpu: readCssVariable("--primary", dark ? "#ff8a4c" : "#c2410c"),
+    memory: readCssVariable("--info", dark ? "#74c0f0" : "#1f5f8b"),
+    disk: readCssVariable("--success", dark ? "#63d471" : "#236b34"),
     fontFamily:
       getComputedStyle(document.body).fontFamily ||
       '"IBM Plex Sans Variable", ui-sans-serif, system-ui, sans-serif',
