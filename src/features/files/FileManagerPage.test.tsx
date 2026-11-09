@@ -200,7 +200,7 @@ describe("FileManagerPage", () => {
     usePreferencesStore.setState({
       preferences: { ...DEFAULT_PREFERENCES, lastActiveServerId: server.id },
     });
-    useFileStore.setState({ entries: {} });
+    useFileStore.setState({ entries: {}, transfers: {}, mutations: {} });
     vi.mocked(getConnectionState).mockResolvedValue(connected);
     vi.mocked(browseRemoteFiles).mockReset();
     vi.mocked(uploadRemoteFile).mockReset();
@@ -297,15 +297,17 @@ describe("FileManagerPage", () => {
     expect(screen.getByRole("button", { name: "Open symlink inside-link" })).toBeInTheDocument();
   });
 
-  it("reports permission errors and keeps the last listing visible", async () => {
-    vi.mocked(browseRemoteFiles).mockRejectedValueOnce({
-      code: "permission",
-      message: "The SSH account does not have permission to read this remote location.",
-      details: "ServerDesk does not elevate with sudo.",
-    });
+  it("reports permission errors and recovers on retry", async () => {
+    vi.mocked(browseRemoteFiles)
+      .mockRejectedValueOnce({
+        code: "permission",
+        message: "The SSH account does not have permission to read this remote location.",
+        details: "ServerDesk does not elevate with sudo.",
+      })
+      .mockResolvedValueOnce(listing());
     renderPage();
 
-    await openRoot("/var/private");
+    const user = await openRoot("/var/private");
 
     expect(
       await screen.findByText(
@@ -313,7 +315,13 @@ describe("FileManagerPage", () => {
       ),
     ).toBeInTheDocument();
     expect(screen.getByText("ServerDesk does not elevate with sudo.")).toBeInTheDocument();
-    expect(screen.getByText("Could not browse this remote path")).toBeInTheDocument();
+    expect(screen.getByText("Permission denied for this remote path")).toBeInTheDocument();
+    expect(screen.getByText(/The SSH account deploy cannot read/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(browseRemoteFiles).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("readme.txt")).toBeInTheDocument();
+    expect(screen.queryByText("Permission denied for this remote path")).not.toBeInTheDocument();
   });
 
   it("keeps the last listing visible with a stale warning when disconnected", async () => {
@@ -444,7 +452,9 @@ describe("FileManagerPage", () => {
     await user.type(screen.getByLabelText("Local source path"), "/home/user/readme.txt");
     await user.click(screen.getByRole("button", { name: "Start upload" }));
 
-    expect(await screen.findByText("Overwrite the existing destination?")).toBeInTheDocument();
+    expect(await screen.findByText("Overwrite readme.txt?")).toBeInTheDocument();
+    expect(screen.getByText("Production (deploy@198.51.100.24:22)")).toBeInTheDocument();
+    expect(screen.getByText("/var/www/readme.txt")).toBeInTheDocument();
     expect(uploadRemoteFile).toHaveBeenCalledTimes(1);
     expect(vi.mocked(uploadRemoteFile).mock.calls[0][0].overwrite).toBe(false);
 
@@ -535,6 +545,11 @@ describe("FileManagerPage", () => {
     await screen.findByText("readme.txt");
     await user.click(screen.getByRole("button", { name: "Rename readme.txt" }));
 
+    const renameDialog = await screen.findByRole("dialog");
+    expect(
+      within(renameDialog).getByText("Production (deploy@198.51.100.24:22)"),
+    ).toBeInTheDocument();
+    expect(within(renameDialog).getByText("/var/www/readme.txt")).toBeInTheDocument();
     const input = await screen.findByLabelText("New name");
     await user.clear(input);
     await user.type(input, "renamed.txt");
@@ -568,6 +583,11 @@ describe("FileManagerPage", () => {
     await screen.findByText("readme.txt");
     await user.click(screen.getByRole("button", { name: "New folder" }));
 
+    const createDialog = await screen.findByRole("dialog");
+    expect(
+      within(createDialog).getByText("Production (deploy@198.51.100.24:22)"),
+    ).toBeInTheDocument();
+    expect(within(createDialog).getByText("/var/www")).toBeInTheDocument();
     const input = await screen.findByLabelText("Folder name");
     await user.type(input, "backups");
     await user.click(screen.getByRole("button", { name: "Create folder" }));
@@ -582,5 +602,287 @@ describe("FileManagerPage", () => {
       ),
     );
     expect(await screen.findByText("Folder created")).toBeInTheDocument();
+  });
+
+  it("navigates back to the selected root through the breadcrumb", async () => {
+    const nested = listing({
+      path: "/var/www/nested",
+      resolvedPath: "/var/www/nested",
+      entries: [],
+    });
+    vi.mocked(browseRemoteFiles)
+      .mockResolvedValueOnce(listing())
+      .mockResolvedValueOnce(nested)
+      .mockResolvedValueOnce(listing());
+    renderPage();
+
+    const user = await openRoot();
+    await screen.findByText("readme.txt");
+    await user.click(screen.getByRole("button", { name: "Open directory nested" }));
+    await waitFor(() =>
+      expect(browseRemoteFiles).toHaveBeenLastCalledWith(server.id, "/var/www", "/var/www/nested"),
+    );
+    expect(await screen.findByText("/var/www/nested")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "www" }));
+    await waitFor(() =>
+      expect(browseRemoteFiles).toHaveBeenLastCalledWith(server.id, "/var/www", "/var/www"),
+    );
+    expect(await screen.findByText("readme.txt")).toBeInTheDocument();
+  });
+
+  it("navigates back and forward through the directory history", async () => {
+    const nested = listing({
+      path: "/var/www/nested",
+      resolvedPath: "/var/www/nested",
+      entries: [
+        entry({
+          name: "deeper",
+          path: "/var/www/nested/deeper",
+          entryType: "directory",
+        }),
+      ],
+    });
+    vi.mocked(browseRemoteFiles)
+      .mockResolvedValueOnce(listing())
+      .mockResolvedValueOnce(nested)
+      .mockResolvedValueOnce(listing())
+      .mockResolvedValueOnce(nested);
+    renderPage();
+
+    const user = await openRoot();
+    await screen.findByText("readme.txt");
+    const back = screen.getByRole("button", { name: "Back" });
+    const forward = screen.getByRole("button", { name: "Forward" });
+    expect(back).toBeDisabled();
+    expect(forward).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "Open directory nested" }));
+    await waitFor(() =>
+      expect(browseRemoteFiles).toHaveBeenLastCalledWith(server.id, "/var/www", "/var/www/nested"),
+    );
+    expect(await screen.findByText("/var/www/nested")).toBeInTheDocument();
+    expect(back).toBeEnabled();
+    expect(forward).toBeDisabled();
+
+    await user.click(back);
+    await waitFor(() =>
+      expect(browseRemoteFiles).toHaveBeenLastCalledWith(server.id, "/var/www", "/var/www"),
+    );
+    expect(await screen.findByText("/var/www")).toBeInTheDocument();
+    expect(back).toBeDisabled();
+    expect(forward).toBeEnabled();
+
+    await user.click(forward);
+    await waitFor(() =>
+      expect(browseRemoteFiles).toHaveBeenLastCalledWith(server.id, "/var/www", "/var/www/nested"),
+    );
+    expect(await screen.findByText("/var/www/nested")).toBeInTheDocument();
+    expect(back).toBeEnabled();
+  });
+
+  it("moves through rows with the keyboard and selects with Space, Ctrl+A, and Escape", async () => {
+    vi.mocked(browseRemoteFiles).mockResolvedValue(listing());
+    renderPage();
+
+    const user = await openRoot();
+    await screen.findByText("readme.txt");
+
+    const nestedRow = screen.getByText("nested").closest("tr") as HTMLElement;
+    const readmeRow = screen.getByText("readme.txt").closest("tr") as HTMLElement;
+    nestedRow.focus();
+    expect(document.activeElement).toBe(nestedRow);
+
+    await user.keyboard("{ArrowDown}");
+    expect(document.activeElement).toBe(readmeRow);
+
+    await user.keyboard(" ");
+    expect(screen.getByLabelText("Select readme.txt")).toBeChecked();
+    const selectionStatus = screen.getByRole("status", {
+      name: "Selected remote entries",
+    });
+    expect(selectionStatus).toHaveTextContent("1 entry selected");
+
+    await user.keyboard("{Control>}a{/Control}");
+    for (const name of ["nested", "readme.txt", "escape-link", "inside-link"]) {
+      expect(screen.getByLabelText(`Select ${name}`)).toBeChecked();
+    }
+    expect(within(selectionStatus).getByText("4 entries")).toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+    expect(
+      screen.queryByRole("status", { name: "Selected remote entries" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("opens the focused directory with Enter", async () => {
+    vi.mocked(browseRemoteFiles)
+      .mockResolvedValueOnce(listing())
+      .mockResolvedValueOnce(
+        listing({
+          path: "/var/www/nested",
+          resolvedPath: "/var/www/nested",
+          entries: [],
+        }),
+      );
+    renderPage();
+
+    const user = await openRoot();
+    await screen.findByText("nested");
+    const nestedRow = screen.getByText("nested").closest("tr") as HTMLElement;
+    nestedRow.focus();
+    await user.keyboard("{Enter}");
+
+    await waitFor(() =>
+      expect(browseRemoteFiles).toHaveBeenLastCalledWith(server.id, "/var/www", "/var/www/nested"),
+    );
+  });
+
+  it("selects multiple entries and deletes them after a confirmation naming the server and paths", async () => {
+    vi.mocked(browseRemoteFiles).mockResolvedValue(listing());
+    vi.mocked(deleteRemoteEntry).mockImplementation(async (input) =>
+      mutationResult({
+        action: "delete",
+        path: input.path,
+        targetPath: undefined,
+        recursive: input.recursive,
+        deletedEntries: 1,
+      }),
+    );
+    renderPage();
+
+    const user = await openRoot();
+    await screen.findByText("readme.txt");
+    await user.click(screen.getByLabelText("Select readme.txt"));
+    await user.click(screen.getByLabelText("Select nested"));
+
+    const selectionStatus = screen.getByRole("status", {
+      name: "Selected remote entries",
+    });
+    expect(selectionStatus).toHaveTextContent("2 entries selected");
+    await user.click(screen.getByRole("button", { name: "Delete selected" }));
+
+    expect(await screen.findByText("Delete 2 selected entries?")).toBeInTheDocument();
+    expect(deleteRemoteEntry).not.toHaveBeenCalled();
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("Production (deploy@198.51.100.24:22)")).toBeInTheDocument();
+    expect(within(dialog).getByText(/\/var\/www\/readme\.txt/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/\/var\/www\/nested/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Delete 2 entries" }));
+    await waitFor(() => expect(deleteRemoteEntry).toHaveBeenCalledTimes(2));
+    expect(deleteRemoteEntry).toHaveBeenNthCalledWith(1, {
+      serverId: server.id,
+      root: "/var/www",
+      path: "/var/www/nested",
+      confirmed: true,
+      recursive: true,
+    });
+    expect(deleteRemoteEntry).toHaveBeenNthCalledWith(2, {
+      serverId: server.id,
+      root: "/var/www",
+      path: "/var/www/readme.txt",
+      confirmed: true,
+      recursive: false,
+    });
+    expect(await screen.findByText("2 entries deleted")).toBeInTheDocument();
+  });
+
+  it("downloads multiple selected entries into an explicit local folder", async () => {
+    vi.mocked(browseRemoteFiles).mockResolvedValue(listing());
+    vi.mocked(downloadRemoteFile).mockImplementation(async (input) =>
+      transferResult({
+        direction: "download",
+        transferId: input.transferId,
+        sourcePath: input.remotePath,
+        destinationPath: input.localPath,
+      }),
+    );
+    renderPage();
+
+    const user = await openRoot();
+    await screen.findByText("readme.txt");
+    await user.click(screen.getByLabelText("Select readme.txt"));
+    await user.click(screen.getByLabelText("Select nested"));
+    await user.click(screen.getByRole("button", { name: "Download selected" }));
+
+    expect(await screen.findByText("Download selected entries")).toBeInTheDocument();
+    await user.type(screen.getByLabelText("Local destination folder"), "/home/user/Downloads");
+    await user.click(screen.getByRole("button", { name: "Download 2 entries" }));
+
+    await waitFor(() => expect(downloadRemoteFile).toHaveBeenCalledTimes(2));
+    const calls = vi.mocked(downloadRemoteFile).mock.calls.map((call) => call[0]);
+    expect(calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          remotePath: "/var/www/nested",
+          localPath: "/home/user/Downloads/nested",
+        }),
+        expect.objectContaining({
+          remotePath: "/var/www/readme.txt",
+          localPath: "/home/user/Downloads/readme.txt",
+        }),
+      ]),
+    );
+  });
+
+  it("keeps concurrent transfers in one queue with progress, cancel, and dismiss controls", async () => {
+    vi.mocked(browseRemoteFiles).mockResolvedValue(listing());
+    let resolveFirst: (result: FileTransferResult) => void = () => undefined;
+    vi.mocked(uploadRemoteFile)
+      .mockImplementationOnce(
+        (input) =>
+          new Promise<FileTransferResult>((resolve) => {
+            resolveFirst = (result) => resolve({ ...result, transferId: input.transferId });
+          }),
+      )
+      .mockImplementationOnce(async (input) =>
+        transferResult({
+          transferId: input.transferId,
+          sourcePath: input.localPath,
+          destinationPath: input.remotePath,
+        }),
+      );
+    vi.mocked(cancelFileTransfer).mockResolvedValue(true);
+    renderPage();
+
+    const user = await openRoot();
+    await screen.findByText("readme.txt");
+
+    await user.click(screen.getByRole("button", { name: "Upload" }));
+    await user.type(screen.getByLabelText("Local source path"), "/home/user/first.txt");
+    await user.click(screen.getByRole("button", { name: "Start upload" }));
+
+    await user.click(screen.getByRole("button", { name: "Upload" }));
+    await user.type(screen.getByLabelText("Local source path"), "/home/user/second.txt");
+    await user.click(screen.getByRole("button", { name: "Start upload" }));
+
+    const queue = await screen.findByRole("region", { name: "File transfer queue" });
+    expect(within(queue).getByText("2 transfers")).toBeInTheDocument();
+    expect(within(queue).getByText("1 active")).toBeInTheDocument();
+    expect(within(queue).getByRole("progressbar", { name: /first\.txt/ })).toBeInTheDocument();
+    expect(within(queue).getByRole("progressbar", { name: /second\.txt/ })).toBeInTheDocument();
+
+    await user.click(within(queue).getByRole("button", { name: "Cancel" }));
+    const firstTransferId = vi.mocked(uploadRemoteFile).mock.calls[0][0].transferId;
+    await waitFor(() => expect(cancelFileTransfer).toHaveBeenCalledWith(firstTransferId));
+
+    resolveFirst(
+      transferResult({
+        transferId: firstTransferId,
+        status: "cancelled",
+        mayBeIncomplete: true,
+        partialPaths: ["/var/www/first.txt.serverdesk-test.part"],
+      }),
+    );
+    expect(await screen.findByText("This transfer may be incomplete")).toBeInTheDocument();
+    expect(within(queue).getByText("0 active")).toBeInTheDocument();
+
+    const dismissButtons = within(queue).getAllByRole("button", { name: "Dismiss" });
+    expect(dismissButtons).toHaveLength(2);
+    await user.click(dismissButtons[0]);
+    expect(within(queue).getByText("1 transfer")).toBeInTheDocument();
+    await user.click(within(queue).getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByRole("region", { name: "File transfer queue" })).not.toBeInTheDocument();
   });
 });

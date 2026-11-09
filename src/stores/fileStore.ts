@@ -30,7 +30,16 @@ export type FileBrowserEntry = {
   pending: boolean;
   error: string | null;
   errorDetails: string | null;
+  errorCode: ErrorCode | null;
+  errorPath: string | null;
+  history: string[];
+  historyIndex: number;
   lastAttemptAt: number | null;
+};
+
+export type DeleteEntryTarget = {
+  path: string;
+  recursive: boolean;
 };
 
 export type FileTransferRequest =
@@ -106,6 +115,8 @@ type FileBrowserStore = {
   openRoot: (serverId: string, path: string) => Promise<boolean>;
   refresh: (serverId: string) => Promise<boolean>;
   goUp: (serverId: string) => Promise<boolean>;
+  goBack: (serverId: string) => Promise<boolean>;
+  goForward: (serverId: string) => Promise<boolean>;
   clearError: (serverId: string) => void;
   clearServer: (serverId: string) => void;
   startUpload: (input: UploadStartInput) => Promise<string>;
@@ -122,6 +133,7 @@ type FileBrowserStore = {
     path: string,
     recursive: boolean,
   ) => Promise<boolean>;
+  deleteEntries: (serverId: string, root: string, targets: DeleteEntryTarget[]) => Promise<boolean>;
   clearMutation: (serverId: string) => void;
 };
 
@@ -133,6 +145,10 @@ export function emptyFileBrowserEntry(): FileBrowserEntry {
     pending: false,
     error: null,
     errorDetails: null,
+    errorCode: null,
+    errorPath: null,
+    history: [],
+    historyIndex: -1,
     lastAttemptAt: null,
   };
 }
@@ -217,7 +233,17 @@ export const useFileStore = create<FileBrowserStore>((set, get) => {
     });
   }
 
-  async function browse(serverId: string, root: string, path: string): Promise<boolean> {
+  type BrowseOptions = {
+    recordHistory?: boolean;
+    resetHistory?: boolean;
+  };
+
+  async function browsePath(
+    serverId: string,
+    root: string,
+    path: string,
+    options: BrowseOptions = {},
+  ): Promise<boolean> {
     const normalizedRoot = normalizeRemotePath(root);
     const normalizedPath = normalizeRemotePath(path);
 
@@ -227,6 +253,8 @@ export const useFileStore = create<FileBrowserStore>((set, get) => {
         error:
           "Enter an absolute, normalized remote path such as /var/www. Relative paths, parent segments, and control characters are rejected.",
         errorDetails: null,
+        errorCode: "validation",
+        errorPath: path,
         lastAttemptAt: Date.now(),
       }));
       return false;
@@ -237,6 +265,8 @@ export const useFileStore = create<FileBrowserStore>((set, get) => {
         ...entry,
         error: "The requested path is outside the selected root directory.",
         errorDetails: "Browsing is limited to the selected root and its descendants.",
+        errorCode: "validation",
+        errorPath: normalizedPath,
         lastAttemptAt: Date.now(),
       }));
       return false;
@@ -253,6 +283,8 @@ export const useFileStore = create<FileBrowserStore>((set, get) => {
       pending: true,
       error: null,
       errorDetails: null,
+      errorCode: null,
+      errorPath: null,
     }));
 
     try {
@@ -260,16 +292,37 @@ export const useFileStore = create<FileBrowserStore>((set, get) => {
       if (requestIds[serverId] !== requestId) {
         return false;
       }
-      updateEntry(serverId, (entry) => ({
-        ...entry,
-        root: listing.root,
-        path: listing.path,
-        listing,
-        pending: false,
-        error: null,
-        errorDetails: null,
-        lastAttemptAt: Date.now(),
-      }));
+      updateEntry(serverId, (entry) => {
+        const rootChanged = entry.root !== listing.root;
+        let history = entry.history;
+        let historyIndex = entry.historyIndex;
+
+        if (options.resetHistory || rootChanged || history.length === 0) {
+          history = [listing.path];
+          historyIndex = 0;
+        } else if (options.recordHistory !== false) {
+          history = history.slice(0, historyIndex + 1);
+          if (history[history.length - 1] !== listing.path) {
+            history.push(listing.path);
+          }
+          historyIndex = history.length - 1;
+        }
+
+        return {
+          ...entry,
+          root: listing.root,
+          path: listing.path,
+          listing,
+          pending: false,
+          error: null,
+          errorDetails: null,
+          errorCode: null,
+          errorPath: null,
+          history,
+          historyIndex,
+          lastAttemptAt: Date.now(),
+        };
+      });
       return true;
     } catch (error) {
       if (requestIds[serverId] === requestId) {
@@ -278,14 +331,22 @@ export const useFileStore = create<FileBrowserStore>((set, get) => {
           // Keep the last successful listing visible with its original sample
           // time. A failed navigation never replaces real metadata with a
           // fabricated empty directory.
+          root: entry.listing ? entry.root : normalizedRoot,
+          path: entry.listing ? entry.path : normalizedPath,
           pending: false,
           error: getCommandErrorMessage(error),
           errorDetails: getCommandErrorDetails(error),
+          errorCode: commandErrorCode(error),
+          errorPath: normalizedPath,
           lastAttemptAt: Date.now(),
         }));
       }
       return false;
     }
+  }
+
+  function browse(serverId: string, root: string, path: string): Promise<boolean> {
+    return browsePath(serverId, root, path, { recordHistory: true });
   }
 
   async function runTransfer(request: FileTransferRequest): Promise<string> {
@@ -374,7 +435,7 @@ export const useFileStore = create<FileBrowserStore>((set, get) => {
     if (!entry?.root || !entry.path) {
       return;
     }
-    await browse(serverId, entry.root, entry.path);
+    await browsePath(serverId, entry.root, entry.path, { recordHistory: false });
   }
 
   async function runMutation(
@@ -397,6 +458,9 @@ export const useFileStore = create<FileBrowserStore>((set, get) => {
         errorDetails: getCommandErrorDetails(error),
         errorCode: commandErrorCode(error),
       }));
+      // A batch operation can delete some entries before a later one fails.
+      // Re-read the directory so the visible listing never claims stale state.
+      await refreshCurrent(serverId);
       return false;
     }
   }
@@ -408,14 +472,15 @@ export const useFileStore = create<FileBrowserStore>((set, get) => {
 
     browse,
 
-    openRoot: (serverId, path) => browse(serverId, path, path),
+    openRoot: (serverId, path) =>
+      browsePath(serverId, path, path, { recordHistory: true, resetHistory: true }),
 
     refresh: (serverId) => {
       const entry = get().entries[serverId];
       if (!entry?.root || !entry.path) {
         return Promise.resolve(false);
       }
-      return browse(serverId, entry.root, entry.path);
+      return browsePath(serverId, entry.root, entry.path, { recordHistory: false });
     },
 
     goUp: (serverId) => {
@@ -430,11 +495,51 @@ export const useFileStore = create<FileBrowserStore>((set, get) => {
       return browse(serverId, entry.root, parent);
     },
 
+    goBack: async (serverId) => {
+      const entry = get().entries[serverId];
+      if (!entry?.root) {
+        return false;
+      }
+      const index = entry.historyIndex - 1;
+      const target = entry.history[index];
+      if (!target) {
+        return false;
+      }
+      const moved = await browsePath(serverId, entry.root, target, { recordHistory: false });
+      if (moved) {
+        updateEntry(serverId, (current) =>
+          current.history[index] === target ? { ...current, historyIndex: index } : current,
+        );
+      }
+      return moved;
+    },
+
+    goForward: async (serverId) => {
+      const entry = get().entries[serverId];
+      if (!entry?.root) {
+        return false;
+      }
+      const index = entry.historyIndex + 1;
+      const target = entry.history[index];
+      if (!target) {
+        return false;
+      }
+      const moved = await browsePath(serverId, entry.root, target, { recordHistory: false });
+      if (moved) {
+        updateEntry(serverId, (current) =>
+          current.history[index] === target ? { ...current, historyIndex: index } : current,
+        );
+      }
+      return moved;
+    },
+
     clearError: (serverId) =>
       updateEntry(serverId, (entry) => ({
         ...entry,
         error: null,
         errorDetails: null,
+        errorCode: null,
+        errorPath: null,
       })),
 
     clearServer: (serverId) => {
@@ -541,6 +646,41 @@ export const useFileStore = create<FileBrowserStore>((set, get) => {
         deleteRemoteEntry({ serverId, root, path, confirmed: true, recursive }),
       ),
 
+    deleteEntries: (serverId, root, targets) => {
+      if (targets.length === 0) {
+        return Promise.resolve(false);
+      }
+      return runMutation(serverId, async () => {
+        const results: RemoteMutationResult[] = [];
+        for (const target of targets) {
+          results.push(
+            await deleteRemoteEntry({
+              serverId,
+              root,
+              path: target.path,
+              confirmed: true,
+              recursive: target.recursive,
+            }),
+          );
+        }
+        const last = results[results.length - 1];
+        const verified = results.every((result) => result.verified);
+        return {
+          ...last,
+          action: "delete",
+          path: root,
+          targetPath: results.length === 1 ? targets[0].path : undefined,
+          recursive: targets.some((target) => target.recursive),
+          deletedEntries: results.reduce((total, result) => total + result.deletedEntries, 0),
+          verified,
+          verificationDetail: verified
+            ? undefined
+            : (results.find((result) => !result.verified)?.verificationDetail ??
+              "Some entries could not be verified after deletion."),
+        };
+      });
+    },
+
     clearMutation: (serverId) =>
       set((state) => {
         const mutations = { ...state.mutations };
@@ -549,3 +689,11 @@ export const useFileStore = create<FileBrowserStore>((set, get) => {
       }),
   };
 });
+
+export function canNavigateBack(entry: FileBrowserEntry | undefined): boolean {
+  return Boolean(entry && entry.historyIndex > 0 && entry.history.length > 1);
+}
+
+export function canNavigateForward(entry: FileBrowserEntry | undefined): boolean {
+  return Boolean(entry && entry.historyIndex >= 0 && entry.historyIndex < entry.history.length - 1);
+}
