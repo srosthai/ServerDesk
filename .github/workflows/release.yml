@@ -241,6 +241,7 @@ jobs:
           mkdir -p "$flat"
           find release-assets -type f \(             -name '*.deb' -o             -name '*.rpm' -o             -name '*.AppImage' -o             -name '*-setup.exe' -o             -name '*.dmg' -o             -name 'ServerDesk.app.zip'           \) -exec cp {} "$flat/" \;
           test -n "$(find "$flat" -type f | head -1)"
+          cp scripts/install.sh scripts/install.ps1 "$flat/"
           (cd "$flat" && sha256sum * > SHA256SUMS)
           ls -lh "$flat"
 

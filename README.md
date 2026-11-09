@@ -25,7 +25,7 @@ Release builds are attached to the repository's GitHub Releases page. If no rele
 
 ## Install
 
-Download the installer for your platform and follow [docs/install.md](docs/install.md) for package commands, first-run setup, and uninstall notes.
+Download the installer for your platform and follow [docs/install.md](docs/install.md) for package commands, first-run setup, and uninstall notes. Linux/macOS and Windows also support verified command-line install scripts described in [docs/install.md](docs/install.md#command-line-install).
 
 ## Development setup
 
