@@ -610,6 +610,16 @@ impl SftpHandler for FixtureSftpSession {
         entry.sent = true;
 
         let mut files = Vec::new();
+        // OpenSSH includes synthetic `.` and `..` entries in every directory
+        // listing. Emit them so the client-side filtering is exercised.
+        let directory_attributes = fs::metadata(&entry.path)
+            .map(|metadata| FileAttributes::from(&metadata))
+            .unwrap_or_else(|_| FileAttributes::dummy());
+        files.push(russh_sftp::protocol::File::new(
+            ".",
+            directory_attributes.clone(),
+        ));
+        files.push(russh_sftp::protocol::File::new("..", directory_attributes));
         for item in fs::read_dir(&entry.path).map_err(map_io_error)? {
             let item = item.map_err(map_io_error)?;
             let name = item.file_name().to_string_lossy().to_string();

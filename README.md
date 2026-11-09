@@ -63,5 +63,6 @@ Artifacts are written to `src-tauri/target/release/bundle`. Do not commit `dist/
 - [Features](docs/features.md)
 - [Development](docs/development.md)
 - [Packaging and distribution](docs/packaging.md)
+- [Acceptance verification](docs/acceptance.md)
 - [Security model](docs/security.md)
 - [Reliability model](docs/reliability.md)
