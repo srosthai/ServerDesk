@@ -27,6 +27,37 @@ A desktop Linux session without an unlocked Secret Service provider can display
 data, but it cannot save or read SSH credentials. Run ServerDesk as your normal
 desktop user, not with `sudo` or as root.
 
+## Command-line install
+
+The release also ships `install.sh` for Linux/macOS and `install.ps1` for
+Windows. Both download the matching release asset, verify it against
+`SHA256SUMS`, and install without requiring an administrator account. Download
+and inspect the script before running it.
+
+### Linux and macOS
+
+```bash
+curl -fsSLO https://github.com/srosthai/ServerDesk/releases/latest/download/install.sh
+less install.sh
+bash install.sh --version v0.1.0
+```
+
+On Linux the AppImage is installed to `~/.local/bin/serverdesk`. Add
+`~/.local/bin` to `PATH` if needed. On macOS the application is installed to
+`~/Applications/ServerDesk.app`.
+
+### Windows
+
+```powershell
+Invoke-WebRequest -Uri https://github.com/srosthai/ServerDesk/releases/latest/download/install.ps1 -OutFile install.ps1
+Get-Content .\install.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Version v0.1.0
+```
+
+The NSIS installer runs per-user. Unsigned Windows and macOS builds may trigger
+SmartScreen or Gatekeeper. Use a signed release when available, or allow the app
+through the operating system security prompt.
+
 ## Linux
 
 ### Debian and Ubuntu (DEB)
