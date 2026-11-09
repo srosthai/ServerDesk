@@ -1,7 +1,15 @@
-import { useEffect, useState } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ComponentProps,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import { Link } from "react-router-dom";
 import {
   ArrowClockwiseIcon,
+  ArrowLeftIcon,
+  ArrowRightIcon,
   ArrowUpIcon,
   CaretRightIcon,
   CircleNotchIcon,
@@ -43,7 +51,16 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { CreateFolderDialog, RenameEntryDialog } from "@/features/files/FileMutationDialogs";
+import {
+  CreateFolderDialog,
+  DownloadSelectionDialog,
+  RenameEntryDialog,
+} from "@/features/files/FileMutationDialogs";
+import {
+  addFileSelectionRange,
+  retainFileSelection,
+  toggleFileSelection,
+} from "@/features/files/fileSelection";
 import {
   FileTransferPanel,
   TransferDialog,
@@ -58,7 +75,13 @@ import {
 } from "@/lib/remotePaths";
 import { isTauriRuntime } from "@/lib/tauri";
 import { useConnectionStore } from "@/stores/connectionStore";
-import { useFileStore, type FileBrowserEntry, type FileTransferState } from "@/stores/fileStore";
+import {
+  canNavigateBack,
+  canNavigateForward,
+  useFileStore,
+  type FileBrowserEntry,
+  type FileTransferState,
+} from "@/stores/fileStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useServerStore } from "@/stores/serverStore";
 import type {
@@ -108,6 +131,40 @@ function formatSampledAt(milliseconds: number): string {
 function dateTimeFromMillis(milliseconds: number): string | undefined {
   const date = new Date(milliseconds);
   return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+function transferDestinationName(transfer: FileTransferState): string {
+  const path =
+    transfer.direction === "upload" ? transfer.request.remotePath : transfer.request.localPath;
+  const segments = path.split(/[\\/]/).filter(Boolean);
+  return segments[segments.length - 1] ?? path;
+}
+
+function joinLocalPath(directory: string, name: string): string {
+  const base = directory.replace(/[\\/]+$/, "");
+  return `${base}/${name}`;
+}
+
+function SelectionCheckbox({
+  indeterminate = false,
+  ...props
+}: { indeterminate?: boolean } & ComponentProps<"input">) {
+  const ref = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (ref.current) {
+      ref.current.indeterminate = indeterminate;
+    }
+  }, [indeterminate]);
+
+  return (
+    <input
+      ref={ref}
+      type="checkbox"
+      className="size-3.5 shrink-0 accent-primary focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+      {...props}
+    />
+  );
 }
 
 function EntryIcon({ entry }: { entry: RemoteFileEntry }) {
@@ -175,6 +232,8 @@ function FileBrowserToolbar({
   onBrowse,
   onRefresh,
   onUp,
+  onBack,
+  onForward,
 }: {
   servers: ServerProfile[];
   selected: ServerProfile;
@@ -187,6 +246,8 @@ function FileBrowserToolbar({
   onBrowse: () => void;
   onRefresh: () => void;
   onUp: () => void;
+  onBack: () => void;
+  onForward: () => void;
 }) {
   const pending = entry?.pending ?? false;
   const listing = entry?.listing ?? null;
@@ -237,6 +298,26 @@ function FileBrowserToolbar({
           <Badge variant={normalizedInput ? "info" : "warning"}>
             {normalizedInput ? "Absolute root" : "Root required"}
           </Badge>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={onBack}
+            disabled={!connected || pending || !canNavigateBack(entry)}
+            title="Go back to the previous directory"
+          >
+            <ArrowLeftIcon className="size-3.5" aria-hidden="true" />
+            Back
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={onForward}
+            disabled={!connected || pending || !canNavigateForward(entry)}
+            title="Go forward to the next directory"
+          >
+            <ArrowRightIcon className="size-3.5" aria-hidden="true" />
+            Forward
+          </Button>
           <Button
             variant="secondary"
             size="sm"
@@ -369,6 +450,8 @@ function DirectoryListing({
   onDownload,
   onRename,
   onDelete,
+  onDownloadSelected,
+  onDeleteSelected,
 }: {
   listing: RemoteFileListing;
   pending: boolean;
@@ -377,8 +460,119 @@ function DirectoryListing({
   onDownload: (entry: RemoteFileEntry) => void;
   onRename: (entry: RemoteFileEntry) => void;
   onDelete: (entry: RemoteFileEntry) => void;
+  onDownloadSelected: (entries: RemoteFileEntry[]) => void;
+  onDeleteSelected: (entries: RemoteFileEntry[]) => void;
 }) {
   const directoryCount = listing.entries.filter((entry) => entry.entryType === "directory").length;
+  const orderedPaths = listing.entries.map((entry) => entry.path);
+  const [selectedPaths, setSelectedPaths] = useState<Set<string>>(() => new Set());
+  const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null);
+  const selectedEntries = listing.entries.filter((entry) => selectedPaths.has(entry.path));
+  const downloadableSelected = selectedEntries.filter(
+    (entry) => entry.entryType === "file" || entry.entryType === "directory",
+  );
+  const allSelected =
+    listing.entries.length > 0 && selectedEntries.length === listing.entries.length;
+  const someSelected = selectedEntries.length > 0 && !allSelected;
+  const [activePath, setActivePath] = useState<string | null>(orderedPaths[0] ?? null);
+  const effectiveActivePath =
+    activePath && orderedPaths.includes(activePath) ? activePath : (orderedPaths[0] ?? null);
+
+  function clearSelection() {
+    setSelectedPaths(new Set());
+    setSelectionAnchor(null);
+  }
+
+  function selectAll() {
+    setSelectedPaths(new Set(orderedPaths));
+    setSelectionAnchor(orderedPaths[0] ?? null);
+  }
+
+  function toggleSelection(path: string) {
+    setSelectionAnchor(path);
+    setSelectedPaths(toggleFileSelection(retainFileSelection(selectedPaths, orderedPaths), path));
+  }
+
+  function selectRange(path: string) {
+    const anchor = selectionAnchor ?? path;
+    setSelectionAnchor(anchor);
+    setSelectedPaths(
+      addFileSelectionRange(
+        retainFileSelection(selectedPaths, orderedPaths),
+        orderedPaths,
+        anchor,
+        path,
+      ),
+    );
+  }
+
+  function handleTableKeyDown(event: ReactKeyboardEvent<HTMLTableElement>) {
+    const target = event.target as HTMLElement;
+    const row = target.closest<HTMLTableRowElement>("tr[data-entry-path]");
+    const index = row?.dataset.entryPath ? orderedPaths.indexOf(row.dataset.entryPath) : -1;
+
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
+      event.preventDefault();
+      selectAll();
+      return;
+    }
+
+    if (event.key === "Escape" && selectedEntries.length > 0) {
+      event.preventDefault();
+      clearSelection();
+      return;
+    }
+
+    if (index < 0) {
+      return;
+    }
+
+    if (
+      event.key === "ArrowDown" ||
+      event.key === "ArrowUp" ||
+      event.key === "Home" ||
+      event.key === "End"
+    ) {
+      event.preventDefault();
+      const rows = Array.from(
+        event.currentTarget.querySelectorAll<HTMLTableRowElement>("tbody tr[data-entry-path]"),
+      );
+      let nextIndex = index;
+      if (event.key === "ArrowDown") {
+        nextIndex = Math.min(orderedPaths.length - 1, index + 1);
+      } else if (event.key === "ArrowUp") {
+        nextIndex = Math.max(0, index - 1);
+      } else if (event.key === "Home") {
+        nextIndex = 0;
+      } else {
+        nextIndex = orderedPaths.length - 1;
+      }
+      const nextPath = orderedPaths[nextIndex];
+      rows[nextIndex]?.focus();
+      setActivePath(nextPath);
+      if (event.shiftKey) {
+        const anchor = selectionAnchor ?? orderedPaths[index];
+        setSelectionAnchor(anchor);
+        setSelectedPaths(addFileSelectionRange(selectedPaths, orderedPaths, anchor, nextPath));
+      }
+      return;
+    }
+
+    const interactive = target.closest("button, a, input, select, textarea");
+    if (interactive) {
+      return;
+    }
+
+    if (event.key === " " || event.key === "Enter") {
+      event.preventDefault();
+      const entry = listing.entries[index];
+      if (event.key === "Enter" && canOpenEntry(entry)) {
+        onOpenEntry(entry);
+      } else {
+        toggleSelection(entry.path);
+      }
+    }
+  }
 
   return (
     <section
@@ -409,6 +603,47 @@ function DirectoryListing({
         </div>
       </div>
 
+      {selectedEntries.length > 0 ? (
+        <div
+          role="status"
+          aria-label="Selected remote entries"
+          className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-muted/40 px-3.5 py-2"
+        >
+          <p className="text-[12px] text-foreground">
+            <span className="font-medium">
+              {selectedEntries.length} {selectedEntries.length === 1 ? "entry" : "entries"}
+            </span>{" "}
+            selected
+            <span className="ml-1 text-muted-foreground">
+              · {downloadableSelected.length} downloadable
+            </span>
+          </p>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => onDownloadSelected(downloadableSelected)}
+              disabled={downloadableSelected.length === 0}
+            >
+              <DownloadSimpleIcon className="size-3.5" aria-hidden="true" />
+              Download selected
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              className="text-destructive hover:text-destructive"
+              onClick={() => onDeleteSelected(selectedEntries)}
+            >
+              <TrashIcon className="size-3.5" aria-hidden="true" />
+              Delete selected
+            </Button>
+            <Button variant="ghost" size="sm" onClick={clearSelection}>
+              Clear selection
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
       {listing.entries.length === 0 ? (
         <div className="px-3.5 py-8 text-center">
           <p className="text-[13px] font-medium text-foreground">This directory is empty</p>
@@ -417,9 +652,27 @@ function DirectoryListing({
           </p>
         </div>
       ) : (
-        <Table>
+        <Table
+          aria-label="Remote directory entries"
+          aria-describedby="file-table-keyboard-help"
+          onKeyDown={handleTableKeyDown}
+        >
           <TableHeader>
             <TableRow>
+              <TableHead className="w-10 pr-0">
+                <SelectionCheckbox
+                  checked={allSelected}
+                  indeterminate={someSelected}
+                  aria-label="Select all entries"
+                  onChange={() => {
+                    if (allSelected) {
+                      clearSelection();
+                    } else {
+                      selectAll();
+                    }
+                  }}
+                />
+              </TableHead>
               <TableHead>Name</TableHead>
               <TableHead>Type</TableHead>
               <TableHead className="text-right">Size</TableHead>
@@ -432,9 +685,30 @@ function DirectoryListing({
             {listing.entries.map((entry) => {
               const openable = canOpenEntry(entry);
               const blockedReason = entryBlockedReason(entry);
+              const isSelected = selectedPaths.has(entry.path);
               return (
-                <TableRow key={entry.path}>
-                  <TableCell className="max-w-[26rem] min-w-[14rem]">
+                <TableRow
+                  key={entry.path}
+                  data-entry-path={entry.path}
+                  data-state={isSelected ? "selected" : undefined}
+                  tabIndex={effectiveActivePath === entry.path ? 0 : -1}
+                  onFocus={() => setActivePath(entry.path)}
+                  className="outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50"
+                >
+                  <TableCell className="w-10 pr-0">
+                    <SelectionCheckbox
+                      checked={isSelected}
+                      aria-label={`Select ${entry.name}`}
+                      onChange={() => toggleSelection(entry.path)}
+                      onClick={(event) => {
+                        if (event.shiftKey) {
+                          event.preventDefault();
+                          selectRange(entry.path);
+                        }
+                      }}
+                    />
+                  </TableCell>
+                  <TableCell className="max-w-[24rem] min-w-[12rem]">
                     <div className="flex min-w-0 items-start gap-2">
                       <span className="mt-0.5 shrink-0">
                         <EntryIcon entry={entry} />
@@ -479,36 +753,36 @@ function DirectoryListing({
                     </time>
                   </TableCell>
                   <TableCell>
-                    <div className="flex justify-end gap-1">
+                    <div className="flex justify-end gap-0.5">
                       {entry.entryType === "file" || entry.entryType === "directory" ? (
                         <Button
                           variant="ghost"
-                          size="sm"
+                          size="icon-sm"
                           onClick={() => onDownload(entry)}
                           aria-label={`Download ${entry.name}`}
+                          title={`Download ${entry.name}`}
                         >
                           <DownloadSimpleIcon className="size-3.5" aria-hidden="true" />
-                          Download
                         </Button>
                       ) : null}
                       <Button
                         variant="ghost"
-                        size="sm"
+                        size="icon-sm"
                         onClick={() => onRename(entry)}
                         aria-label={`Rename ${entry.name}`}
+                        title={`Rename ${entry.name}`}
                       >
                         <PencilSimpleIcon className="size-3.5" aria-hidden="true" />
-                        Rename
                       </Button>
                       <Button
                         variant="ghost"
-                        size="sm"
+                        size="icon-sm"
                         onClick={() => onDelete(entry)}
                         aria-label={`Delete ${entry.name}`}
+                        title={`Delete ${entry.name}`}
                         className="text-destructive hover:text-destructive"
                       >
                         <TrashIcon className="size-3.5" aria-hidden="true" />
-                        Delete
                       </Button>
                     </div>
                   </TableCell>
@@ -526,11 +800,17 @@ function DirectoryListing({
             {formatSampledAt(listing.sampledAt)}
           </time>
         </span>
+        <span id="file-table-keyboard-help">
+          Arrow keys move between rows, Space selects, Enter opens, and Ctrl/Cmd+A selects all.
+        </span>
+      </div>
+      <p className="flex flex-wrap items-center justify-between gap-2 border-t border-border px-3.5 py-2 text-[10px] text-muted-foreground">
         <span>
           Transfers use this same authenticated SSH session. No separate file-transfer port is
           opened.
         </span>
-      </div>
+        <span>Shift+click a checkbox to extend the selection through that range.</span>
+      </p>
       {listing.truncated ? (
         <p className="border-t border-border px-3.5 py-2 text-[11px] text-warning">
           The listing stopped at the safety limit. Open a narrower directory to see the remaining
@@ -555,6 +835,8 @@ function FileManagerPage() {
   const openRoot = useFileStore((state) => state.openRoot);
   const refresh = useFileStore((state) => state.refresh);
   const goUp = useFileStore((state) => state.goUp);
+  const goBack = useFileStore((state) => state.goBack);
+  const goForward = useFileStore((state) => state.goForward);
   const clearError = useFileStore((state) => state.clearError);
   const startUpload = useFileStore((state) => state.startUpload);
   const startDownload = useFileStore((state) => state.startDownload);
@@ -564,13 +846,15 @@ function FileManagerPage() {
   const createFolder = useFileStore((state) => state.createFolder);
   const renameEntry = useFileStore((state) => state.renameEntry);
   const deleteEntry = useFileStore((state) => state.deleteEntry);
+  const deleteEntries = useFileStore((state) => state.deleteEntries);
   const clearMutation = useFileStore((state) => state.clearMutation);
   const transfers = useFileStore((state) => state.transfers);
   const mutations = useFileStore((state) => state.mutations);
 
   const [createFolderOpen, setCreateFolderOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<RemoteFileEntry | null>(null);
-  const [deleteTarget, setDeleteTarget] = useState<RemoteFileEntry | null>(null);
+  const [deleteTargets, setDeleteTargets] = useState<RemoteFileEntry[] | null>(null);
+  const [downloadSelection, setDownloadSelection] = useState<RemoteFileEntry[] | null>(null);
   const [transferPrompt, setTransferPrompt] = useState<TransferPrompt | null>(null);
   const [overwriteTransfer, setOverwriteTransfer] = useState<FileTransferState | null>(null);
 
@@ -599,8 +883,32 @@ function FileManagerPage() {
   const serverTransfers = selectedServerId
     ? Object.values(transfers)
         .filter((transfer) => transfer.serverId === selectedServerId)
-        .sort((left, right) => right.startedAt - left.startedAt)
+        .sort((left, right) => {
+          if (left.status === "running" && right.status !== "running") {
+            return -1;
+          }
+          if (left.status !== "running" && right.status === "running") {
+            return 1;
+          }
+          return right.startedAt - left.startedAt;
+        })
     : [];
+
+  const overwriteServer = overwriteTransfer
+    ? (servers.find((server) => server.id === overwriteTransfer.serverId) ?? selected)
+    : null;
+  const serverLabel = selected
+    ? `${selected.name} (${selected.username}@${selected.host}:${selected.port})`
+    : "";
+  const singleDeleteTarget = deleteTargets?.length === 1 ? deleteTargets[0] : null;
+  const deleteTargetCount = deleteTargets?.length ?? 0;
+  const deletePathPreview = (() => {
+    const paths = deleteTargets?.map((target) => target.path) ?? [];
+    if (paths.length <= 8) {
+      return paths.join("\n");
+    }
+    return `${paths.slice(0, 8).join("\n")}\nand ${paths.length - 8} more`;
+  })();
 
   useEffect(() => {
     if (status === "idle") {
@@ -670,6 +978,51 @@ function FileManagerPage() {
       return;
     }
     void browse(selected.id, entry.root, path);
+  }
+
+  function handleBack() {
+    if (!selected || !connected) {
+      return;
+    }
+    void goBack(selected.id);
+  }
+
+  function handleForward() {
+    if (!selected || !connected) {
+      return;
+    }
+    void goForward(selected.id);
+  }
+
+  function handleRetryBrowse() {
+    if (!selected || !connected || !entry?.root) {
+      return;
+    }
+    const target = entry.errorPath ?? entry.path ?? entry.root;
+    void browse(selected.id, entry.root, target);
+  }
+
+  function handleDeleteSelected(targets: RemoteFileEntry[]) {
+    if (targets.length > 0) {
+      setDeleteTargets(targets);
+    }
+  }
+
+  function startSelectedDownloads(localDirectory: string) {
+    if (!selected || !root || !downloadSelection) {
+      return;
+    }
+    for (const target of downloadSelection) {
+      if (target.entryType !== "file" && target.entryType !== "directory") {
+        continue;
+      }
+      void startDownload({
+        serverId: selected.id,
+        root,
+        remotePath: target.path,
+        localPath: joinLocalPath(localDirectory, target.name),
+      });
+    }
   }
 
   async function openOverwritePromptIfNeeded(transferId: string) {
@@ -794,6 +1147,8 @@ function FileManagerPage() {
             onBrowse={handleBrowse}
             onRefresh={handleRefresh}
             onUp={handleUp}
+            onBack={handleBack}
+            onForward={handleForward}
           />
 
           {!connected ? (
@@ -819,8 +1174,18 @@ function FileManagerPage() {
                 aria-hidden="true"
               />
               <div className="flex-1">
-                <AlertTitle>Could not browse this remote path</AlertTitle>
+                <AlertTitle>
+                  {entry.errorCode === "permission"
+                    ? "Permission denied for this remote path"
+                    : "Could not browse this remote path"}
+                </AlertTitle>
                 <AlertDescription>
+                  {entry.errorCode === "permission" ? (
+                    <span className="block">
+                      The SSH account {selected.username} cannot read{" "}
+                      {entry.errorPath ?? entry.path ?? "the requested path"} on {selected.name}.
+                    </span>
+                  ) : null}
                   <span className="block">{entry.error}</span>
                   {entry.errorDetails ? (
                     <span className="mt-1 block whitespace-pre-wrap font-mono text-[10px]">
@@ -832,17 +1197,24 @@ function FileManagerPage() {
                     : null}
                 </AlertDescription>
               </div>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => {
-                  if (selectedServerId) {
-                    clearError(selectedServerId);
-                  }
-                }}
-              >
-                Dismiss
-              </Button>
+              <div className="flex shrink-0 flex-wrap items-center gap-1">
+                {connected && entry.root ? (
+                  <Button variant="secondary" size="sm" onClick={handleRetryBrowse}>
+                    Retry
+                  </Button>
+                ) : null}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    if (selectedServerId) {
+                      clearError(selectedServerId);
+                    }
+                  }}
+                >
+                  Dismiss
+                </Button>
+              </div>
             </Alert>
           ) : null}
 
@@ -906,7 +1278,9 @@ function FileManagerPage() {
                     ? "Folder created"
                     : mutation.result.action === "rename"
                       ? "Entry renamed"
-                      : "Entry deleted"}
+                      : mutation.result.deletedEntries === 1
+                        ? "Entry deleted"
+                        : `${mutation.result.deletedEntries} entries deleted`}
                 </AlertTitle>
                 <AlertDescription>
                   <span className="block">
@@ -967,13 +1341,16 @@ function FileManagerPage() {
 
           {listing ? (
             <DirectoryListing
+              key={`${selectedServerId}:${listing.path}`}
               listing={listing}
               pending={entry?.pending ?? false}
               onNavigate={handleBreadcrumb}
               onOpenEntry={handleOpenEntry}
               onDownload={(target) => setTransferPrompt({ direction: "download", entry: target })}
               onRename={setRenameTarget}
-              onDelete={setDeleteTarget}
+              onDelete={(target) => setDeleteTargets([target])}
+              onDownloadSelected={setDownloadSelection}
+              onDeleteSelected={handleDeleteSelected}
             />
           ) : null}
 
@@ -1006,6 +1383,7 @@ function FileManagerPage() {
             <CreateFolderDialog
               open
               parent={listing?.path ?? root ?? DEFAULT_ROOT}
+              serverLabel={serverLabel}
               onClose={() => setCreateFolderOpen(false)}
               onCreate={(name) =>
                 selected && root && listing
@@ -1018,6 +1396,7 @@ function FileManagerPage() {
           {renameTarget ? (
             <RenameEntryDialog
               entry={renameTarget}
+              serverLabel={serverLabel}
               onClose={() => setRenameTarget(null)}
               onRename={(newName) =>
                 selected && root && renameTarget
@@ -1027,48 +1406,87 @@ function FileManagerPage() {
             />
           ) : null}
 
+          {downloadSelection ? (
+            <DownloadSelectionDialog
+              open
+              entries={downloadSelection}
+              serverLabel={serverLabel}
+              remoteDirectory={listing?.path ?? root ?? DEFAULT_ROOT}
+              onClose={() => setDownloadSelection(null)}
+              onStart={(localDirectory) => {
+                startSelectedDownloads(localDirectory);
+                setDownloadSelection(null);
+              }}
+            />
+          ) : null}
+
           <ConfirmDialog
-            open={deleteTarget !== null}
+            open={deleteTargets !== null}
             onOpenChange={(open) => {
               if (!open) {
-                setDeleteTarget(null);
+                setDeleteTargets(null);
               }
             }}
-            title={deleteTarget ? `Delete ${deleteTarget.name}?` : "Delete remote entry?"}
+            title={
+              deleteTargetCount === 1
+                ? `Delete ${singleDeleteTarget?.name}?`
+                : `Delete ${deleteTargetCount} selected entries?`
+            }
             description={
-              deleteTarget?.entryType === "directory"
-                ? "This deletes the directory and every entry inside it. ServerDesk re-reads the path afterward to verify the result."
-                : "This deletes the entry from the remote server. ServerDesk re-reads the path afterward to verify the result."
+              deleteTargetCount > 1
+                ? deleteTargets?.some((target) => target.entryType === "directory")
+                  ? "This deletes the selected entries, including every entry inside selected directories. ServerDesk re-reads the directory afterward to verify the result."
+                  : "This deletes the selected entries from the remote server. ServerDesk re-reads the directory afterward to verify the result."
+                : singleDeleteTarget?.entryType === "directory"
+                  ? "This deletes the directory and every entry inside it. ServerDesk re-reads the path afterward to verify the result."
+                  : "This deletes the entry from the remote server. ServerDesk re-reads the path afterward to verify the result."
             }
             confirmLabel={
-              deleteTarget?.entryType === "directory" ? "Delete directory" : "Delete file"
+              deleteTargetCount > 1
+                ? `Delete ${deleteTargetCount} entries`
+                : singleDeleteTarget?.entryType === "directory"
+                  ? "Delete directory"
+                  : "Delete file"
             }
             details={
-              deleteTarget
+              deleteTargets
                 ? [
-                    {
-                      label: "Server",
-                      value: selected
-                        ? `${selected.name} (${selected.username}@${selected.host}:${selected.port})`
-                        : "",
-                    },
-                    { label: "Path", value: deleteTarget.path },
-                    { label: "Type", value: typeLabels[deleteTarget.entryType] },
+                    { label: "Server", value: serverLabel },
+                    deleteTargetCount === 1
+                      ? { label: "Path", value: singleDeleteTarget?.path ?? "" }
+                      : { label: "Targets", value: deletePathPreview },
+                    deleteTargetCount === 1
+                      ? {
+                          label: "Type",
+                          value: singleDeleteTarget ? typeLabels[singleDeleteTarget.entryType] : "",
+                        }
+                      : { label: "Count", value: String(deleteTargetCount) },
                   ]
                 : undefined
             }
             pending={mutation?.pending ?? false}
             onConfirm={() => {
-              const target = deleteTarget;
-              if (!selected || !root || !target) {
+              const targets = deleteTargets;
+              if (!selected || !root || !targets || targets.length === 0) {
                 return;
               }
-              void deleteEntry(
-                selected.id,
-                root,
-                target.path,
-                target.entryType === "directory",
-              ).finally(() => setDeleteTarget(null));
+              const operation =
+                targets.length === 1
+                  ? deleteEntry(
+                      selected.id,
+                      root,
+                      targets[0].path,
+                      targets[0].entryType === "directory",
+                    )
+                  : deleteEntries(
+                      selected.id,
+                      root,
+                      targets.map((target) => ({
+                        path: target.path,
+                        recursive: target.entryType === "directory",
+                      })),
+                    );
+              void operation.finally(() => setDeleteTargets(null));
             }}
           />
 
@@ -1089,16 +1507,26 @@ function FileManagerPage() {
                 setOverwriteTransfer(null);
               }
             }}
-            title="Overwrite the existing destination?"
+            title={
+              overwriteTransfer
+                ? `Overwrite ${transferDestinationName(overwriteTransfer)}?`
+                : "Overwrite the existing destination?"
+            }
             description={
               overwriteTransfer
-                ? "The destination already exists. ServerDesk writes to a separate partial file and replaces the destination only after the complete transfer is verified."
+                ? `The destination already exists on ${overwriteServer?.name ?? "this server"}. ServerDesk writes to a separate partial file and replaces the destination only after the complete transfer is verified.`
                 : ""
             }
             confirmLabel="Overwrite and transfer"
             details={
               overwriteTransfer
                 ? [
+                    {
+                      label: "Server",
+                      value: overwriteServer
+                        ? `${overwriteServer.name} (${overwriteServer.username}@${overwriteServer.host}:${overwriteServer.port})`
+                        : serverLabel,
+                    },
                     {
                       label: "Direction",
                       value: overwriteTransfer.direction === "upload" ? "Upload" : "Download",
