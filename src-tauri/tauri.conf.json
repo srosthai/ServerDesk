@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "ServerDesk",
         "width": 1280,
         "height": 800,
@@ -28,13 +29,18 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "ServerDesk",
+    "copyright": "Copyright © 2026 ServerDesk contributors",
+    "homepage": "https://github.com/srosthai/ServerDesk",
     "category": "DeveloperTool",
     "shortDescription": "Manage Linux VPS servers over SSH.",
     "longDescription": "ServerDesk is a local-first desktop workspace for connecting to Linux VPS servers over SSH, inspecting system health, managing services, running Laravel tasks, and working with remote files.",
     "icon": [
       "icons/32x32.png",
+      "icons/64x64.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
+      "icons/icon.png",
       "icons/icon.icns",
       "icons/icon.ico"
     ]

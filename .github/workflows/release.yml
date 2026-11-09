@@ -1,0 +1,224 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux packages
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install Tauri and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libdbus-1-dev \
+            librsvg2-dev \
+            libssl-dev \
+            patchelf \
+            pkg-config \
+            build-essential \
+            curl \
+            wget \
+            file \
+            rpm \
+            xvfb \
+            sqlite3 \
+            libfuse2
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Verify version metadata and release tag
+        run: node scripts/check-versions.mjs --tag "$GITHUB_REF_NAME"
+        if: startsWith(github.ref, 'refs/tags/')
+
+      - name: Verify version metadata
+        run: node scripts/check-versions.mjs
+        if: "!startsWith(github.ref, 'refs/tags/')"
+
+      - name: Build Linux packages
+        run: npm run tauri build -- --bundles deb,rpm,appimage
+
+      - name: Smoke test the built application
+        env:
+          WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+        run: |
+          set -euo pipefail
+          smoke_dir="$RUNNER_TEMP/serverdesk-smoke"
+          rm -rf "$smoke_dir"
+          mkdir -p "$smoke_dir"
+          XDG_DATA_HOME="$smoke_dir" SERVERDESK_SMOKE_TEST=1 \
+            dbus-run-session -- xvfb-run -a ./src-tauri/target/release/serverdesk
+          database="$smoke_dir/com.serverdesk.app/serverdesk.sqlite3"
+          test -f "$database"
+          test "$(sqlite3 "$database" 'PRAGMA user_version;')" = "4"
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: ServerDesk-linux
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/rpm/*.rpm
+            src-tauri/target/release/bundle/appimage/*.AppImage
+
+  macos:
+    name: macOS universal DMG
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: macos-universal
+
+      - name: Verify version metadata
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            node scripts/check-versions.mjs --tag "$GITHUB_REF_NAME"
+          else
+            node scripts/check-versions.mjs
+          fi
+        shell: bash
+
+      - name: Build macOS application and DMG
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run tauri build -- --target universal-apple-darwin --bundles app,dmg
+
+      - name: Archive the application bundle
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            "src-tauri/target/universal-apple-darwin/release/bundle/macos/ServerDesk.app" \
+            "$RUNNER_TEMP/ServerDesk.app.zip"
+
+      - name: Upload macOS artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ServerDesk-macos
+          if-no-files-found: error
+          path: |
+            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            ${{ runner.temp }}/ServerDesk.app.zip
+
+  windows:
+    name: Windows NSIS installer
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Verify version metadata
+        run: |
+          if ($env:GITHUB_REF -like "refs/tags/*") {
+            node scripts/check-versions.mjs --tag $env:GITHUB_REF_NAME
+          } else {
+            node scripts/check-versions.mjs
+          }
+        shell: pwsh
+
+      - name: Build NSIS installer
+        run: npm run tauri build -- --bundles nsis
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ServerDesk-windows
+          if-no-files-found: error
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe
+
+  publish:
+    name: Publish draft release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artefacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ServerDesk-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Create draft GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: release-assets/*

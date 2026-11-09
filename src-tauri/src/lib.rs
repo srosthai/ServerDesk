@@ -8,6 +8,7 @@ use crate::{
         terminal::TauriTerminalEventSink,
     },
     core::{
+        credential_index::CredentialIndex,
         credentials::{CredentialStore, OsCredentialStore},
         files::FileTransferManager,
         ssh::{ConnectionManager, ConnectionTimeouts, RusshTransport},
@@ -27,6 +28,65 @@ async fn release_connections(app: &tauri::AppHandle) {
     }
 }
 
+/// Closes the main window after startup when the packaging smoke test asks for it.
+///
+/// This exercises window creation, managed-state setup, database migrations, and
+/// a clean application exit without requiring desktop automation tools.
+fn schedule_smoke_exit(app: &tauri::App) {
+    let app_handle = app.handle().clone();
+
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        let exit_handle = app_handle.clone();
+        if app_handle
+            .run_on_main_thread(move || {
+                if let Some(window) = exit_handle.get_webview_window("main") {
+                    eprintln!("SERVERDESK_SMOKE_WINDOW_PRESENT=1");
+                    if let Err(error) = window.close() {
+                        eprintln!("SERVERDESK_SMOKE_CLOSE_ERROR={error}");
+                        exit_handle.exit(2);
+                    }
+                } else {
+                    eprintln!("SERVERDESK_SMOKE_WINDOW_PRESENT=0");
+                    exit_handle.exit(2);
+                }
+            })
+            .is_err()
+        {
+            eprintln!("SERVERDESK_SMOKE_MAIN_THREAD_ERROR=1");
+        }
+    });
+}
+
+/// Runs the uninstall cleanup from the command line.
+///
+/// Returns a process exit code. This is called before Tauri starts so the
+/// cleanup also works from package-manager uninstall scripts.
+pub fn purge_local_data_cli() -> i32 {
+    let data_directory = match crate::core::purge::default_data_directory() {
+        Ok(directory) => directory,
+        Err(error) => {
+            eprintln!("ServerDesk cleanup failed: {}", error.message);
+            return 1;
+        }
+    };
+
+    match crate::core::purge::purge_local_data(&data_directory, &OsCredentialStore) {
+        Ok(report) => {
+            eprintln!(
+                "ServerDesk removed {} credential(s) from the OS credential store.",
+                report.credential_count
+            );
+            0
+        }
+        Err(error) => {
+            eprintln!("ServerDesk cleanup failed: {}", error.message);
+            1
+        }
+    }
+}
+
 pub mod commands;
 pub mod core;
 pub mod storage;
@@ -40,8 +100,17 @@ pub fn run() {
             std::fs::create_dir_all(&data_directory)?;
 
             let database = storage::Database::open(data_directory.join("serverdesk.sqlite3"))?;
+            let schema_version = database.schema_version()?;
+            let credential_index = CredentialIndex::open(&data_directory)?;
             app.manage(database);
+            app.manage(credential_index);
             app.manage(Arc::new(OsCredentialStore) as Arc<dyn CredentialStore>);
+
+            if std::env::var_os("SERVERDESK_SMOKE_TEST").is_some() {
+                eprintln!("SERVERDESK_SMOKE_DATA_DIR={}", data_directory.display());
+                eprintln!("SERVERDESK_SMOKE_SCHEMA_VERSION={schema_version}");
+                schedule_smoke_exit(app);
+            }
             let connections = Arc::new(ConnectionManager::new(
                 Arc::new(RusshTransport::new()),
                 Arc::new(TauriConnectionEventSink::new(app.handle().clone())),

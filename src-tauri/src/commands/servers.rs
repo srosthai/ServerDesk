@@ -5,6 +5,7 @@ use tauri::State;
 use crate::{
     core::{
         AppError,
+        credential_index::CredentialIndex,
         credentials::CredentialStore,
         servers::{ServerProfile, ServerProfileInput},
         ssh::ConnectionManager,
@@ -85,6 +86,7 @@ fn connection_details_changed(existing: &Server, updated: &NewServer) -> bool {
 pub async fn delete_server(
     database: State<'_, Database>,
     credentials: State<'_, Arc<dyn CredentialStore>>,
+    credential_index: State<'_, CredentialIndex>,
     connection_manager: State<'_, Arc<ConnectionManager>>,
     id: String,
     confirmed: bool,
@@ -105,6 +107,7 @@ pub async fn delete_server(
         .and_then(|server| server.credential_ref)
     {
         credentials.delete_secret(&reference)?;
+        let _ = credential_index.remove(&reference);
     }
 
     database.delete_server(&id)?;
