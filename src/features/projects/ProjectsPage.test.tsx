@@ -10,9 +10,11 @@ import {
   runProjectArtisanAction,
   scanRemoteProjects,
 } from "@/services/projects";
+import { getQueueSupervisorStatus } from "@/services/queue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useProjectStore } from "@/stores/projectStore";
+import { useQueueStore } from "@/stores/queueStore";
 import { useServerStore } from "@/stores/serverStore";
 import { DEFAULT_PREFERENCES } from "@/lib/preferences";
 import type {
@@ -22,6 +24,7 @@ import type {
   ProjectArtisanRun,
   ProjectRecord,
   ProjectScanResult,
+  QueueSupervisorStatus,
   RemoteDirectoryListing,
   ServerProfile,
 } from "@/types/contracts";
@@ -40,6 +43,10 @@ vi.mock("@/services/projects", () => ({
   scanRemoteProjects: vi.fn(),
   runProjectArtisanAction: vi.fn(),
   deleteProject: vi.fn(),
+}));
+
+vi.mock("@/services/queue", () => ({
+  getQueueSupervisorStatus: vi.fn(),
 }));
 
 const server: ServerProfile = {
@@ -95,6 +102,48 @@ const project: ProjectRecord = {
       durationMs: 17,
     },
   ],
+};
+
+const queueStatus: QueueSupervisorStatus = {
+  serverId: server.id,
+  supervisor: {
+    status: "available",
+    installed: true,
+    programs: [
+      {
+        name: "laravel-worker:laravel-worker_00",
+        state: "running",
+        stateText: "RUNNING",
+        queueRelated: true,
+        detail: "pid 2101, uptime 0:10:12",
+      },
+      {
+        name: "nightly-report",
+        state: "fatal",
+        stateText: "FATAL",
+        queueRelated: false,
+        detail: "Exited too quickly",
+      },
+    ],
+    detail: null,
+  },
+  queueWorkers: {
+    status: "available",
+    workers: [
+      {
+        pid: 2101,
+        elapsedSeconds: 120,
+        kind: "queue_work",
+        queue: "high",
+        connection: "redis",
+      },
+    ],
+    truncated: false,
+    detail: null,
+  },
+  sampledAt: 1_762_665_720_000,
+  durationMs: 42,
+  connectionState: "connected",
 };
 
 const listing: RemoteDirectoryListing = {
@@ -182,6 +231,7 @@ describe("ProjectsPage", () => {
       error: null,
     });
     useProjectStore.setState({ entries: {} });
+    useQueueStore.setState({ entries: {} });
     usePreferencesStore.setState({
       preferences: { ...DEFAULT_PREFERENCES, lastActiveServerId: server.id },
     });
@@ -191,6 +241,8 @@ describe("ProjectsPage", () => {
     vi.mocked(browseRemoteDirectories).mockReset();
     vi.mocked(scanRemoteProjects).mockReset();
     vi.mocked(runProjectArtisanAction).mockReset();
+    vi.mocked(getQueueSupervisorStatus).mockReset();
+    vi.mocked(getQueueSupervisorStatus).mockResolvedValue(queueStatus);
   });
 
   it("loads saved projects without scanning automatically", async () => {
@@ -414,5 +466,102 @@ describe("ProjectsPage", () => {
           content.includes("route output"),
       ),
     ).toBeInTheDocument();
+  });
+
+  it("shows Supervisor programs, queue workers, and the queue restart distinction", async () => {
+    vi.mocked(listProjects).mockResolvedValue([project]);
+    renderPage();
+
+    const panel = await screen.findByLabelText(`Queue and Supervisor status for ${server.name}`);
+    expect(await within(panel).findByText("laravel-worker:laravel-worker_00")).toBeInTheDocument();
+    expect(within(panel).getByText("Queue-related name")).toBeInTheDocument();
+    expect(within(panel).getByText("nightly-report")).toBeInTheDocument();
+    expect(within(panel).getByText("Fatal")).toBeInTheDocument();
+    expect(within(panel).getByText("1 detected")).toBeInTheDocument();
+    expect(within(panel).getByText(/PID 2101/)).toBeInTheDocument();
+    expect(
+      within(panel).getByText(/queue restart is not a supervisor restart/i),
+    ).toBeInTheDocument();
+    expect(within(panel).getByText(/does not restart Supervisor/)).toBeInTheDocument();
+    expect(within(panel).getByText(/does not read or rewrite Supervisor/)).toBeInTheDocument();
+  });
+
+  it("shows missing Supervisor data as unavailable instead of guessing programs", async () => {
+    vi.mocked(listProjects).mockResolvedValue([project]);
+    vi.mocked(getQueueSupervisorStatus).mockResolvedValue({
+      ...queueStatus,
+      supervisor: {
+        status: "missing",
+        installed: false,
+        programs: [],
+        detail: "Supervisor is not installed: supervisorctl and supervisord were not found.",
+      },
+    });
+    renderPage();
+
+    const panel = await screen.findByLabelText(`Queue and Supervisor status for ${server.name}`);
+    expect(await within(panel).findByText("Not installed")).toBeInTheDocument();
+    expect(within(panel).getByText("Program names unavailable")).toBeInTheDocument();
+    expect(
+      within(panel).getByText(/supervisorctl and supervisord were not found/),
+    ).toBeInTheDocument();
+    expect(within(panel).queryByText("laravel-worker:laravel-worker_00")).not.toBeInTheDocument();
+  });
+
+  it("shows unreadable Supervisor status as unavailable with the remote detail", async () => {
+    vi.mocked(listProjects).mockResolvedValue([project]);
+    vi.mocked(getQueueSupervisorStatus).mockResolvedValue({
+      ...queueStatus,
+      supervisor: {
+        status: "unavailable",
+        installed: true,
+        programs: [],
+        detail:
+          "Supervisor is installed, but program status could not be read (exit code 2: supervisor.sock no such file). Program names are unavailable.",
+      },
+      queueWorkers: {
+        status: "unavailable",
+        workers: [],
+        truncated: false,
+        detail: "Queue worker processes could not be read (exit code 1).",
+      },
+    });
+    renderPage();
+
+    const panel = await screen.findByLabelText(`Queue and Supervisor status for ${server.name}`);
+    const unavailable = await within(panel).findAllByText("Unavailable");
+    expect(unavailable.length).toBeGreaterThanOrEqual(2);
+    expect(within(panel).getByText(/supervisor.sock no such file/)).toBeInTheDocument();
+    expect(within(panel).getByText("Worker status unavailable")).toBeInTheDocument();
+    expect(within(panel).getByText(/Queue worker processes could not be read/)).toBeInTheDocument();
+    expect(within(panel).queryByText("laravel-worker:laravel-worker_00")).not.toBeInTheDocument();
+  });
+
+  it("confirms queue restart and refreshes the read-only queue snapshot afterwards", async () => {
+    vi.mocked(listProjects).mockResolvedValue([project]);
+    vi.mocked(runProjectArtisanAction).mockResolvedValue(artisanRun("queue-restart"));
+    const user = userEvent.setup();
+    renderPage();
+
+    await screen.findByLabelText("Project storefront");
+    await waitFor(() => expect(getQueueSupervisorStatus).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole("button", { name: "Run Restart queue workers" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Restart queue workers on storefront?")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("cd -- '/var/www/storefront' && php artisan queue:restart"),
+    ).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Run command" }));
+
+    await waitFor(() =>
+      expect(runProjectArtisanAction).toHaveBeenCalledWith(
+        server.id,
+        project.id,
+        "queue-restart",
+        true,
+      ),
+    );
+    await waitFor(() => expect(getQueueSupervisorStatus).toHaveBeenCalledTimes(2));
   });
 });
