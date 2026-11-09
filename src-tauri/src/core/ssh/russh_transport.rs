@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -8,11 +9,13 @@ use std::{
 
 use async_trait::async_trait;
 use russh::{
-    ChannelMsg, Disconnect,
-    client::{self, Config, Handle},
+    ChannelMsg, ChannelReadHalf, ChannelWriteHalf, Disconnect,
+    client::{self, Config, Handle, Msg},
     keys::{HashAlg, PrivateKeyWithHashAlg},
 };
 use tokio::net::TcpStream;
+
+use crate::core::terminal::{TerminalChannel, TerminalChannelEvent, TerminalOptions, TerminalSize};
 
 use super::{
     Authentication, CommandOutput, ConnectionRequest, SshSession, SshTransport, TransportError,
@@ -20,6 +23,8 @@ use super::{
 };
 
 const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_TERMINAL_HANDSHAKE_BUFFER_BYTES: usize = 1024 * 1024;
+const TERMINAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 enum HostKeyObservation {
@@ -303,6 +308,109 @@ impl SshSession for RusshSession {
             .await
     }
 
+    async fn open_terminal(
+        &self,
+        options: TerminalOptions,
+    ) -> Result<Arc<dyn TerminalChannel>, TransportError> {
+        if let Err(error) = options.validate() {
+            return Err(TransportError::Remote(error.message));
+        }
+
+        let mut channel = {
+            let handle = self.handle.lock().await;
+            if self.closed.load(Ordering::SeqCst) || handle.is_closed() {
+                return Err(TransportError::Network);
+            }
+            handle
+                .channel_open_session()
+                .await
+                .map_err(map_russh_error)?
+        };
+
+        let size = options.size;
+        let handshake = async {
+            channel
+                .request_pty(
+                    true,
+                    &options.term,
+                    size.cols,
+                    size.rows,
+                    size.pixel_width,
+                    size.pixel_height,
+                    &[],
+                )
+                .await
+                .map_err(map_russh_error)?;
+            channel.request_shell(true).await.map_err(map_russh_error)?;
+
+            // Wait for the server to accept both requests. Any output sent
+            // before the replies (a prompt, for example) is buffered so it is
+            // not lost before the reader task starts.
+            let mut pending = VecDeque::new();
+            let mut pending_bytes = 0usize;
+            let mut successes = 0;
+            let wait_for_replies = async {
+                while successes < 2 {
+                    match channel.wait().await {
+                        Some(ChannelMsg::Success) => successes += 1,
+                        Some(ChannelMsg::Failure) => {
+                            return Err(TransportError::Remote(
+                                "The SSH server rejected the interactive terminal request."
+                                    .to_string(),
+                            ));
+                        }
+                        Some(ChannelMsg::Data { data }) => {
+                            pending_bytes = pending_bytes.saturating_add(data.len());
+                            if pending_bytes > MAX_TERMINAL_HANDSHAKE_BUFFER_BYTES {
+                                return Err(TransportError::Remote(
+                                    "The remote terminal produced too much output before its shell was ready."
+                                        .to_string(),
+                                ));
+                            }
+                            pending.push_back(data.to_vec());
+                        }
+                        Some(ChannelMsg::ExtendedData { data, .. }) => {
+                            pending_bytes = pending_bytes.saturating_add(data.len());
+                            if pending_bytes > MAX_TERMINAL_HANDSHAKE_BUFFER_BYTES {
+                                return Err(TransportError::Remote(
+                                    "The remote terminal produced too much output before its shell was ready."
+                                        .to_string(),
+                                ));
+                            }
+                            pending.push_back(data.to_vec());
+                        }
+                        Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                            return Err(TransportError::Network);
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(pending)
+            };
+
+            tokio::time::timeout(TERMINAL_HANDSHAKE_TIMEOUT, wait_for_replies)
+                .await
+                .map_err(|_| TransportError::Timeout)?
+        }
+        .await;
+
+        let pending = match handshake {
+            Ok(pending) => pending,
+            Err(error) => {
+                let _ = channel.close().await;
+                return Err(error);
+            }
+        };
+
+        let (read, write) = channel.split();
+        Ok(Arc::new(RusshTerminalChannel {
+            read: tokio::sync::Mutex::new(read),
+            write,
+            pending: Mutex::new(pending),
+            closed: AtomicBool::new(false),
+        }))
+    }
+
     async fn is_healthy(&self) -> bool {
         if self.closed.load(Ordering::SeqCst) {
             return false;
@@ -322,6 +430,77 @@ impl SshSession for RusshSession {
             .disconnect(Disconnect::ByApplication, "ServerDesk disconnected", "en")
             .await
             .map_err(map_russh_error)
+    }
+}
+
+struct RusshTerminalChannel {
+    read: tokio::sync::Mutex<ChannelReadHalf>,
+    write: ChannelWriteHalf<Msg>,
+    pending: Mutex<VecDeque<Vec<u8>>>,
+    closed: AtomicBool,
+}
+
+#[async_trait]
+impl TerminalChannel for RusshTerminalChannel {
+    async fn read(&self) -> Option<TerminalChannelEvent> {
+        if let Ok(mut pending) = self.pending.lock()
+            && let Some(data) = pending.pop_front()
+        {
+            return Some(TerminalChannelEvent::Data(data));
+        }
+        if self.closed.load(Ordering::SeqCst) {
+            return None;
+        }
+
+        let mut read = self.read.lock().await;
+        loop {
+            match read.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    return Some(TerminalChannelEvent::Data(data.to_vec()));
+                }
+                Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    return Some(TerminalChannelEvent::Data(data.to_vec()));
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    return Some(TerminalChannelEvent::ExitStatus(exit_status));
+                }
+                Some(ChannelMsg::ExitSignal { signal_name, .. }) => {
+                    return Some(TerminalChannelEvent::ExitSignal(format!("{signal_name:?}")));
+                }
+                Some(ChannelMsg::Close) | None => {
+                    self.closed.store(true, Ordering::SeqCst);
+                    return Some(TerminalChannelEvent::Closed);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn write(&self, data: &[u8]) -> Result<(), TransportError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(TransportError::Network);
+        }
+        self.write
+            .data_bytes(data.to_vec())
+            .await
+            .map_err(map_russh_error)
+    }
+
+    async fn resize(&self, size: TerminalSize) -> Result<(), TransportError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(TransportError::Network);
+        }
+        self.write
+            .window_change(size.cols, size.rows, size.pixel_width, size.pixel_height)
+            .await
+            .map_err(map_russh_error)
+    }
+
+    async fn close(&self) -> Result<(), TransportError> {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.write.close().await.map_err(map_russh_error)
     }
 }
 

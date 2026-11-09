@@ -11,5 +11,6 @@ pub mod remote;
 pub mod servers;
 pub mod services;
 pub mod ssh;
+pub mod terminal;
 
 pub use error::{AppError, ErrorCode};

@@ -3,12 +3,14 @@ import { Outlet, useLocation } from "react-router-dom";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { Topbar } from "@/components/layout/Topbar";
 import { useConnectionEvents } from "@/hooks/useConnectionEvents";
+import { useTerminalEvents } from "@/hooks/useTerminalEvents";
 
 function AppShell() {
   const [navigationOpen, setNavigationOpen] = useState(false);
   const location = useLocation();
 
   useConnectionEvents();
+  useTerminalEvents();
 
   useEffect(() => {
     window.scrollTo({ top: 0 });

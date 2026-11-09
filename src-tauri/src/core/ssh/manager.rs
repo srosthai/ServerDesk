@@ -7,7 +7,10 @@ use std::{
     time::Duration,
 };
 
-use crate::core::AppError;
+use crate::core::{
+    AppError,
+    terminal::{TerminalChannel, TerminalOptions},
+};
 
 use super::{
     ConnectionEventSink, ConnectionRequest, ConnectionSnapshot, ConnectionState,
@@ -490,6 +493,40 @@ impl ConnectionManager {
                 Err(error.to_app_error())
             }
             Ok(Ok(output)) => Ok(output),
+        }
+    }
+
+    /// Opens an interactive PTY channel on the managed session for `server_id`.
+    ///
+    /// Every call creates an independent SSH channel, so multiple terminal
+    /// sessions can share one connection without sharing state.
+    pub async fn open_terminal(
+        &self,
+        server_id: &str,
+        options: TerminalOptions,
+    ) -> Result<Arc<dyn TerminalChannel>, AppError> {
+        options.validate()?;
+        let session = {
+            let inner = self.lock()?;
+            inner
+                .sessions
+                .get(server_id)
+                .map(|entry| Arc::clone(&entry.session))
+                .ok_or_else(|| AppError::not_found("The server is not connected."))?
+        };
+
+        match tokio::time::timeout(self.timeouts.command, session.open_terminal(options)).await {
+            Err(_) => Err(AppError::timeout(format!(
+                "The interactive terminal could not be opened within {} seconds.",
+                timeout_seconds(self.timeouts.command)
+            ))),
+            Ok(Err(error)) => {
+                if !session.is_healthy().await {
+                    let _ = self.mark_error(server_id, error.to_app_error());
+                }
+                Err(error.to_app_error())
+            }
+            Ok(Ok(channel)) => Ok(channel),
         }
     }
 

@@ -14,6 +14,7 @@ use crate::{
             RusshTransport, TrustedHostKey, test_connection, validate_host_key_metadata,
             validate_private_key,
         },
+        terminal::TerminalManager,
     },
     storage::{AuthType, Database, Server, StorageError},
 };
@@ -80,8 +81,10 @@ pub async fn connect_server(
 #[tauri::command]
 pub async fn disconnect_server(
     manager: State<'_, Arc<ConnectionManager>>,
+    terminal: State<'_, Arc<TerminalManager>>,
     id: String,
 ) -> Result<ConnectionSnapshot, AppError> {
+    terminal.close_server(&id).await;
     manager.disconnect(&id).await
 }
 

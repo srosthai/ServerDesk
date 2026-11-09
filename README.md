@@ -64,6 +64,14 @@ Host keys are checked against the local `known_hosts` records before authenticat
 
 The add/edit server form includes a connection test. It reports visible progress, keeps non-secret field values after a failed test, and uses the same host-key verification flow before sending credentials. Auth failures, host-key mismatches, timeouts, DNS failures, and network loss keep distinct error codes and UI labels. Tests against an unsaved profile trust an accepted key only for that test; saving and connecting verifies the key again.
 
+## Interactive terminal
+
+Every terminal session opens a dedicated SSH channel on the managed connection, requests a remote PTY (`xterm-256color` by default), and starts an interactive shell. Multiple independent sessions can share one server connection because each session owns its own channel. Output is streamed to the frontend as base64-encoded `terminal-event` payloads so arbitrary bytes, ANSI control sequences, and colors are preserved. Input and resize events are sent back through typed Tauri commands; resize requests update the remote PTY dimensions.
+
+Closing a session sends an SSH channel close, remote exit statuses are reported, and disconnecting a server closes its terminals before the SSH session is released. Application shutdown also closes every terminal channel. Terminal input is never written to application logs or frontend state, and debug output for terminal input and raw output payloads is redacted.
+
+The minimal terminal page in this slice includes a plain-text preview, raw keyboard forwarding, paste support, and automatic resize. The full xterm.js renderer and scrollback UI are tracked in #27. `cargo test --manifest-path src-tauri/Cargo.toml --test terminal_sessions` starts an in-process `russh` server and verifies PTY/shell setup, ANSI output, input routing, resize forwarding, multiple sessions, remote termination, disconnect cleanup, and command execution while a terminal is open.
+
 ## Remote commands
 
 The Overview page provides the first end-to-end vertical slice: add a profile, connect, verify the host key, authenticate, run fixed `hostname` and `uptime` commands, inspect real stdout, stderr, the exit code, and the connection state, then disconnect and release the session. The Rust command path accepts a closed `RemoteCommand` enum and maps it to fixed command templates, so user text is never concatenated into a shell command. A non-zero exit status is returned as a structured result rather than lost as a transport error.

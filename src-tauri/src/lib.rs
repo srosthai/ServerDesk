@@ -3,12 +3,22 @@ use std::sync::Arc;
 use tauri::Manager;
 
 use crate::{
-    commands::connections::TauriConnectionEventSink,
+    commands::{connections::TauriConnectionEventSink, terminal::TauriTerminalEventSink},
     core::{
         credentials::{CredentialStore, OsCredentialStore},
         ssh::{ConnectionManager, ConnectionTimeouts, RusshTransport},
+        terminal::TerminalManager,
     },
 };
+
+async fn release_connections(app: &tauri::AppHandle) {
+    if let Some(terminal) = app.try_state::<Arc<TerminalManager>>() {
+        terminal.close_all().await;
+    }
+    if let Some(manager) = app.try_state::<Arc<ConnectionManager>>() {
+        manager.disconnect_all().await;
+    }
+}
 
 pub mod commands;
 pub mod core;
@@ -30,14 +40,15 @@ pub fn run() {
                 Arc::new(TauriConnectionEventSink::new(app.handle().clone())),
                 ConnectionTimeouts::default(),
             )));
+            app.manage(Arc::new(TerminalManager::new(Arc::new(
+                TauriTerminalEventSink::new(app.handle().clone()),
+            ))));
 
             Ok(())
         })
         .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. })
-                && let Some(manager) = window.app_handle().try_state::<Arc<ConnectionManager>>()
-            {
-                tauri::async_runtime::block_on(manager.disconnect_all());
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                tauri::async_runtime::block_on(release_connections(window.app_handle()));
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -75,16 +86,19 @@ pub fn run() {
             commands::known_hosts::list_known_hosts,
             commands::known_hosts::trust_host_key,
             commands::known_hosts::reject_host_key,
-            commands::known_hosts::delete_known_host
+            commands::known_hosts::delete_known_host,
+            commands::terminal::open_terminal,
+            commands::terminal::terminal_input,
+            commands::terminal::resize_terminal,
+            commands::terminal::close_terminal,
+            commands::terminal::list_terminal_sessions
         ])
         .build(tauri::generate_context!())
         .expect("error while building ServerDesk");
 
     app.run(|app_handle, event| {
-        if matches!(event, tauri::RunEvent::Exit)
-            && let Some(manager) = app_handle.try_state::<Arc<ConnectionManager>>()
-        {
-            tauri::async_runtime::block_on(manager.disconnect_all());
+        if matches!(event, tauri::RunEvent::Exit) {
+            tauri::async_runtime::block_on(release_connections(app_handle));
         }
     });
 }
