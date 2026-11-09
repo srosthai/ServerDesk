@@ -104,7 +104,16 @@ pub fn delete_known_host(
     database: State<'_, Database>,
     id: String,
     key_type: String,
+    confirmed: bool,
 ) -> Result<(), AppError> {
+    if !confirmed {
+        return Err(AppError::validation(
+            "Removing a trusted host key requires explicit confirmation.",
+        )
+        .with_details(
+            "The saved fingerprint for this server and key type is removed. The next connection will ask for verification again.",
+        ));
+    }
     if !database.delete_known_host(&id, &key_type)? {
         return Err(AppError::not_found(
             "That trusted host key was not found. It may already have been removed.",

@@ -94,7 +94,7 @@ pub fn validate_connection_fields(host: &str, port: u16, username: &str) -> Resu
     if host.is_empty() {
         return Err(AppError::validation("Host is required."));
     }
-    if host.len() > 253 || host.chars().any(char::is_whitespace) {
+    if host.len() > 253 || host.chars().any(host_forbidden_character) {
         return Err(AppError::validation(
             "Enter a valid hostname or IP address.",
         ));
@@ -104,11 +104,52 @@ pub fn validate_connection_fields(host: &str, port: u16, username: &str) -> Resu
             "SSH port must be between 1 and 65535.",
         ));
     }
-    if username.is_empty() || username.len() > 64 || username.chars().any(char::is_whitespace) {
+    if username.is_empty()
+        || username.len() > 64
+        || username.chars().any(username_forbidden_character)
+    {
         return Err(AppError::validation("Enter a valid SSH username."));
     }
 
     Ok(())
+}
+
+fn host_forbidden_character(character: char) -> bool {
+    character.is_control()
+        || character.is_whitespace()
+        || matches!(
+            character,
+            ';' | '|' | '&' | '$' | '`' | '(' | ')' | '<' | '>' | '"' | '\'' | '\\' | '/' | '@'
+        )
+}
+
+fn username_forbidden_character(character: char) -> bool {
+    character.is_control()
+        || character.is_whitespace()
+        || matches!(
+            character,
+            ';' | '|'
+                | '&'
+                | '$'
+                | '`'
+                | '('
+                | ')'
+                | '<'
+                | '>'
+                | '{'
+                | '}'
+                | '['
+                | ']'
+                | '*'
+                | '?'
+                | '!'
+                | '#'
+                | '~'
+                | '"'
+                | '\''
+                | '\\'
+                | '/'
+        )
 }
 
 fn normalize_optional(
@@ -226,6 +267,41 @@ mod tests {
             ..valid_input()
         };
         assert!(bad_host.into_new_server().is_err());
+    }
+
+    #[test]
+    fn rejects_shell_metacharacters_in_connection_fields() {
+        for host in [
+            "example.test; id",
+            "example.test$(id)",
+            "example.test`id`",
+            "example.test|cat",
+            "example.test\nignored",
+            "user@example.test",
+        ] {
+            assert!(
+                validate_connection_fields(host, 22, "deploy").is_err(),
+                "{host:?} must be rejected as a host"
+            );
+        }
+
+        for username in [
+            "deploy; id",
+            "deploy$(id)",
+            "deploy`id`",
+            "deploy|cat",
+            "deploy\nignored",
+            "deploy/root",
+        ] {
+            assert!(
+                validate_connection_fields("198.51.100.24", 22, username).is_err(),
+                "{username:?} must be rejected as a username"
+            );
+        }
+
+        assert!(validate_connection_fields("198.51.100.24", 22, "deploy").is_ok());
+        assert!(validate_connection_fields("2001:db8::1", 22, "deploy").is_ok());
+        assert!(validate_connection_fields("[2001:db8::1]", 22, "deploy").is_ok());
     }
 
     #[test]

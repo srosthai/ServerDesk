@@ -87,6 +87,7 @@ function logTail(overrides: Partial<LogTail> = {}): LogTail {
     truncatedBytes: true,
     truncatedLines: false,
     partialFirstLine: true,
+    secretsRedacted: false,
     rotated: false,
     rotationDetail: null,
     retrievedAt: 1_762_665_720_000,

@@ -14,9 +14,16 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+pub use crate::core::command::log_tail_command;
+
 use crate::core::{
     AppError,
-    projects::{RemotePath, normalize_remote_path, shell_quote},
+    command::{
+        LOG_AFTER_MARKER, LOG_BEFORE_MARKER, LOG_GONE_MARKER, LOG_MISSING_MARKER,
+        LOG_NOT_FILE_MARKER, LOG_READ_FAILED_MARKER, LOG_REAL_MARKER, LOG_UNREADABLE_MARKER,
+    },
+    projects::{RemotePath, normalize_remote_path},
+    redaction::{redact_text, redact_text_preserving_lines},
     ssh::{CommandOutput, ConnectionManager, ConnectionState},
 };
 
@@ -36,15 +43,6 @@ pub const LOG_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 const MAX_LOG_FILE_NAME_CHARS: usize = 255;
 const MAX_LOG_DETAIL_CHARS: usize = 300;
-
-const REAL_MARKER: &str = "__SERVERDESK_LOG_REAL__";
-const BEFORE_MARKER: &str = "__SERVERDESK_LOG_BEFORE__";
-const AFTER_MARKER: &str = "__SERVERDESK_LOG_AFTER__";
-const MISSING_MARKER: &str = "__SERVERDESK_LOG_MISSING__";
-const NOT_FILE_MARKER: &str = "__SERVERDESK_LOG_NOT_FILE__";
-const UNREADABLE_MARKER: &str = "__SERVERDESK_LOG_UNREADABLE__";
-const READ_FAILED_MARKER: &str = "__SERVERDESK_LOG_READ_FAILED__";
-const GONE_MARKER: &str = "__SERVERDESK_LOG_GONE__";
 
 /// One common system log offered by ServerDesk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -174,6 +172,8 @@ pub struct LogTail {
     pub truncated_lines: bool,
     /// True when a partial first line was dropped from a byte-bounded tail.
     pub partial_first_line: bool,
+    /// True when at least one secret-like value was replaced in the tail.
+    pub secrets_redacted: bool,
     pub rotated: bool,
     pub rotation_detail: Option<String>,
     pub retrieved_at: i64,
@@ -287,37 +287,6 @@ fn resolved_outside_error() -> AppError {
     )
 }
 
-/// Builds the only remote command used for one log tail.
-///
-/// The path is quoted as one shell argument and the byte count is a fixed
-/// numeric bound. The command emits small metadata markers on stderr and the
-/// actual bounded tail on stdout.
-pub fn log_tail_command(path: &str, byte_limit: usize) -> String {
-    let quoted = shell_quote(path);
-    format!(
-        "log_path={quoted}; \
-         if [ ! -e \"$log_path\" ]; then printf '%s\\n' '{MISSING_MARKER}' >&2; exit 41; fi; \
-         if [ ! -f \"$log_path\" ]; then printf '%s\\n' '{NOT_FILE_MARKER}' >&2; exit 42; fi; \
-         resolved=$(readlink -f -- \"$log_path\" 2>/dev/null) || resolved=''; \
-         if [ -z \"$resolved\" ]; then printf '%s\\n' '{MISSING_MARKER}' >&2; exit 41; fi; \
-         printf '%s%s\\n' '{REAL_MARKER}' \"$resolved\" >&2; \
-         if [ ! -r \"$resolved\" ]; then printf '%s\\n' '{UNREADABLE_MARKER}' >&2; exit 43; fi; \
-         if ! before=$(stat -c '%d:%i:%s:%Y' -- \"$resolved\" 2>/dev/null); then \
-           printf '%s\\n' '{UNREADABLE_MARKER}' >&2; exit 43; \
-         fi; \
-         printf '%s%s\\n' '{BEFORE_MARKER}' \"$before\" >&2; \
-         tail -c {byte_limit} -- \"$resolved\"; \
-         read_status=$?; \
-         if [ \"$read_status\" -ne 0 ]; then \
-           printf '%s%s\\n' '{READ_FAILED_MARKER}' \"$read_status\" >&2; exit 44; \
-         fi; \
-         if ! after=$(stat -c '%d:%i:%s:%Y' -- \"$resolved\" 2>/dev/null); then \
-           printf '%s\\n' '{GONE_MARKER}' >&2; exit 0; \
-         fi; \
-         printf '%s%s\\n' '{AFTER_MARKER}' \"$after\" >&2"
-    )
-}
-
 /// Reads one bounded log tail over an existing authenticated SSH session.
 pub async fn read_log_tail(
     manager: &ConnectionManager,
@@ -385,6 +354,7 @@ pub async fn read_log_tail(
         truncated_bytes: false,
         truncated_lines: false,
         partial_first_line: false,
+        secrets_redacted: false,
         rotated,
         rotation_detail,
         retrieved_at,
@@ -399,9 +369,11 @@ pub async fn read_log_tail(
             MAX_LOG_CONTENT_BYTES,
             line_limit,
         );
-        tail.content = bounded.content;
-        tail.returned_lines = bounded.returned_lines;
-        tail.returned_bytes = bounded.returned_bytes;
+        let redacted = redact_text_preserving_lines(&bounded.content);
+        tail.content = redacted.text;
+        tail.secrets_redacted = redacted.redacted;
+        tail.returned_lines = tail.content.lines().count();
+        tail.returned_bytes = tail.content.len();
         tail.truncated_bytes = bounded.truncated_bytes;
         tail.truncated_lines = bounded.truncated_lines;
         tail.partial_first_line = bounded.partial_first_line;
@@ -437,24 +409,24 @@ fn parse_remote_log_metadata(stderr: &str) -> RemoteLogMetadata {
 
     for raw_line in stderr.lines() {
         let line = raw_line.trim_end_matches('\r');
-        if let Some(value) = line.strip_prefix(REAL_MARKER) {
+        if let Some(value) = line.strip_prefix(LOG_REAL_MARKER) {
             let value = value.trim();
             if !value.is_empty() {
                 metadata.resolved_path = Some(value.to_string());
             }
-        } else if let Some(value) = line.strip_prefix(BEFORE_MARKER) {
+        } else if let Some(value) = line.strip_prefix(LOG_BEFORE_MARKER) {
             metadata.before = parse_file_meta(value.trim());
-        } else if let Some(value) = line.strip_prefix(AFTER_MARKER) {
+        } else if let Some(value) = line.strip_prefix(LOG_AFTER_MARKER) {
             metadata.after = parse_file_meta(value.trim());
-        } else if line == MISSING_MARKER {
+        } else if line == LOG_MISSING_MARKER {
             metadata.missing = true;
-        } else if line == NOT_FILE_MARKER {
+        } else if line == LOG_NOT_FILE_MARKER {
             metadata.not_file = true;
-        } else if line == UNREADABLE_MARKER {
+        } else if line == LOG_UNREADABLE_MARKER {
             metadata.unreadable = true;
-        } else if line == GONE_MARKER {
+        } else if line == LOG_GONE_MARKER {
             metadata.gone = true;
-        } else if let Some(value) = line.strip_prefix(READ_FAILED_MARKER) {
+        } else if let Some(value) = line.strip_prefix(LOG_READ_FAILED_MARKER) {
             metadata.read_failed = value.trim().parse().ok();
         } else if !line.trim().is_empty() && metadata.error_text.is_none() {
             metadata.error_text = Some(bounded_detail(line));
@@ -681,7 +653,8 @@ fn bounded_tail(
 }
 
 fn bounded_detail(value: &str) -> String {
-    value
+    redact_text(value)
+        .text
         .chars()
         .filter(|character| !character.is_control() || *character == '\t')
         .take(MAX_LOG_DETAIL_CHARS)
@@ -932,6 +905,7 @@ mod tests {
             truncated_bytes: false,
             truncated_lines: false,
             partial_first_line: false,
+            secrets_redacted: false,
             rotated: false,
             rotation_detail: None,
             retrieved_at: 1_762_665_720_000,

@@ -12,7 +12,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::{
     AppError, ErrorCode,
+    command::{service_action_command, service_status_command},
+    redaction::redact_text,
     ssh::{CommandOutput, ConnectionManager, ConnectionState},
+};
+
+pub use crate::core::command::{
+    SERVICE_STATUS_PROPERTIES, SERVICE_STATUS_PROPERTY_FLAGS, SUDO_BINARY, SYSTEMCTL_BINARY,
 };
 
 /// Hard output bound applied to the service discovery command.
@@ -29,19 +35,6 @@ const _: () = assert!(MAX_SERVICE_ACTION_OUTPUT_BYTES <= 64 * 1024);
 pub const SERVICE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SERVICE_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SERVICE_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Fixed binaries used by every action command.
-///
-/// The action path always uses non-interactive sudo (`-n`). It never falls back
-/// to an interactive password prompt or to direct root execution.
-pub const SUDO_BINARY: &str = "/usr/bin/sudo";
-pub const SYSTEMCTL_BINARY: &str = "/usr/bin/systemctl";
-pub const SERVICE_STATUS_PROPERTIES: &str =
-    "Id,LoadState,ActiveState,SubState,UnitFileState,Description";
-/// Repeated `--property` flags avoid commas in the sudoers command arguments.
-pub const SERVICE_STATUS_PROPERTY_FLAGS: &str = "--property=Id --property=LoadState \
-                                                 --property=ActiveState --property=SubState \
-                                                 --property=UnitFileState --property=Description";
 
 /// The single fixed command sent during service discovery.
 ///
@@ -216,7 +209,7 @@ fn failure_detail(output: &CommandOutput, status: ServiceDiscoveryStatus) -> Str
         .stderr
         .lines()
         .find(|line| !line.trim().is_empty())
-        .map(|line| bounded_detail(line.trim()))
+        .map(|line| bounded_detail(redact_text(line.trim()).text.trim()))
         .unwrap_or_default();
 
     match status {
@@ -454,6 +447,12 @@ impl ServiceAction {
         }
     }
 
+    /// Whether the action can interrupt workloads and therefore requires
+    /// explicit confirmation naming the server, unit, and operation.
+    pub const fn requires_confirmation(self) -> bool {
+        matches!(self, Self::Stop | Self::Restart)
+    }
+
     /// Builds the only command line used for this action and unit.
     ///
     /// The unit has already passed [`validate_service_unit_name`]. `--` is
@@ -461,16 +460,10 @@ impl ServiceAction {
     /// as an option.
     pub fn command(self, unit: &ServiceUnitName) -> String {
         match self {
-            Self::Status => format!(
-                "{SUDO_BINARY} -n -- {SYSTEMCTL_BINARY} show --no-pager \
-                 {SERVICE_STATUS_PROPERTY_FLAGS} -- {}",
-                unit.as_str()
-            ),
-            Self::Start | Self::Stop | Self::Restart => format!(
-                "{SUDO_BINARY} -n -- {SYSTEMCTL_BINARY} {} -- {}",
-                self.as_str(),
-                unit.as_str()
-            ),
+            Self::Status => service_status_command(unit.as_str()),
+            Self::Start | Self::Stop | Self::Restart => {
+                service_action_command(self.as_str(), unit.as_str())
+            }
         }
     }
 }
@@ -558,12 +551,24 @@ pub async fn run_service_action(
     server_id: &str,
     unit_name: &str,
     action: ServiceAction,
+    confirmed: bool,
 ) -> Result<ServiceActionResult, AppError> {
     if server_id.trim().is_empty() {
         return Err(AppError::validation("Server ID is required."));
     }
 
     let unit = validate_service_unit_name(unit_name)?;
+    if action.requires_confirmation() && !confirmed {
+        return Err(AppError::validation(format!(
+            "{} {} on server {} requires explicit confirmation before it can run.",
+            action.as_str(),
+            unit.as_str(),
+            server_id
+        ))
+        .with_details(
+            "Review the server, target unit, and operation, then confirm the action. No remote command was sent.",
+        ));
+    }
 
     if action == ServiceAction::Status {
         let query = query_service_status(manager, server_id, &unit).await?;
@@ -585,8 +590,8 @@ pub async fn run_service_action(
             action,
             command,
             succeeded,
-            stdout: query.output.stdout,
-            stderr: query.output.stderr,
+            stdout: sanitize_stream(&query.output.stdout),
+            stderr: sanitize_stream(&query.output.stderr),
             exit_code: query.output.exit_code,
             duration_ms: query.duration_ms,
             permission_denied,
@@ -642,8 +647,8 @@ pub async fn run_service_action(
         action,
         command,
         succeeded: action_succeeded,
-        stdout: output.stdout,
-        stderr: output.stderr,
+        stdout: sanitize_stream(&output.stdout),
+        stderr: sanitize_stream(&output.stderr),
         exit_code: output.exit_code,
         duration_ms,
         permission_denied,
@@ -890,13 +895,13 @@ fn describe_failure(output: &CommandOutput) -> String {
         .stderr
         .lines()
         .find(|line| !line.trim().is_empty())
-        .map(|line| bounded_detail(line.trim()))
+        .map(|line| bounded_detail(redact_text(line.trim()).text.trim()))
         .unwrap_or_default();
     let stdout = output
         .stdout
         .lines()
         .find(|line| !line.trim().is_empty())
-        .map(|line| bounded_detail(line.trim()))
+        .map(|line| bounded_detail(redact_text(line.trim()).text.trim()))
         .unwrap_or_default();
 
     match (stderr.is_empty(), stdout.is_empty()) {
@@ -913,9 +918,13 @@ fn exit_suffix(output: &CommandOutput) -> String {
     }
 }
 
+fn sanitize_stream(value: &str) -> String {
+    redact_text(value).text
+}
+
 fn command_diagnostics(command: &str, output: &CommandOutput, duration_ms: u64) -> String {
-    let stdout = bounded_diagnostic(&output.stdout);
-    let stderr = bounded_diagnostic(&output.stderr);
+    let stdout = bounded_diagnostic(&redact_text(&output.stdout).text);
+    let stderr = bounded_diagnostic(&redact_text(&output.stderr).text);
     format!(
         "Command: {command}\nExit code: {}\nDuration: {duration_ms} ms\n\nstdout:\n{}\n\nstderr:\n{}",
         match output.exit_code {

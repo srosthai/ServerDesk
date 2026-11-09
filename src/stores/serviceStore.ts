@@ -31,7 +31,12 @@ type ServiceStore = {
   entries: Record<string, ServiceDiscoveryEntry>;
   actions: Record<string, ServiceActionEntry>;
   refresh: (serverId: string) => Promise<boolean>;
-  runAction: (serverId: string, unit: string, action: ServiceActionName) => Promise<boolean>;
+  runAction: (
+    serverId: string,
+    unit: string,
+    action: ServiceActionName,
+    confirmed: boolean,
+  ) => Promise<boolean>;
   clearActionResult: (serverId: string) => void;
   clearServer: (serverId: string) => void;
   clearError: (serverId: string) => void;
@@ -164,7 +169,7 @@ export const useServiceStore = create<ServiceStore>((set, get) => {
       }
     },
 
-    runAction: async (serverId, unit, action) => {
+    runAction: async (serverId, unit, action, confirmed) => {
       if (!isTauriRuntime()) {
         return false;
       }
@@ -189,7 +194,7 @@ export const useServiceStore = create<ServiceStore>((set, get) => {
       });
 
       try {
-        const result = await runServiceActionService(serverId, unit, action);
+        const result = await runServiceActionService(serverId, unit, action, confirmed);
         if (actionIds[serverId] !== requestId) {
           return false;
         }

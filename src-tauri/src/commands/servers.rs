@@ -87,7 +87,17 @@ pub async fn delete_server(
     credentials: State<'_, Arc<dyn CredentialStore>>,
     connection_manager: State<'_, Arc<ConnectionManager>>,
     id: String,
+    confirmed: bool,
 ) -> Result<(), AppError> {
+    if !confirmed {
+        return Err(AppError::validation(
+            "Deleting a server profile requires explicit confirmation.",
+        )
+        .with_details(
+            "The server, its saved credential reference, and its local records are removed. No remote command is sent.",
+        ));
+    }
+
     connection_manager.disconnect(&id).await?;
 
     if let Some(reference) = database
