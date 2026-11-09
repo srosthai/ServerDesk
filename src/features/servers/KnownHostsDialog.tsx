@@ -155,6 +155,8 @@ function KnownHostsDialog({ server, onOpenChange }: KnownHostsDialogProps) {
         title="Remove trusted fingerprint?"
         description="The next connection will require explicit acceptance of the server host key again. This does not change the remote server."
         confirmLabel="Remove fingerprint"
+        warningTitle="This only changes local trust."
+        warningDescription="The remote server is not modified. The next connection requires host-key verification again."
         details={
           removeTarget
             ? [

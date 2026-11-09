@@ -62,6 +62,8 @@ describe("KnownHostsDialog", () => {
 
     await user.click(screen.getByRole("button", { name: "Remove ssh-ed25519 fingerprint" }));
     expect(screen.getByText("Remove trusted fingerprint?")).toBeInTheDocument();
+    expect(screen.getByText("This only changes local trust.")).toBeInTheDocument();
+    expect(screen.getByText(/The remote server is not modified/)).toBeInTheDocument();
     expect(screen.getAllByText("SHA256:trusted").length).toBeGreaterThan(1);
 
     await user.click(screen.getByRole("button", { name: "Remove fingerprint" }));

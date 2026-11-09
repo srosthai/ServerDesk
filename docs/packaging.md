@@ -184,7 +184,7 @@ Windows Authenticode signing is not configured. Unsigned NSIS installers trigger
 4. Create and push a tag such as `v0.1.0` from `main`.
 5. The workflow builds:
    - Ubuntu 22.04: DEB, RPM, and AppImage, then smoke-tests the release binary in Xvfb against a clean data directory.
-   - macOS 14: universal `.app` and DMG, signed and notarized when the Apple secrets exist.
+   - macOS 15 Intel: universal `.app` and DMG, signed and notarized when the Apple secrets exist.
    - Windows: NSIS installer.
 6. The publish job downloads all artifacts and creates a draft GitHub release. Review the artifacts, confirm signing status, and publish the draft manually.
 
@@ -249,7 +249,7 @@ The DEB artifact is built by the same Tauri bundler on Linux. Installing it with
 Not executed locally:
 
 - Windows NSIS installation and uninstallation. The workflow builds it on `windows-latest`.
-- macOS universal build, code signing, and notarization. The workflow builds it on `macos-14`; signing requires the repository secrets above.
+- macOS universal build, code signing, and notarization. The workflow builds it on `macos-15-intel`; signing requires the repository secrets above.
 - A full desktop install/uninstall on Debian/Ubuntu, including the package manager scriptlets. The package contents and scriptlets were inspected, but the end-to-end dpkg/rpm transaction was not run.
 
 Known limitations:

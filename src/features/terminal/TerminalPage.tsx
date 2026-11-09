@@ -380,14 +380,14 @@ function TerminalPage() {
             </div>
           </header>
 
-          <div className="flex items-stretch border-b border-[#1e2a23] bg-[#0b1511]">
+          <div className="flex items-stretch border-b border-[#1b241f] bg-[#060907]">
             <div
               role="tablist"
               aria-label={`Terminal sessions for ${selected.name}`}
               className="flex min-w-0 flex-1 overflow-x-auto"
             >
               {serverSessions.length === 0 ? (
-                <span className="flex items-center px-4 py-2 text-[11px] text-[#7f9188]">
+                <span className="flex items-center px-4 py-2 text-[11px] text-[#8b9a91]">
                   No open sessions
                 </span>
               ) : (
@@ -399,7 +399,7 @@ function TerminalPage() {
                       key={session.info.sessionId}
                       className={cn(
                         "flex shrink-0 items-stretch border-r border-white/10",
-                        active ? "bg-[#07100c] shadow-[inset_0_2px_0_#f08a4b]" : "hover:bg-white/5",
+                        active ? "bg-[#000000] shadow-[inset_0_2px_0_#ff8a4c]" : "hover:bg-white/5",
                       )}
                     >
                       <button
@@ -409,7 +409,7 @@ function TerminalPage() {
                         aria-selected={active}
                         aria-controls={`terminal-panel-${session.info.sessionId}`}
                         tabIndex={active ? 0 : -1}
-                        className="flex min-w-[138px] items-center gap-2 px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-[#f08a4b]/60"
+                        className="flex min-w-[138px] items-center gap-2 px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-[#ff8a4c]/60"
                         onClick={() => handleSelectSession(session.info.sessionId)}
                       >
                         <span
@@ -418,24 +418,24 @@ function TerminalPage() {
                             "size-1.5 shrink-0 rounded-full",
                             session.status === "open"
                               ? connected
-                                ? "bg-[#5bc46d]"
-                                : "bg-[#e7a33d]"
+                                ? "bg-[#63d471]"
+                                : "bg-[#f0b04a]"
                               : session.exitReason === "error" ||
                                   session.exitReason === "disconnected"
-                                ? "bg-[#e7a33d]"
-                                : "bg-[#6f8177]",
+                                ? "bg-[#f0b04a]"
+                                : "bg-[#7d8d84]",
                           )}
                         />
                         <span className="min-w-0">
                           <span
                             className={cn(
                               "block truncate text-[11px] font-medium",
-                              active ? "text-[#f0f6fc]" : "text-[#c3d0c8]",
+                              active ? "text-[#f1f5f2]" : "text-[#dce6df]",
                             )}
                           >
                             {label}
                           </span>
-                          <span className="block font-mono text-[10px] leading-4 text-[#7f9188]">
+                          <span className="block font-mono text-[10px] leading-4 text-[#8b9a91]">
                             {session.status === "open"
                               ? `${session.info.cols}×${session.info.rows}`
                               : session.exitReason
@@ -447,7 +447,7 @@ function TerminalPage() {
                       <button
                         type="button"
                         aria-label={`Close ${label}`}
-                        className="my-1 mr-1 grid w-6 place-items-center rounded-sm text-[#7f9188] outline-none transition-colors hover:bg-white/10 hover:text-[#f0f6fc] focus-visible:ring-2 focus-visible:ring-[#f08a4b]/60"
+                        className="my-1 mr-1 grid w-6 place-items-center rounded-sm text-[#8b9a91] outline-none transition-colors hover:bg-white/10 hover:text-[#f1f5f2] focus-visible:ring-2 focus-visible:ring-[#ff8a4c]/60"
                         onClick={() => {
                           void handleCloseSession(session.info.sessionId);
                         }}
@@ -461,7 +461,7 @@ function TerminalPage() {
             </div>
             <button
               type="button"
-              className="flex shrink-0 items-center gap-1.5 border-l border-white/10 px-3 text-[11px] font-medium text-[#c3d0c8] outline-none transition-colors hover:bg-white/10 hover:text-[#f0f6fc] focus-visible:ring-2 focus-visible:ring-[#f08a4b]/60 disabled:pointer-events-none disabled:opacity-40"
+              className="flex shrink-0 items-center gap-1.5 border-l border-white/10 px-3 text-[11px] font-medium text-[#dce6df] outline-none transition-colors hover:bg-white/10 hover:text-[#f1f5f2] focus-visible:ring-2 focus-visible:ring-[#ff8a4c]/60 disabled:pointer-events-none disabled:opacity-40"
               disabled={!connected || opening}
               onClick={() => {
                 void handleOpen();
@@ -481,11 +481,11 @@ function TerminalPage() {
 
           <div className="relative h-[clamp(320px,52dvh,560px)]">
             {serverSessions.length === 0 ? (
-              <div className="flex h-full items-center justify-center bg-[#07100c] px-6">
+              <div className="flex h-full items-center justify-center bg-[#000000] px-6">
                 <div className="max-w-[48ch] text-center">
                   <DiagnosticMark />
-                  <p className="mt-4 text-[13px] text-[#d7e4dc]">No terminal session is open.</p>
-                  <p className="mt-1 text-[12px] leading-5 text-[#7f9188]">
+                  <p className="mt-4 text-[13px] text-[#eaf1ec]">No terminal session is open.</p>
+                  <p className="mt-1 text-[12px] leading-5 text-[#8b9a91]">
                     Open a terminal to start a shell as {selected.username} on {selected.host}. Each
                     tab owns an independent SSH channel and scrollback buffer.
                   </p>
@@ -527,8 +527,8 @@ function TerminalPage() {
           </div>
 
           {activeSession && activeSession.status === "exited" ? (
-            <div className="flex flex-wrap items-center gap-2 border-t border-[#1e2a23] bg-[#0b1511] px-4 py-2.5 text-[12px] text-[#9fb0a6]">
-              <span className="size-1.5 rounded-full bg-[#e7a33d]" aria-hidden="true" />
+            <div className="flex flex-wrap items-center gap-2 border-t border-[#1b241f] bg-[#060907] px-4 py-2.5 text-[12px] text-[#a2b0a7]">
+              <span className="size-1.5 rounded-full bg-[#f0b04a]" aria-hidden="true" />
               <span className="min-w-0 flex-1">
                 {exitDescription(activeSession)}
                 {activeSession.message ? ` ${activeSession.message}` : ""}
@@ -536,7 +536,7 @@ function TerminalPage() {
               <Button
                 variant="outline"
                 size="sm"
-                className="border-white/15 bg-transparent text-[#e6ece8] hover:border-white/25 hover:bg-white/10"
+                className="border-white/15 bg-transparent text-[#f1f5f2] hover:border-white/25 hover:bg-white/10"
                 disabled={!connected || opening}
                 onClick={() => {
                   void handleOpen();
@@ -547,7 +547,7 @@ function TerminalPage() {
               <Button
                 variant="ghost"
                 size="sm"
-                className="text-[#9fb0a6] hover:bg-white/10 hover:text-[#f0f6fc]"
+                className="text-[#a2b0a7] hover:bg-white/10 hover:text-[#f1f5f2]"
                 onClick={() => dismissSession(activeSession.info.sessionId)}
               >
                 Dismiss
@@ -557,7 +557,7 @@ function TerminalPage() {
 
           {activeSession?.error ? (
             <div
-              className="border-t border-[#1e2a23] bg-[#0b1511] px-4 py-2 text-[12px] text-[#ff7b72]"
+              className="border-t border-[#1b241f] bg-[#060907] px-4 py-2 text-[12px] text-[#ff6b6b]"
               role="alert"
             >
               {activeSession.error}
@@ -579,9 +579,9 @@ function TerminalPage() {
 function DiagnosticMark() {
   return (
     <div className="mx-auto flex w-fit items-center gap-1.5" aria-hidden="true">
-      <span className="font-mono text-[11px] text-[#5bc46d]">deploy@server</span>
-      <span className="font-mono text-[11px] text-[#7f9188]">$</span>
-      <span className="h-3.5 w-1.5 animate-pulse bg-[#f08a4b]" />
+      <span className="font-mono text-[11px] text-[#63d471]">deploy@server</span>
+      <span className="font-mono text-[11px] text-[#8b9a91]">$</span>
+      <span className="h-3.5 w-1.5 animate-pulse bg-[#ff8a4c]" />
     </div>
   );
 }
