@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["deb", "rpm", "appimage"],
+    "linux": {
+      "deb": {
+        "section": "admin",
+        "priority": "optional",
+        "preRemoveScript": "packaging/linux/pre-remove.sh"
+      },
+      "rpm": {
+        "release": "1",
+        "preRemoveScript": "packaging/linux/pre-remove.sh"
+      }
+    }
+  }
+}
