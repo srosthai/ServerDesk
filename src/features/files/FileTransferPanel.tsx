@@ -107,17 +107,27 @@ export function FileTransferPanel({
     return null;
   }
 
+  const activeCount = transfers.filter((transfer) => transfer.status === "running").length;
+
   return (
     <section
-      aria-label="File transfers"
+      aria-label="File transfer queue"
       className="overflow-hidden rounded-md border border-border bg-card"
     >
-      <div className="border-b border-border px-3.5 py-3">
-        <h2 className="text-[13px] font-semibold text-foreground">Transfers</h2>
-        <p className="mt-0.5 text-[11px] text-muted-foreground">
-          Progress is reported per transfer. Cancelled or interrupted transfers keep their partial
-          file and are never reported as complete.
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-2 border-b border-border px-3.5 py-3">
+        <div>
+          <h2 className="text-[13px] font-semibold text-foreground">Transfer queue</h2>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
+            Progress is reported per transfer. Cancelled or interrupted transfers keep their partial
+            file and are never reported as complete.
+          </p>
+        </div>
+        <div className="flex items-center gap-2" aria-live="polite">
+          <Badge variant={activeCount > 0 ? "info" : "secondary"}>{activeCount} active</Badge>
+          <Badge variant="outline">
+            {transfers.length} {transfers.length === 1 ? "transfer" : "transfers"}
+          </Badge>
+        </div>
       </div>
       <div className="divide-y divide-border">
         {transfers.map((transfer) => (

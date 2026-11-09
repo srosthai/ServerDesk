@@ -8,7 +8,12 @@ import {
   renameRemoteEntry,
   uploadRemoteFile,
 } from "@/services/files";
-import { emptyFileBrowserEntry, useFileStore } from "@/stores/fileStore";
+import {
+  canNavigateBack,
+  canNavigateForward,
+  emptyFileBrowserEntry,
+  useFileStore,
+} from "@/stores/fileStore";
 import type {
   FileTransferResult,
   RemoteFileListing,
@@ -185,6 +190,71 @@ describe("file browser store", () => {
     expect(entry?.errorDetails).toContain("sudo");
   });
 
+  it("records navigation history, moves back and forward, and truncates forward history", async () => {
+    vi.mocked(browseRemoteFiles).mockImplementation(async (_serverId, _root, path) =>
+      listing({ path, resolvedPath: path, entries: [] }),
+    );
+
+    await useFileStore.getState().openRoot("server-1", "/var/www");
+    let entry = useFileStore.getState().entries["server-1"];
+    expect(entry?.history).toEqual(["/var/www"]);
+    expect(entry?.historyIndex).toBe(0);
+    expect(canNavigateBack(entry)).toBe(false);
+    expect(canNavigateForward(entry)).toBe(false);
+
+    await useFileStore.getState().browse("server-1", "/var/www", "/var/www/app");
+    await useFileStore.getState().browse("server-1", "/var/www", "/var/www/app/public");
+    entry = useFileStore.getState().entries["server-1"];
+    expect(entry?.history).toEqual(["/var/www", "/var/www/app", "/var/www/app/public"]);
+    expect(entry?.historyIndex).toBe(2);
+    expect(canNavigateBack(entry)).toBe(true);
+    expect(canNavigateForward(entry)).toBe(false);
+
+    await expect(useFileStore.getState().goBack("server-1")).resolves.toBe(true);
+    entry = useFileStore.getState().entries["server-1"];
+    expect(entry?.path).toBe("/var/www/app");
+    expect(entry?.historyIndex).toBe(1);
+    expect(canNavigateForward(entry)).toBe(true);
+    expect(browseRemoteFiles).toHaveBeenLastCalledWith("server-1", "/var/www", "/var/www/app");
+
+    await expect(useFileStore.getState().goForward("server-1")).resolves.toBe(true);
+    entry = useFileStore.getState().entries["server-1"];
+    expect(entry?.path).toBe("/var/www/app/public");
+    expect(entry?.historyIndex).toBe(2);
+
+    await useFileStore.getState().goBack("server-1");
+    await useFileStore.getState().browse("server-1", "/var/www", "/var/www/app/other");
+    entry = useFileStore.getState().entries["server-1"];
+    expect(entry?.history).toEqual(["/var/www", "/var/www/app", "/var/www/app/other"]);
+    expect(entry?.historyIndex).toBe(2);
+    expect(canNavigateForward(entry)).toBe(false);
+  });
+
+  it("does not add failed or refreshed navigation to history", async () => {
+    vi.mocked(browseRemoteFiles)
+      .mockResolvedValueOnce(listing())
+      .mockRejectedValueOnce({
+        code: "permission",
+        message: "Permission denied.",
+      })
+      .mockResolvedValueOnce(listing());
+
+    await useFileStore.getState().openRoot("server-1", "/var/www");
+    await expect(
+      useFileStore.getState().browse("server-1", "/var/www", "/var/www/private"),
+    ).resolves.toBe(false);
+
+    let entry = useFileStore.getState().entries["server-1"];
+    expect(entry?.history).toEqual(["/var/www"]);
+    expect(entry?.errorCode).toBe("permission");
+    expect(entry?.errorPath).toBe("/var/www/private");
+
+    await expect(useFileStore.getState().refresh("server-1")).resolves.toBe(true);
+    entry = useFileStore.getState().entries["server-1"];
+    expect(entry?.history).toEqual(["/var/www"]);
+    expect(entry?.historyIndex).toBe(0);
+  });
+
   it("moves up only within the selected root and clears server state", async () => {
     vi.mocked(browseRemoteFiles).mockResolvedValue(
       listing({ path: "/var/www/app", resolvedPath: "/var/www/app" }),
@@ -356,6 +426,99 @@ describe("file browser store", () => {
     expect(retryId).toBe("transfer-test-2");
     expect(vi.mocked(uploadRemoteFile).mock.calls[1][0].overwrite).toBe(false);
     expect(useFileStore.getState().transfers[retryId ?? ""]?.status).toBe("completed");
+  });
+
+  it("deletes selected entries one at a time, aggregates the result, and refreshes once", async () => {
+    vi.mocked(browseRemoteFiles).mockResolvedValue(listing());
+    vi.mocked(deleteRemoteEntry).mockImplementation(async (input) =>
+      mutationResult({
+        action: "delete",
+        path: input.path,
+        targetPath: undefined,
+        recursive: input.recursive,
+        deletedEntries: input.recursive ? 3 : 1,
+      }),
+    );
+    useFileStore.setState({
+      entries: {
+        "server-1": {
+          ...emptyFileBrowserEntry(),
+          root: "/var/www",
+          path: "/var/www",
+          listing: listing(),
+        },
+      },
+    });
+
+    await expect(
+      useFileStore.getState().deleteEntries("server-1", "/var/www", [
+        { path: "/var/www/readme.txt", recursive: false },
+        { path: "/var/www/backups", recursive: true },
+      ]),
+    ).resolves.toBe(true);
+
+    expect(deleteRemoteEntry).toHaveBeenNthCalledWith(1, {
+      serverId: "server-1",
+      root: "/var/www",
+      path: "/var/www/readme.txt",
+      confirmed: true,
+      recursive: false,
+    });
+    expect(deleteRemoteEntry).toHaveBeenNthCalledWith(2, {
+      serverId: "server-1",
+      root: "/var/www",
+      path: "/var/www/backups",
+      confirmed: true,
+      recursive: true,
+    });
+    const result = useFileStore.getState().mutations["server-1"]?.result;
+    expect(result?.action).toBe("delete");
+    expect(result?.targetPath).toBeUndefined();
+    expect(result?.deletedEntries).toBe(4);
+    expect(result?.recursive).toBe(true);
+    expect(result?.verified).toBe(true);
+    expect(browseRemoteFiles).toHaveBeenCalledWith("server-1", "/var/www", "/var/www");
+  });
+
+  it("refreshes the listing after a batch delete fails partway through", async () => {
+    vi.mocked(browseRemoteFiles).mockResolvedValue(listing());
+    vi.mocked(deleteRemoteEntry)
+      .mockResolvedValueOnce(
+        mutationResult({
+          action: "delete",
+          path: "/var/www/readme.txt",
+          targetPath: undefined,
+          deletedEntries: 1,
+        }),
+      )
+      .mockRejectedValueOnce({
+        code: "permission",
+        message: "Permission denied.",
+        details: "The SSH account cannot remove this entry.",
+      });
+    useFileStore.setState({
+      entries: {
+        "server-1": {
+          ...emptyFileBrowserEntry(),
+          root: "/var/www",
+          path: "/var/www",
+          listing: listing(),
+        },
+      },
+    });
+
+    await expect(
+      useFileStore.getState().deleteEntries("server-1", "/var/www", [
+        { path: "/var/www/readme.txt", recursive: false },
+        { path: "/var/www/backups", recursive: true },
+      ]),
+    ).resolves.toBe(false);
+
+    const mutation = useFileStore.getState().mutations["server-1"];
+    expect(mutation?.pending).toBe(false);
+    expect(mutation?.error).toBe("Permission denied.");
+    expect(mutation?.errorCode).toBe("permission");
+    expect(browseRemoteFiles).toHaveBeenCalledWith("server-1", "/var/www", "/var/www");
   });
 
   it("runs confirmed mutations and refreshes the current listing", async () => {
