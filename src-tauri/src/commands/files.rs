@@ -1,17 +1,22 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, State};
 
-use crate::core::{
-    AppError,
-    files::{
-        DownloadRequest, FILE_TRANSFER_EVENT, FileTransferEventSink, FileTransferManager,
-        FileTransferProgress, FileTransferResult, RemoteFileListing, RemoteMutationResult,
-        UploadRequest, browse_remote_files as browse, create_remote_folder as create_folder,
-        delete_remote_entry as delete_entry, rename_remote_entry as rename_entry,
+use crate::{
+    core::{
+        AppError,
+        files::{
+            DownloadRequest, FILE_TRANSFER_EVENT, FileTransferDirection, FileTransferEventSink,
+            FileTransferKind, FileTransferManager, FileTransferProgress, FileTransferResult,
+            FileTransferStatus, RemoteFileListing, RemoteMutationAction, RemoteMutationResult,
+            UploadRequest, browse_remote_files as browse, create_remote_folder as create_folder,
+            delete_remote_entry as delete_entry, rename_remote_entry as rename_entry,
+        },
+        history::{now_unix_seconds, record_operation, summarize_error, summarize_output},
+        ssh::ConnectionManager,
     },
-    ssh::ConnectionManager,
+    storage::{Database, NewOperationRecord, OperationCategory, OperationResult},
 };
 
 pub struct TauriFileTransferEventSink {
@@ -57,10 +62,15 @@ pub struct UploadFileInput {
 /// Uploads one local file or directory over the managed SSH session.
 #[tauri::command]
 pub async fn upload_remote_file(
+    database: State<'_, Database>,
     transfers: State<'_, Arc<FileTransferManager>>,
     input: UploadFileInput,
 ) -> Result<FileTransferResult, AppError> {
-    transfers
+    let started_at = now_unix_seconds();
+    let started = Instant::now();
+    let server_id = input.server_id.clone();
+    let remote_path = input.remote_path.clone();
+    let outcome = transfers
         .upload(UploadRequest {
             transfer_id: input.transfer_id,
             server_id: input.server_id,
@@ -69,7 +79,29 @@ pub async fn upload_remote_file(
             remote_path: input.remote_path,
             overwrite: input.overwrite,
         })
-        .await
+        .await;
+
+    match outcome {
+        Ok(result) => {
+            record_transfer(database.inner(), &result, "sftp-upload");
+            Ok(result)
+        }
+        Err(error) => {
+            record_file_failure(
+                database.inner(),
+                FileFailureContext {
+                    server_id: &server_id,
+                    operation: "sftp-upload",
+                    action: "Upload",
+                    path: &remote_path,
+                    error: &error,
+                    started_at,
+                    started,
+                },
+            );
+            Err(error)
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -87,10 +119,15 @@ pub struct DownloadFileInput {
 /// Downloads one remote file or directory over the managed SSH session.
 #[tauri::command]
 pub async fn download_remote_file(
+    database: State<'_, Database>,
     transfers: State<'_, Arc<FileTransferManager>>,
     input: DownloadFileInput,
 ) -> Result<FileTransferResult, AppError> {
-    transfers
+    let started_at = now_unix_seconds();
+    let started = Instant::now();
+    let server_id = input.server_id.clone();
+    let remote_path = input.remote_path.clone();
+    let outcome = transfers
         .download(DownloadRequest {
             transfer_id: input.transfer_id,
             server_id: input.server_id,
@@ -99,7 +136,29 @@ pub async fn download_remote_file(
             local_path: input.local_path,
             overwrite: input.overwrite,
         })
-        .await
+        .await;
+
+    match outcome {
+        Ok(result) => {
+            record_transfer(database.inner(), &result, "sftp-download");
+            Ok(result)
+        }
+        Err(error) => {
+            record_file_failure(
+                database.inner(),
+                FileFailureContext {
+                    server_id: &server_id,
+                    operation: "sftp-download",
+                    action: "Download",
+                    path: &remote_path,
+                    error: &error,
+                    started_at,
+                    started,
+                },
+            );
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -121,17 +180,42 @@ pub struct CreateFolderInput {
 
 #[tauri::command]
 pub async fn create_remote_folder(
+    database: State<'_, Database>,
     manager: State<'_, Arc<ConnectionManager>>,
     input: CreateFolderInput,
 ) -> Result<RemoteMutationResult, AppError> {
-    create_folder(
+    let started_at = now_unix_seconds();
+    let started = Instant::now();
+    let outcome = create_folder(
         manager.inner().as_ref(),
         &input.server_id,
         &input.root,
         &input.parent,
         &input.name,
     )
-    .await
+    .await;
+
+    match outcome {
+        Ok(result) => {
+            record_mutation(database.inner(), &result, started_at, started);
+            Ok(result)
+        }
+        Err(error) => {
+            record_file_failure(
+                database.inner(),
+                FileFailureContext {
+                    server_id: &input.server_id,
+                    operation: "sftp-create-folder",
+                    action: "Create folder",
+                    path: &input.parent,
+                    error: &error,
+                    started_at,
+                    started,
+                },
+            );
+            Err(error)
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -147,10 +231,13 @@ pub struct RenameEntryInput {
 
 #[tauri::command]
 pub async fn rename_remote_entry(
+    database: State<'_, Database>,
     manager: State<'_, Arc<ConnectionManager>>,
     input: RenameEntryInput,
 ) -> Result<RemoteMutationResult, AppError> {
-    rename_entry(
+    let started_at = now_unix_seconds();
+    let started = Instant::now();
+    let outcome = rename_entry(
         manager.inner().as_ref(),
         &input.server_id,
         &input.root,
@@ -158,7 +245,29 @@ pub async fn rename_remote_entry(
         &input.new_name,
         input.confirmed,
     )
-    .await
+    .await;
+
+    match outcome {
+        Ok(result) => {
+            record_mutation(database.inner(), &result, started_at, started);
+            Ok(result)
+        }
+        Err(error) => {
+            record_file_failure(
+                database.inner(),
+                FileFailureContext {
+                    server_id: &input.server_id,
+                    operation: "sftp-rename",
+                    action: "Rename",
+                    path: &input.path,
+                    error: &error,
+                    started_at,
+                    started,
+                },
+            );
+            Err(error)
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -175,10 +284,13 @@ pub struct DeleteEntryInput {
 
 #[tauri::command]
 pub async fn delete_remote_entry(
+    database: State<'_, Database>,
     manager: State<'_, Arc<ConnectionManager>>,
     input: DeleteEntryInput,
 ) -> Result<RemoteMutationResult, AppError> {
-    delete_entry(
+    let started_at = now_unix_seconds();
+    let started = Instant::now();
+    let outcome = delete_entry(
         manager.inner().as_ref(),
         &input.server_id,
         &input.root,
@@ -186,5 +298,190 @@ pub async fn delete_remote_entry(
         input.confirmed,
         input.recursive,
     )
-    .await
+    .await;
+
+    match outcome {
+        Ok(result) => {
+            record_mutation(database.inner(), &result, started_at, started);
+            Ok(result)
+        }
+        Err(error) => {
+            record_file_failure(
+                database.inner(),
+                FileFailureContext {
+                    server_id: &input.server_id,
+                    operation: "sftp-delete",
+                    action: "Delete",
+                    path: &input.path,
+                    error: &error,
+                    started_at,
+                    started,
+                },
+            );
+            Err(error)
+        }
+    }
+}
+
+fn record_transfer(database: &Database, result: &FileTransferResult, operation: &str) {
+    let remote_path = match result.direction {
+        FileTransferDirection::Upload => &result.destination_path,
+        FileTransferDirection::Download => &result.source_path,
+    };
+    let direction = match result.direction {
+        FileTransferDirection::Upload => "Uploaded",
+        FileTransferDirection::Download => "Downloaded",
+    };
+    let noun = match result.kind {
+        FileTransferKind::File => "file",
+        FileTransferKind::Directory => "directory",
+    };
+    let result_kind = match result.status {
+        FileTransferStatus::Completed => OperationResult::Success,
+        FileTransferStatus::Cancelled => OperationResult::Cancelled,
+        FileTransferStatus::Failed => OperationResult::Failure,
+        FileTransferStatus::Running => OperationResult::Unknown,
+    };
+    let safe_summary = match result.status {
+        FileTransferStatus::Completed => {
+            format!("{direction} a {noun} at {remote_path}")
+        }
+        FileTransferStatus::Cancelled => {
+            format!("Cancelled the {noun} {direction} at {remote_path}")
+        }
+        FileTransferStatus::Failed => {
+            format!("The {noun} {direction} at {remote_path} did not complete")
+        }
+        FileTransferStatus::Running => {
+            format!("The {noun} {direction} at {remote_path} is still running")
+        }
+    };
+    let output_summary = result.error.as_ref().and_then(summarize_error).or_else(|| {
+        let transferred = format!(
+            "{} file(s), {} bytes; {} directories created; status {}",
+            result.files_transferred,
+            result.bytes_transferred,
+            result.directories_created,
+            transfer_status_text(result.status)
+        );
+        summarize_output(&transferred, "")
+    });
+
+    let _ = record_operation(
+        database,
+        &NewOperationRecord {
+            server_id: Some(result.server_id.clone()),
+            project_id: None,
+            category: OperationCategory::Sftp,
+            operation: operation.to_string(),
+            safe_summary,
+            path: Some(remote_path.clone()),
+            output_summary,
+            result: result_kind,
+            exit_code: None,
+            started_at: result.started_at / 1_000,
+            duration_ms: i64::try_from(result.duration_ms).unwrap_or(i64::MAX),
+        },
+    );
+}
+
+fn record_mutation(
+    database: &Database,
+    result: &RemoteMutationResult,
+    started_at: i64,
+    started: Instant,
+) {
+    let (operation, summary) = match result.action {
+        RemoteMutationAction::CreateFolder => (
+            "sftp-create-folder",
+            format!("Created folder {}", result.path),
+        ),
+        RemoteMutationAction::Rename => (
+            "sftp-rename",
+            format!(
+                "Renamed {} to {}",
+                result.path,
+                result.target_path.as_deref().unwrap_or("the new name")
+            ),
+        ),
+        RemoteMutationAction::Delete => (
+            "sftp-delete",
+            if result.recursive {
+                format!("Recursively deleted {}", result.path)
+            } else {
+                format!("Deleted {}", result.path)
+            },
+        ),
+    };
+    let output_summary = result
+        .verification_detail
+        .as_deref()
+        .and_then(|detail| summarize_output(detail, ""))
+        .or_else(|| {
+            Some(if result.verified {
+                "The expected remote state was verified after the operation.".to_string()
+            } else {
+                "The operation completed but the expected state could not be verified.".to_string()
+            })
+        });
+    let result_kind = if result.verified {
+        OperationResult::Success
+    } else {
+        OperationResult::Unknown
+    };
+
+    let _ = record_operation(
+        database,
+        &NewOperationRecord {
+            server_id: Some(result.server_id.clone()),
+            project_id: None,
+            category: OperationCategory::Sftp,
+            operation: operation.to_string(),
+            safe_summary: summary,
+            path: Some(result.path.clone()),
+            output_summary,
+            result: result_kind,
+            exit_code: None,
+            started_at,
+            duration_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+        },
+    );
+}
+
+struct FileFailureContext<'a> {
+    server_id: &'a str,
+    operation: &'a str,
+    action: &'a str,
+    path: &'a str,
+    error: &'a AppError,
+    started_at: i64,
+    started: Instant,
+}
+
+fn record_file_failure(database: &Database, failure: FileFailureContext<'_>) {
+    let _ = record_operation(
+        database,
+        &NewOperationRecord {
+            server_id: Some(failure.server_id.to_string()),
+            project_id: None,
+            category: OperationCategory::Sftp,
+            operation: failure.operation.to_string(),
+            safe_summary: format!("{} at {} did not complete", failure.action, failure.path),
+            path: Some(failure.path.to_string()),
+            output_summary: summarize_error(failure.error),
+            result: OperationResult::Failure,
+            exit_code: None,
+            started_at: failure.started_at,
+            duration_ms: i64::try_from(failure.started.elapsed().as_millis()).unwrap_or(i64::MAX),
+        },
+    );
+}
+
+fn transfer_status_text(status: FileTransferStatus) -> &'static str {
+    match status {
+        FileTransferStatus::Running => "running",
+        FileTransferStatus::Completed => "completed",
+        FileTransferStatus::Cancelled => "cancelled",
+        FileTransferStatus::Failed => "failed",
+    }
 }

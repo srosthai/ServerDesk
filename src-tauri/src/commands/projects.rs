@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use serde::Serialize;
 use tauri::State;
@@ -7,13 +7,17 @@ use crate::{
     core::{
         AppError,
         artisan::{ArtisanAction, ArtisanActionResult, run_artisan_action as run_artisan},
+        history::{
+            now_unix_seconds, record_operation, result_from_exit_code, summarize_error,
+            summarize_output,
+        },
         projects::{
             ProjectRecord, ProjectScanResult, RemoteDirectoryListing,
             list_remote_directories as browse, project_record, scan_remote_projects as scan,
         },
         ssh::ConnectionManager,
     },
-    storage::{Database, NewOperationRecord, NewProject},
+    storage::{Database, NewOperationRecord, NewProject, OperationCategory, OperationResult},
 };
 
 #[tauri::command]
@@ -124,26 +128,60 @@ pub async fn run_project_artisan_action(
     }
 
     let project_id = project.id;
-    let result = run_artisan(
+    let target_path = project.remote_path;
+    let started_at = now_unix_seconds();
+    let started = Instant::now();
+    let outcome = run_artisan(
         manager.inner().as_ref(),
         &id,
         &project_id,
-        &project.remote_path,
+        &target_path,
         action,
         confirmed,
     )
-    .await?;
+    .await;
+
+    let result = match outcome {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = record_operation(
+                database.inner(),
+                &NewOperationRecord {
+                    server_id: Some(id),
+                    project_id: Some(project_id),
+                    category: OperationCategory::Artisan,
+                    operation: action.operation_name().to_string(),
+                    safe_summary: format!(
+                        "The Artisan {} action for {} did not complete",
+                        action.argument(),
+                        target_path
+                    ),
+                    path: Some(target_path),
+                    output_summary: summarize_error(&error),
+                    result: OperationResult::Failure,
+                    exit_code: None,
+                    started_at,
+                    duration_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                },
+            );
+            return Err(error);
+        }
+    };
 
     let record = NewOperationRecord {
         server_id: Some(id),
         project_id: Some(project_id),
+        category: OperationCategory::Artisan,
         operation: result.action.operation_name().to_string(),
         safe_summary: result.safe_summary(),
+        path: Some(result.target_path.clone()),
+        output_summary: summarize_output(&result.stdout, &result.stderr),
+        result: result_from_exit_code(result.exit_code),
         exit_code: result.exit_code.and_then(|code| i32::try_from(code).ok()),
         started_at: result.started_at,
         duration_ms: i64::try_from(result.duration_ms).unwrap_or(i64::MAX),
     };
-    let (history_recorded, history_error) = match database.record_operation(&record) {
+    let (history_recorded, history_error) = match record_operation(database.inner(), &record) {
         Ok(_) => (true, None),
         Err(error) => (false, Some(error.to_string())),
     };

@@ -21,7 +21,7 @@ use serverdesk_lib::{
             TransportError,
         },
     },
-    storage::{Database, NewOperationRecord},
+    storage::{Database, NewOperationRecord, OperationCategory, OperationResult},
 };
 
 struct LocalSession {
@@ -432,8 +432,12 @@ async fn history_summary_never_contains_env_values() {
         .record_operation(&NewOperationRecord {
             server_id: None,
             project_id: None,
+            category: OperationCategory::Artisan,
             operation: result.action.operation_name().to_string(),
             safe_summary: result.safe_summary(),
+            path: Some(result.target_path.clone()),
+            output_summary: Some("Artisan output omitted from history".to_string()),
+            result: OperationResult::Success,
             exit_code: result.exit_code.and_then(|code| i32::try_from(code).ok()),
             started_at: result.started_at,
             duration_ms: i64::try_from(result.duration_ms).unwrap_or(i64::MAX),

@@ -12,7 +12,9 @@ mod servers;
 
 pub use database::Database;
 pub use error::StorageError;
+pub use history::MAX_OPERATION_HISTORY_RECORDS;
 pub use models::{
     AuthType, KnownHost, NewOperationRecord, NewPortForward, NewProject, NewSavedCommand,
-    NewServer, OperationRecord, PortForward, Preference, Project, SavedCommand, Server,
+    NewServer, OperationCategory, OperationHistoryFilter, OperationRecord, OperationResult,
+    PortForward, Preference, Project, SavedCommand, Server,
 };
