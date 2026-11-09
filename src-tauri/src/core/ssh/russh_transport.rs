@@ -464,8 +464,13 @@ impl SshSession for RusshSession {
         if self.closed.load(Ordering::SeqCst) {
             return false;
         }
-        let handle = self.handle.lock().await;
-        !handle.is_closed()
+        // Contention means another operation is using the handle, not that the
+        // session is dead. Waiting for the lock here could turn a long command
+        // into a false health failure.
+        match self.handle.try_lock() {
+            Ok(handle) => !handle.is_closed(),
+            Err(_) => true,
+        }
     }
 
     async fn close(&self) -> Result<(), TransportError> {
@@ -821,6 +826,12 @@ fn map_russh_error(error: russh::Error) -> TransportError {
             expected_fingerprint: "a saved host key".to_string(),
             actual_fingerprint: "an untrusted key".to_string(),
         },
+        russh::Error::NotAuthenticated | russh::Error::UnsupportedAuthMethod => {
+            TransportError::Authentication
+        }
+        russh::Error::CouldNotReadKey => TransportError::Credential(
+            "The private key could not be read. Check the key format and permissions.".to_string(),
+        ),
         russh::Error::Keys(russh::keys::Error::KeyIsEncrypted) => TransportError::Credential(
             "The private key is encrypted and cannot be used yet.".to_string(),
         ),
@@ -846,6 +857,20 @@ mod tests {
             map_russh_error(russh::Error::ConnectionTimeout),
             TransportError::Timeout
         );
+    }
+
+    #[test]
+    fn authentication_and_unreadable_key_errors_keep_distinct_categories() {
+        for error in [
+            russh::Error::NotAuthenticated,
+            russh::Error::UnsupportedAuthMethod,
+        ] {
+            assert_eq!(map_russh_error(error), TransportError::Authentication);
+        }
+        assert!(matches!(
+            map_russh_error(russh::Error::CouldNotReadKey),
+            TransportError::Credential(_)
+        ));
     }
 
     #[test]

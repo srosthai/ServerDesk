@@ -617,6 +617,10 @@ pub async fn run_service_action(
             action.verb(),
             SERVICE_ACTION_TIMEOUT.as_secs()
         ))
+        .with_details(
+            "The remote command may still be running or may already have completed. Verify the \
+             unit state before retrying a start, stop, or restart.",
+        )
     })??;
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 

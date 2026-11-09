@@ -241,7 +241,13 @@ pub struct DownloadRequest {
 pub struct FileTransferManager {
     connections: Arc<ConnectionManager>,
     events: Arc<dyn FileTransferEventSink>,
-    cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    transfers: Mutex<TransferRegistry>,
+}
+
+#[derive(Default)]
+struct TransferRegistry {
+    cancellations: HashMap<String, Arc<AtomicBool>>,
+    destinations: HashMap<String, String>,
 }
 
 impl FileTransferManager {
@@ -252,7 +258,7 @@ impl FileTransferManager {
         Self {
             connections,
             events,
-            cancellations: Mutex::new(HashMap::new()),
+            transfers: Mutex::new(TransferRegistry::default()),
         }
     }
 
@@ -284,7 +290,8 @@ impl FileTransferManager {
             ));
         };
 
-        let cancel = self.register_transfer(&request.transfer_id)?;
+        let destination_key = upload_destination_key(&request.server_id, remote_path.as_str());
+        let cancel = self.register_transfer(&request.transfer_id, &destination_key)?;
         let transfer_id = request.transfer_id.clone();
         let result = self
             .run_upload(
@@ -310,7 +317,9 @@ impl FileTransferManager {
         let (root, remote_path) = validate_browse_paths(&request.root, &request.remote_path)?;
         let local_path = normalize_local_path(&request.local_path)?;
 
-        let cancel = self.register_transfer(&request.transfer_id)?;
+        let destination_key =
+            download_destination_key(&request.server_id, local_path.to_string_lossy().as_ref());
+        let cancel = self.register_transfer(&request.transfer_id, &destination_key)?;
         let transfer_id = request.transfer_id.clone();
         let result = self
             .run_download(request, root, remote_path, local_path, cancel)
@@ -323,8 +332,8 @@ impl FileTransferManager {
     ///
     /// Returns `false` when the transfer already finished or never existed.
     pub fn cancel(&self, transfer_id: &str) -> Result<bool, AppError> {
-        let cancellations = self.lock_cancellations()?;
-        if let Some(flag) = cancellations.get(transfer_id) {
+        let registry = self.lock_registry()?;
+        if let Some(flag) = registry.cancellations.get(transfer_id) {
             flag.store(true, Ordering::SeqCst);
             Ok(true)
         } else {
@@ -334,35 +343,54 @@ impl FileTransferManager {
 
     /// Cancels every running transfer. Used when the application is closing.
     pub fn cancel_all(&self) {
-        if let Ok(cancellations) = self.cancellations.lock() {
-            for flag in cancellations.values() {
+        if let Ok(registry) = self.transfers.lock() {
+            for flag in registry.cancellations.values() {
                 flag.store(true, Ordering::SeqCst);
             }
         }
     }
 
-    fn register_transfer(&self, transfer_id: &str) -> Result<Arc<AtomicBool>, AppError> {
-        let mut cancellations = self.lock_cancellations()?;
-        if cancellations.contains_key(transfer_id) {
+    fn register_transfer(
+        &self,
+        transfer_id: &str,
+        destination_key: &str,
+    ) -> Result<Arc<AtomicBool>, AppError> {
+        let mut registry = self.lock_registry()?;
+        if registry.cancellations.contains_key(transfer_id) {
             return Err(AppError::conflict(
                 "A transfer with this identifier is already running.",
             ));
         }
+        if registry.destinations.contains_key(destination_key) {
+            return Err(AppError::conflict(
+                "Another transfer to this destination is already running.",
+            )
+            .with_details(
+                "Wait for the running transfer to finish, or cancel it before retrying. This \
+                 guard prevents a network retry from writing to the same destination twice.",
+            ));
+        }
         let flag = Arc::new(AtomicBool::new(false));
-        cancellations.insert(transfer_id.to_string(), Arc::clone(&flag));
+        registry
+            .cancellations
+            .insert(transfer_id.to_string(), Arc::clone(&flag));
+        registry
+            .destinations
+            .insert(destination_key.to_string(), transfer_id.to_string());
         Ok(flag)
     }
 
     fn finish_transfer(&self, transfer_id: &str) {
-        if let Ok(mut cancellations) = self.cancellations.lock() {
-            cancellations.remove(transfer_id);
+        if let Ok(mut registry) = self.transfers.lock() {
+            registry.cancellations.remove(transfer_id);
+            registry
+                .destinations
+                .retain(|_, running| running != transfer_id);
         }
     }
 
-    fn lock_cancellations(
-        &self,
-    ) -> Result<MutexGuard<'_, HashMap<String, Arc<AtomicBool>>>, AppError> {
-        self.cancellations
+    fn lock_registry(&self) -> Result<MutexGuard<'_, TransferRegistry>, AppError> {
+        self.transfers
             .lock()
             .map_err(|_| AppError::internal("File transfer lock was poisoned."))
     }
@@ -427,6 +455,11 @@ impl FileTransferManager {
             }
             Err(error) => Some(error),
         };
+        if error.is_some() {
+            self.connections
+                .note_operation_failure(&request.server_id)
+                .await;
+        }
 
         let _ = browser.close().await;
         let status = if error.is_some() {
@@ -497,6 +530,11 @@ impl FileTransferManager {
             }
             Err(error) => Some(error),
         };
+        if error.is_some() {
+            self.connections
+                .note_operation_failure(&request.server_id)
+                .await;
+        }
 
         let _ = browser.close().await;
         let status = if error.is_some() {
@@ -826,13 +864,17 @@ pub async fn browse_remote_files(
     .await;
     let _ = browser.close().await;
 
-    match result {
+    let result = match result {
         Err(_) => Err(AppError::timeout(format!(
             "Remote file browsing timed out after {} seconds.",
             FILE_BROWSE_TIMEOUT.as_secs()
         ))),
         Ok(result) => result,
+    };
+    if result.is_err() {
+        manager.note_operation_failure(server_id).await;
     }
+    result
 }
 
 async fn browse_with_browser(
@@ -1051,6 +1093,22 @@ fn sftp_error(error: SftpError) -> AppError {
     error
 }
 
+fn partial_delete_error(error: SftpError, deleted_entries: u64) -> AppError {
+    let error = sftp_error(error);
+    if deleted_entries == 0 {
+        return error;
+    }
+
+    append_detail(
+        error,
+        &format!(
+            "{deleted_entries} remote entr{} had already been deleted before the operation \
+             stopped. Re-read the directory and verify what remains before retrying.",
+            if deleted_entries == 1 { "y" } else { "ies" }
+        ),
+    )
+}
+
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1060,6 +1118,14 @@ fn now_millis() -> i64 {
 
 fn duration_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn upload_destination_key(server_id: &str, remote_path: &str) -> String {
+    format!("upload|{server_id}|{remote_path}")
+}
+
+fn download_destination_key(server_id: &str, local_path: &str) -> String {
+    format!("download|{server_id}|{local_path}")
 }
 
 fn validate_transfer_id(value: &str) -> Result<(), AppError> {
@@ -1549,11 +1615,28 @@ async fn upload_one_file(
         return Err(error);
     }
 
-    if !overwrite
-        && stat_optional(browser, &file.remote_path)
+    // Back up an existing destination before replacing it. The backup is only
+    // removed after the new file has been re-read and verified, so a failed
+    // verification can restore the previous complete file.
+    let mut backup_path = None;
+    if overwrite {
+        if stat_optional(browser, &file.remote_path)
             .await
             .map_err(sftp_error)?
             .is_some()
+        {
+            let backup = transfer_part_path(&file.remote_path, "backup");
+            let _ = browser.remove_file(&backup).await;
+            if let Err(error) = browser.rename(&file.remote_path, &backup).await {
+                context.record_partial(part_path);
+                return Err(sftp_error(error));
+            }
+            backup_path = Some(backup);
+        }
+    } else if stat_optional(browser, &file.remote_path)
+        .await
+        .map_err(sftp_error)?
+        .is_some()
     {
         context.record_partial(part_path);
         return Err(AppError::conflict(
@@ -1565,45 +1648,105 @@ async fn upload_one_file(
         ));
     }
 
-    match browser.rename(&part_path, &file.remote_path).await {
-        Ok(()) => {}
-        Err(error) if overwrite => {
-            // Move the existing destination aside first so a failed replace
-            // can never destroy it before the complete part file is in place.
-            let backup = transfer_part_path(&file.remote_path, "backup");
-            let had_destination = stat_optional(browser, &file.remote_path)
-                .await
-                .map_err(sftp_error)?
-                .is_some();
-            if had_destination
-                && let Err(backup_error) = browser.rename(&file.remote_path, &backup).await
-            {
-                context.record_partial(part_path);
-                return Err(sftp_error(backup_error));
+    if let Err(error) = browser.rename(&part_path, &file.remote_path).await {
+        if let Some(backup) = &backup_path {
+            let _ = browser.rename(backup, &file.remote_path).await;
+        }
+        context.record_partial(part_path);
+        return Err(sftp_error(error));
+    }
+
+    // Rename success alone is not proof that the remote file is complete.
+    // Re-read the destination and compare the remote size with the bytes that
+    // were sent. On a mismatch, restore the previous file when one existed.
+    if let Err(error) = verify_uploaded_file(browser, &file.remote_path, offset).await {
+        match rollback_upload(browser, &file.remote_path, backup_path.as_deref()).await {
+            Ok(()) => {
+                context.warn(format!(
+                    "The upload to {} failed verification and the destination was rolled back.",
+                    file.remote_path
+                ));
             }
-            if let Err(second) = browser.rename(&part_path, &file.remote_path).await {
-                if had_destination {
-                    let _ = browser.rename(&backup, &file.remote_path).await;
-                }
-                context.record_partial(part_path);
-                return Err(sftp_error(if matches!(second, SftpError::NotFound) {
-                    error
-                } else {
-                    second
-                }));
-            }
-            if had_destination {
-                let _ = browser.remove_file(&backup).await;
+            Err(rollback_error) => {
+                context.record_partial(&file.remote_path);
+                context.warn(format!(
+                    "The upload to {} failed verification and the destination could not be \
+                     restored: {}",
+                    file.remote_path,
+                    rollback_error.to_app_error().message
+                ));
             }
         }
-        Err(error) => {
-            context.record_partial(part_path);
-            return Err(sftp_error(error));
-        }
+        return Err(append_detail(
+            error,
+            "The destination was not reported as successful. Verify the remote path before \
+             retrying.",
+        ));
+    }
+
+    if let Some(backup) = backup_path {
+        let _ = browser.remove_file(&backup).await;
     }
 
     context.files_transferred = context.files_transferred.saturating_add(1);
     Ok(())
+}
+
+async fn verify_uploaded_file(
+    browser: &dyn SftpBrowser,
+    remote_path: &str,
+    expected_bytes: u64,
+) -> Result<(), AppError> {
+    match stat_optional(browser, remote_path).await {
+        Ok(Some(metadata))
+            if metadata.kind == SftpEntryKind::File && metadata.size == Some(expected_bytes) =>
+        {
+            Ok(())
+        }
+        Ok(Some(metadata)) => Err(AppError::remote(
+            "The uploaded file does not match the source after the transfer.",
+        )
+        .with_details(format!(
+            "ServerDesk sent {expected_bytes} bytes, but the remote server reported {} for \
+             {remote_path}.",
+            metadata
+                .size
+                .map(|size| format!("{size} bytes"))
+                .unwrap_or_else(|| "no size".to_string())
+        ))),
+        Ok(None) => Err(
+            AppError::remote("The uploaded file is missing after the transfer.").with_details(
+                format!(
+                    "The remote server did not report {remote_path} after the rename completed."
+                ),
+            ),
+        ),
+        Err(error) => Err(sftp_error(error)),
+    }
+}
+
+async fn rollback_upload(
+    browser: &dyn SftpBrowser,
+    remote_path: &str,
+    backup_path: Option<&str>,
+) -> Result<(), SftpError> {
+    if let Some(backup) = backup_path {
+        let _ = browser.remove_file(remote_path).await;
+        browser.rename(backup, remote_path).await
+    } else {
+        match browser.remove_file(remote_path).await {
+            Ok(()) | Err(SftpError::NotFound) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn append_detail(mut error: AppError, detail: &str) -> AppError {
+    error.details = Some(match error.details.take() {
+        Some(existing) if !existing.trim().is_empty() => format!("{existing}\n{detail}"),
+        _ => detail.to_string(),
+    });
+    error
 }
 
 struct ScannedDownloadFile {
@@ -2009,6 +2152,20 @@ async fn download_one_file(
             .flush()
             .await
             .map_err(|error| local_storage_error("written", error))?;
+        let written = local
+            .metadata()
+            .await
+            .map_err(|error| local_storage_error("read", error))?
+            .len();
+        if written != offset {
+            return Err(AppError::new(
+                ErrorCode::Storage,
+                "The local download did not contain every byte reported as written.",
+            )
+            .with_details(format!(
+                "The transfer read {offset} bytes but the local partial file contains {written}."
+            )));
+        }
         context.check_cancelled()?;
         Ok(())
     }
@@ -2190,6 +2347,7 @@ pub async fn create_remote_folder(
         Ok(target) => target,
         Err(error) => {
             let _ = browser.close().await;
+            manager.note_operation_failure(server_id).await;
             return Err(error);
         }
     };
@@ -2282,6 +2440,7 @@ pub async fn rename_remote_entry(
         Ok(outcome) => outcome,
         Err(error) => {
             let _ = browser.close().await;
+            manager.note_operation_failure(server_id).await;
             return Err(error);
         }
     };
@@ -2334,7 +2493,7 @@ pub async fn delete_remote_entry(
     let operation = async {
         let (_root_real, _parent_real, _name, target, metadata) =
             resolve_mutation_target(browser.as_ref(), &root, &path).await?;
-        let mut deleted_entries = 1u64;
+        let mut deleted_entries = 0u64;
         if metadata.kind == SftpEntryKind::Directory {
             if !recursive {
                 return Err(AppError::validation(
@@ -2384,16 +2543,25 @@ pub async fn delete_remote_entry(
                 }
             }
             for (entry, is_directory) in entries.into_iter().rev() {
-                if is_directory {
-                    browser.remove_dir(&entry).await.map_err(sftp_error)?;
+                let removal = if is_directory {
+                    browser.remove_dir(&entry).await
                 } else {
-                    browser.remove_file(&entry).await.map_err(sftp_error)?;
+                    browser.remove_file(&entry).await
+                };
+                if let Err(error) = removal {
+                    return Err(partial_delete_error(error, deleted_entries));
                 }
                 deleted_entries = deleted_entries.saturating_add(1);
             }
-            browser.remove_dir(&target).await.map_err(sftp_error)?;
+            if let Err(error) = browser.remove_dir(&target).await {
+                return Err(partial_delete_error(error, deleted_entries));
+            }
+            deleted_entries = deleted_entries.saturating_add(1);
         } else {
-            browser.remove_file(&target).await.map_err(sftp_error)?;
+            if let Err(error) = browser.remove_file(&target).await {
+                return Err(partial_delete_error(error, deleted_entries));
+            }
+            deleted_entries = deleted_entries.saturating_add(1);
         }
         Ok::<u64, AppError>(deleted_entries)
     }
@@ -2407,6 +2575,7 @@ pub async fn delete_remote_entry(
         Ok(deleted) => deleted,
         Err(error) => {
             let _ = browser.close().await;
+            manager.note_operation_failure(server_id).await;
             return Err(error);
         }
     };
@@ -2554,6 +2723,39 @@ mod tests {
         assert_eq!(value["entries"][1]["entryType"], "symlink");
         assert_eq!(value["entries"][1]["symlinkEscapesRoot"], true);
         assert!(value["entries"][0].get("symlinkTarget").is_none());
+    }
+
+    #[test]
+    fn transfer_destination_keys_are_scoped_to_server_and_direction() {
+        assert_eq!(
+            upload_destination_key("server-1", "/var/www/app.zip"),
+            "upload|server-1|/var/www/app.zip"
+        );
+        assert_ne!(
+            upload_destination_key("server-1", "/var/www/app.zip"),
+            download_destination_key("server-1", "/var/www/app.zip")
+        );
+        assert_ne!(
+            upload_destination_key("server-1", "/var/www/app.zip"),
+            upload_destination_key("server-2", "/var/www/app.zip")
+        );
+    }
+
+    #[test]
+    fn partial_delete_errors_disclose_entries_already_removed() {
+        let error = partial_delete_error(SftpError::PermissionDenied, 0);
+        assert!(
+            !error
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("already been deleted"))
+        );
+
+        let error = partial_delete_error(SftpError::PermissionDenied, 3);
+        let details = error.details.as_deref().expect("partial detail");
+        assert!(details.contains("3 remote entries had already been deleted"));
+        assert!(details.contains("verify what remains before retrying"));
+        assert_eq!(error.code, ErrorCode::Permission);
     }
 
     #[test]

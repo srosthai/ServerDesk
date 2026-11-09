@@ -163,7 +163,11 @@ impl ConnectionManager {
         let had_session = existing_session.is_some();
 
         if let Some(entry) = existing_session {
-            if entry.session.is_healthy().await {
+            // A reused session is only reported as connected after the fixed,
+            // read-only discovery command succeeds. A half-open connection can
+            // still look healthy locally, so local handle state is not proof
+            // that remote commands work.
+            if self.verify_session(&entry.session).await {
                 let snapshot = {
                     let mut inner = self.lock()?;
                     if !is_current(&inner, &server_id, generation) {
@@ -182,7 +186,7 @@ impl ConnectionManager {
                 return Ok(snapshot);
             }
 
-            let _ = entry.session.close().await;
+            let _ = tokio::time::timeout(self.timeouts.close, entry.session.close()).await;
             let mut inner = self.lock()?;
             if !is_current(&inner, &server_id, generation) {
                 return Err(cancelled());
@@ -292,7 +296,7 @@ impl ConnectionManager {
                         .await;
                 match discovery {
                     Err(_) => {
-                        let _ = session.close().await;
+                        let _ = tokio::time::timeout(self.timeouts.close, session.close()).await;
                         let error = AppError::timeout(format!(
                             "The connection check timed out after {} seconds.",
                             timeout_seconds(self.timeouts.command)
@@ -307,7 +311,7 @@ impl ConnectionManager {
                         Err(error)
                     }
                     Ok(Err(error)) => {
-                        let _ = session.close().await;
+                        let _ = tokio::time::timeout(self.timeouts.close, session.close()).await;
                         let app_error = error.to_app_error();
                         self.finish_with_error(
                             &server_id,
@@ -319,7 +323,7 @@ impl ConnectionManager {
                         Err(app_error)
                     }
                     Ok(Ok(output)) if output.exit_code != Some(0) => {
-                        let _ = session.close().await;
+                        let _ = tokio::time::timeout(self.timeouts.close, session.close()).await;
                         let detail = match output.exit_code {
                             Some(code) => format!("exit code {code}"),
                             None => "no exit status".to_string(),
@@ -360,7 +364,8 @@ impl ConnectionManager {
                         };
 
                         let Some(snapshot) = snapshot else {
-                            let _ = session.close().await;
+                            let _ =
+                                tokio::time::timeout(self.timeouts.close, session.close()).await;
                             return Err(cancelled());
                         };
                         self.events.emit(&snapshot);
@@ -465,14 +470,7 @@ impl ConnectionManager {
             return Err(AppError::validation("Command cannot be empty."));
         }
 
-        let session = {
-            let inner = self.lock()?;
-            inner
-                .sessions
-                .get(server_id)
-                .map(|entry| Arc::clone(&entry.session))
-                .ok_or_else(|| AppError::not_found("The server is not connected."))?
-        };
+        let session = self.session(server_id)?;
 
         let execution = async {
             match max_output_bytes {
@@ -482,13 +480,31 @@ impl ConnectionManager {
         };
 
         match tokio::time::timeout(self.timeouts.command, execution).await {
-            Err(_) => Err(AppError::timeout(format!(
-                "The remote command timed out after {} seconds.",
-                timeout_seconds(self.timeouts.command)
-            ))),
+            Err(_) => {
+                if !self.session_is_healthy(&session).await {
+                    let error = AppError::network(
+                        "The SSH connection was lost while the remote command was running.",
+                    )
+                    .with_details(
+                        "The command may have completed on the server before the connection \
+                         dropped. Reconnect and verify the remote state before retrying.",
+                    );
+                    self.fail_session(server_id, &session, error.clone()).await;
+                    return Err(error);
+                }
+                Err(AppError::timeout(format!(
+                    "The remote command timed out after {} seconds.",
+                    timeout_seconds(self.timeouts.command)
+                ))
+                .with_details(
+                    "The session is still connected, but the command may still be running on the \
+                     server. Verify the remote state before retrying a command that changes it.",
+                ))
+            }
             Ok(Err(error)) => {
-                if !session.is_healthy().await {
-                    let _ = self.mark_error(server_id, error.to_app_error());
+                if !self.session_is_healthy(&session).await {
+                    self.fail_session(server_id, &session, error.to_app_error())
+                        .await;
                 }
                 Err(error.to_app_error())
             }
@@ -506,23 +522,27 @@ impl ConnectionManager {
         options: TerminalOptions,
     ) -> Result<Arc<dyn TerminalChannel>, AppError> {
         options.validate()?;
-        let session = {
-            let inner = self.lock()?;
-            inner
-                .sessions
-                .get(server_id)
-                .map(|entry| Arc::clone(&entry.session))
-                .ok_or_else(|| AppError::not_found("The server is not connected."))?
-        };
+        let session = self.session(server_id)?;
 
         match tokio::time::timeout(self.timeouts.command, session.open_terminal(options)).await {
-            Err(_) => Err(AppError::timeout(format!(
-                "The interactive terminal could not be opened within {} seconds.",
-                timeout_seconds(self.timeouts.command)
-            ))),
+            Err(_) => {
+                if !self.session_is_healthy(&session).await {
+                    let error = AppError::network(
+                        "The SSH connection was lost while opening the interactive terminal.",
+                    )
+                    .with_details("Reconnect the server before opening another terminal.");
+                    self.fail_session(server_id, &session, error.clone()).await;
+                    return Err(error);
+                }
+                Err(AppError::timeout(format!(
+                    "The interactive terminal could not be opened within {} seconds.",
+                    timeout_seconds(self.timeouts.command)
+                )))
+            }
             Ok(Err(error)) => {
-                if !session.is_healthy().await {
-                    let _ = self.mark_error(server_id, error.to_app_error());
+                if !self.session_is_healthy(&session).await {
+                    self.fail_session(server_id, &session, error.to_app_error())
+                        .await;
                 }
                 Err(error.to_app_error())
             }
@@ -552,18 +572,57 @@ impl ConnectionManager {
         };
 
         match tokio::time::timeout(self.timeouts.command, session.open_sftp()).await {
-            Err(_) => Err(AppError::timeout(format!(
-                "Opening the SFTP file browser timed out after {} seconds.",
-                timeout_seconds(self.timeouts.command)
-            ))),
+            Err(_) => {
+                if !self.session_is_healthy(&session).await {
+                    let error = AppError::network(
+                        "The SSH connection was lost while opening the SFTP file browser.",
+                    )
+                    .with_details("Reconnect the server before browsing or transferring files.");
+                    self.fail_session(server_id, &session, error.clone()).await;
+                    return Err(error);
+                }
+                Err(AppError::timeout(format!(
+                    "Opening the SFTP file browser timed out after {} seconds.",
+                    timeout_seconds(self.timeouts.command)
+                )))
+            }
             Ok(Err(error)) => {
-                if !session.is_healthy().await {
-                    let _ = self.mark_error(server_id, error.to_app_error());
+                if !self.session_is_healthy(&session).await {
+                    self.fail_session(server_id, &session, error.to_app_error())
+                        .await;
                 }
                 Err(error.to_app_error())
             }
             Ok(Ok(browser)) => Ok(browser),
         }
+    }
+
+    /// Rechecks a session after an operation that bypassed the command path,
+    /// such as an SFTP transfer. It never retries the operation; it only moves
+    /// the connection to `error` when the session is confirmed dead.
+    pub async fn note_operation_failure(&self, server_id: &str) {
+        let session = {
+            let Ok(inner) = self.inner.lock() else {
+                return;
+            };
+            inner
+                .sessions
+                .get(server_id)
+                .map(|entry| Arc::clone(&entry.session))
+        };
+        let Some(session) = session else {
+            return;
+        };
+        if self.session_is_healthy(&session).await {
+            return;
+        }
+
+        let error = AppError::network("The SSH connection was lost during the operation.")
+            .with_details(
+                "Reconnect and verify the remote state before retrying. An operation that was \
+                 already running may have completed on the server.",
+            );
+        self.fail_session(server_id, &session, error).await;
     }
 
     fn state_locked(&self, server_id: &str) -> Result<ConnectionState, AppError> {
@@ -600,19 +659,80 @@ impl ConnectionManager {
         Ok(())
     }
 
-    fn mark_error(&self, server_id: &str, error: AppError) -> Result<(), AppError> {
-        let snapshot = {
-            let mut inner = self.lock()?;
-            transition(
+    fn session(&self, server_id: &str) -> Result<Arc<dyn SshSession>, AppError> {
+        let inner = self.lock()?;
+        inner
+            .sessions
+            .get(server_id)
+            .map(|entry| Arc::clone(&entry.session))
+            .ok_or_else(|| {
+                AppError::connection(
+                    "The server is not connected. Reconnect before running commands.",
+                )
+                .with_details("No authenticated SSH session is open for this server profile.")
+            })
+    }
+
+    async fn session_is_healthy(&self, session: &Arc<dyn SshSession>) -> bool {
+        matches!(
+            tokio::time::timeout(self.timeouts.close, session.is_healthy()).await,
+            Ok(true)
+        )
+    }
+
+    /// A reused session must answer one fixed, read-only command before it is
+    /// presented as connected. Local handle state alone cannot detect a
+    /// half-open connection.
+    async fn verify_session(&self, session: &Arc<dyn SshSession>) -> bool {
+        if !self.session_is_healthy(session).await {
+            return false;
+        }
+
+        matches!(
+            tokio::time::timeout(self.timeouts.command, session.execute(DISCOVERY_COMMAND)).await,
+            Ok(Ok(output)) if output.exit_code == Some(0)
+        )
+    }
+
+    /// Moves a dead session to the error state and releases it.
+    ///
+    /// The caller already observed an unhealthy session, so this never retries
+    /// the failed command. It only cleans up local state before the user
+    /// reconnects and verifies the remote result themselves.
+    async fn fail_session(
+        &self,
+        server_id: &str,
+        failed_session: &Arc<dyn SshSession>,
+        error: AppError,
+    ) {
+        let session = {
+            let mut inner = match self.inner.lock() {
+                Ok(inner) => inner,
+                Err(_) => return,
+            };
+            let still_current = inner
+                .sessions
+                .get(server_id)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.session, failed_session));
+            if !still_current {
+                return;
+            }
+            let session = inner.sessions.remove(server_id).map(|entry| entry.session);
+            let snapshot = transition(
                 &mut inner,
                 server_id,
                 ConnectionState::Error,
                 Some(error),
                 None,
-            )
+            );
+            drop(inner);
+            self.events.emit(&snapshot);
+            session
         };
-        self.events.emit(&snapshot);
-        Ok(())
+
+        if let Some(session) = session {
+            let _ = tokio::time::timeout(self.timeouts.close, session.close()).await;
+        }
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, ManagerInner>, AppError> {
@@ -714,7 +834,8 @@ mod tests {
 
     struct MockSession {
         command_delay_millis: AtomicU64,
-        command_result: Result<CommandOutput, TransportError>,
+        command_result: Mutex<Result<CommandOutput, TransportError>>,
+        command_count: AtomicUsize,
         healthy: AtomicBool,
         closed: AtomicBool,
         close_count: AtomicUsize,
@@ -727,7 +848,8 @@ mod tests {
         ) -> Self {
             Self {
                 command_delay_millis: AtomicU64::new(command_delay.as_millis() as u64),
-                command_result,
+                command_result: Mutex::new(command_result),
+                command_count: AtomicUsize::new(0),
                 healthy: AtomicBool::new(true),
                 closed: AtomicBool::new(false),
                 close_count: AtomicUsize::new(0),
@@ -743,6 +865,14 @@ mod tests {
                 .store(delay.as_millis() as u64, Ordering::SeqCst);
         }
 
+        fn set_command_result(&self, result: Result<CommandOutput, TransportError>) {
+            *self.command_result.lock().expect("command result lock") = result;
+        }
+
+        fn command_count(&self) -> usize {
+            self.command_count.load(Ordering::SeqCst)
+        }
+
         fn close_count(&self) -> usize {
             self.close_count.load(Ordering::SeqCst)
         }
@@ -751,11 +881,15 @@ mod tests {
     #[async_trait]
     impl SshSession for MockSession {
         async fn execute(&self, _command: &str) -> Result<CommandOutput, TransportError> {
+            self.command_count.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(
                 self.command_delay_millis.load(Ordering::SeqCst),
             ))
             .await;
-            self.command_result.clone()
+            self.command_result
+                .lock()
+                .expect("command result lock")
+                .clone()
         }
 
         async fn is_healthy(&self) -> bool {
@@ -1190,7 +1324,7 @@ mod tests {
                 .await
                 .expect_err("session is released")
                 .code,
-            crate::core::ErrorCode::NotFound
+            crate::core::ErrorCode::Connection
         );
     }
 
@@ -1329,18 +1463,127 @@ mod tests {
         ));
 
         manager.connect(request("server-1")).await.expect("connect");
-        transport
-            .first_session()
-            .set_command_delay(Duration::from_secs(60));
+        let session = transport.first_session();
+        session.set_command_delay(Duration::from_secs(60));
+        let commands_before = session.command_count();
         let error = manager
             .execute("server-1", "uptime")
             .await
             .expect_err("command should time out");
 
         assert_eq!(error.code, crate::core::ErrorCode::Timeout);
+        assert!(
+            error
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("may still be running"))
+        );
+        assert_eq!(
+            session.command_count(),
+            commands_before + 1,
+            "a timed-out command must not be silently retried"
+        );
         assert_eq!(
             manager.connection_state("server-1").expect("state").state,
             ConnectionState::Connected
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn command_timeout_on_a_lost_session_reports_network_loss_and_drops_it() {
+        let transport = Arc::new(MockTransport::success());
+        let events = Arc::new(RecordingSink::default());
+        let manager = Arc::new(ConnectionManager::new(
+            Arc::clone(&transport) as Arc<dyn SshTransport>,
+            Arc::clone(&events) as Arc<dyn ConnectionEventSink>,
+            test_timeouts(),
+        ));
+
+        manager.connect(request("server-1")).await.expect("connect");
+        let session = transport.first_session();
+        session.set_command_delay(Duration::from_secs(60));
+        session.mark_unhealthy();
+
+        let error = manager
+            .execute("server-1", "uptime")
+            .await
+            .expect_err("lost session must not report a plain timeout");
+
+        assert_eq!(error.code, crate::core::ErrorCode::Network);
+        assert!(
+            error
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("may have completed"))
+        );
+        assert_eq!(
+            manager.connection_state("server-1").expect("state").state,
+            ConnectionState::Error
+        );
+        assert_eq!(manager.inner.lock().expect("inner lock").sessions.len(), 0);
+        assert_eq!(session.close_count(), 1);
+
+        let error = manager
+            .execute("server-1", "uptime")
+            .await
+            .expect_err("the dead session is released");
+        assert_eq!(error.code, crate::core::ErrorCode::Connection);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reused_session_is_reverified_and_replaced_when_remote_commands_fail() {
+        let transport = Arc::new(MockTransport::success());
+        let events = Arc::new(RecordingSink::default());
+        let manager = Arc::new(ConnectionManager::new(
+            Arc::clone(&transport) as Arc<dyn SshTransport>,
+            Arc::clone(&events) as Arc<dyn ConnectionEventSink>,
+            test_timeouts(),
+        ));
+
+        manager.connect(request("server-1")).await.expect("connect");
+        let first_session = transport.first_session();
+        assert_eq!(
+            first_session.command_count(),
+            1,
+            "the initial connection runs one discovery command"
+        );
+
+        first_session.set_command_result(Err(TransportError::Network));
+        manager
+            .connect(request("server-1"))
+            .await
+            .expect("reconnect replaces the unresponsive session");
+
+        assert_eq!(transport.connect_count(), 2);
+        assert_eq!(first_session.close_count(), 1);
+        assert_eq!(
+            manager.connection_state("server-1").expect("state").state,
+            ConnectionState::Connected
+        );
+        assert_eq!(transport.sessions().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reuse_verifies_the_session_with_a_read_only_command() {
+        let transport = Arc::new(MockTransport::success());
+        let events = Arc::new(RecordingSink::default());
+        let manager = Arc::new(ConnectionManager::new(
+            Arc::clone(&transport) as Arc<dyn SshTransport>,
+            Arc::clone(&events) as Arc<dyn ConnectionEventSink>,
+            test_timeouts(),
+        ));
+
+        manager.connect(request("server-1")).await.expect("connect");
+        manager
+            .connect(request("server-1"))
+            .await
+            .expect("reuse verified session");
+
+        assert_eq!(transport.connect_count(), 1);
+        assert_eq!(
+            transport.first_session().command_count(),
+            2,
+            "every reuse must verify the remote session before reporting connected"
         );
     }
 }

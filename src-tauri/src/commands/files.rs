@@ -5,7 +5,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::{
     core::{
-        AppError,
+        AppError, ErrorCode,
         files::{
             DownloadRequest, FILE_TRANSFER_EVENT, FileTransferDirection, FileTransferEventSink,
             FileTransferKind, FileTransferManager, FileTransferProgress, FileTransferResult,
@@ -95,6 +95,7 @@ pub async fn upload_remote_file(
                     action: "Upload",
                     path: &remote_path,
                     error: &error,
+                    mutating: false,
                     started_at,
                     started,
                 },
@@ -152,6 +153,7 @@ pub async fn download_remote_file(
                     action: "Download",
                     path: &remote_path,
                     error: &error,
+                    mutating: false,
                     started_at,
                     started,
                 },
@@ -209,6 +211,7 @@ pub async fn create_remote_folder(
                     action: "Create folder",
                     path: &input.parent,
                     error: &error,
+                    mutating: true,
                     started_at,
                     started,
                 },
@@ -261,6 +264,7 @@ pub async fn rename_remote_entry(
                     action: "Rename",
                     path: &input.path,
                     error: &error,
+                    mutating: true,
                     started_at,
                     started,
                 },
@@ -314,6 +318,7 @@ pub async fn delete_remote_entry(
                     action: "Delete",
                     path: &input.path,
                     error: &error,
+                    mutating: true,
                     started_at,
                     started,
                 },
@@ -336,18 +341,19 @@ fn record_transfer(database: &Database, result: &FileTransferResult, operation: 
         FileTransferKind::File => "file",
         FileTransferKind::Directory => "directory",
     };
-    let result_kind = match result.status {
-        FileTransferStatus::Completed => OperationResult::Success,
-        FileTransferStatus::Cancelled => OperationResult::Cancelled,
-        FileTransferStatus::Failed => OperationResult::Failure,
-        FileTransferStatus::Running => OperationResult::Unknown,
-    };
+    let result_kind = transfer_operation_result(result);
     let safe_summary = match result.status {
         FileTransferStatus::Completed => {
             format!("{direction} a {noun} at {remote_path}")
         }
         FileTransferStatus::Cancelled => {
             format!("Cancelled the {noun} {direction} at {remote_path}")
+        }
+        FileTransferStatus::Failed if result_kind == OperationResult::Unknown => {
+            format!(
+                "The {noun} {direction} at {remote_path} has an unknown outcome; verify the path \
+                 before retrying"
+            )
         }
         FileTransferStatus::Failed => {
             format!("The {noun} {direction} at {remote_path} did not complete")
@@ -454,11 +460,13 @@ struct FileFailureContext<'a> {
     action: &'a str,
     path: &'a str,
     error: &'a AppError,
+    mutating: bool,
     started_at: i64,
     started: Instant,
 }
 
 fn record_file_failure(database: &Database, failure: FileFailureContext<'_>) {
+    let outcome_unknown = failure.mutating && file_mutation_failure_is_unknown(failure.error);
     let _ = record_operation(
         database,
         &NewOperationRecord {
@@ -466,15 +474,52 @@ fn record_file_failure(database: &Database, failure: FileFailureContext<'_>) {
             project_id: None,
             category: OperationCategory::Sftp,
             operation: failure.operation.to_string(),
-            safe_summary: format!("{} at {} did not complete", failure.action, failure.path),
+            safe_summary: if outcome_unknown {
+                format!(
+                    "{} at {} has an unknown outcome; re-read the path before retrying",
+                    failure.action, failure.path
+                )
+            } else {
+                format!("{} at {} did not complete", failure.action, failure.path)
+            },
             path: Some(failure.path.to_string()),
             output_summary: summarize_error(failure.error),
-            result: OperationResult::Failure,
+            result: if outcome_unknown {
+                OperationResult::Unknown
+            } else {
+                OperationResult::Failure
+            },
             exit_code: None,
             started_at: failure.started_at,
             duration_ms: i64::try_from(failure.started.elapsed().as_millis()).unwrap_or(i64::MAX),
         },
     );
+}
+
+fn transfer_operation_result(result: &FileTransferResult) -> OperationResult {
+    match result.status {
+        FileTransferStatus::Completed => OperationResult::Success,
+        FileTransferStatus::Cancelled => OperationResult::Cancelled,
+        FileTransferStatus::Running => OperationResult::Unknown,
+        FileTransferStatus::Failed
+            if result.error.as_ref().is_some_and(|error| {
+                matches!(
+                    error.code,
+                    ErrorCode::Timeout | ErrorCode::Network | ErrorCode::Connection
+                )
+            }) =>
+        {
+            OperationResult::Unknown
+        }
+        FileTransferStatus::Failed => OperationResult::Failure,
+    }
+}
+
+fn file_mutation_failure_is_unknown(error: &AppError) -> bool {
+    matches!(
+        error.code,
+        ErrorCode::Timeout | ErrorCode::Network | ErrorCode::Connection
+    )
 }
 
 fn transfer_status_text(status: FileTransferStatus) -> &'static str {
@@ -483,5 +528,66 @@ fn transfer_status_text(status: FileTransferStatus) -> &'static str {
         FileTransferStatus::Completed => "completed",
         FileTransferStatus::Cancelled => "cancelled",
         FileTransferStatus::Failed => "failed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::ssh::ConnectionState;
+
+    fn failed_transfer(code: ErrorCode) -> FileTransferResult {
+        FileTransferResult {
+            transfer_id: "transfer-1".to_string(),
+            server_id: "server-1".to_string(),
+            direction: FileTransferDirection::Upload,
+            kind: FileTransferKind::File,
+            status: FileTransferStatus::Failed,
+            source_path: "/tmp/source.bin".to_string(),
+            destination_path: "/var/www/source.bin".to_string(),
+            bytes_transferred: 100,
+            total_bytes: Some(200),
+            files_transferred: 0,
+            files_total: Some(1),
+            directories_created: 0,
+            skipped_entries: 0,
+            warnings: Vec::new(),
+            partial_paths: vec!["/var/www/source.bin.serverdesk-test.part".to_string()],
+            may_be_incomplete: true,
+            overwrite: false,
+            started_at: 1,
+            finished_at: 2,
+            duration_ms: 3,
+            error: Some(AppError::new(code, "transfer failed")),
+            connection_state: ConnectionState::Error,
+        }
+    }
+
+    #[test]
+    fn interrupted_transfer_history_is_unknown_after_a_transport_loss() {
+        assert_eq!(
+            transfer_operation_result(&failed_transfer(ErrorCode::Network)),
+            OperationResult::Unknown
+        );
+        assert_eq!(
+            transfer_operation_result(&failed_transfer(ErrorCode::Timeout)),
+            OperationResult::Unknown
+        );
+        assert_eq!(
+            transfer_operation_result(&failed_transfer(ErrorCode::Permission)),
+            OperationResult::Failure
+        );
+    }
+
+    #[test]
+    fn mutating_file_failures_are_only_unknown_for_transport_losses() {
+        assert!(file_mutation_failure_is_unknown(&AppError::network("lost")));
+        assert!(file_mutation_failure_is_unknown(&AppError::timeout("slow")));
+        assert!(!file_mutation_failure_is_unknown(&AppError::permission(
+            "denied"
+        )));
+        assert!(!file_mutation_failure_is_unknown(&AppError::validation(
+            "invalid"
+        )));
     }
 }

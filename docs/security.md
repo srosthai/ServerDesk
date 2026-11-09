@@ -178,3 +178,14 @@ ServerDesk does not require root and does not use a hosted relay.
   trust implied by using SFTP at all.
 - Known-host records are local trust-on-first-use decisions. Users must verify
   fingerprints through an independent channel.
+- Transfer progress and partial-path state are held in memory. A crash or an
+  application exit can leave `.serverdesk-*.part` files on disk or on the
+  remote host without a visible retry record. ServerDesk never resumes a
+  transfer automatically; a retry starts from a new partial path.
+- Upload completion verifies the remote file type and byte count, not a content
+  checksum. A malicious or buggy SFTP server can return metadata for different
+  content of the same size.
+- Long-running read-only commands are bounded by timeouts but have no per-command
+  cancel control. Closing an SSH channel does not prove that a remote process
+  stopped, so ServerDesk does not claim that cancellation is safe for commands
+  that can change remote state.

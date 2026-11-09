@@ -229,6 +229,10 @@ pub async fn run_artisan_action(
             "The Artisan action timed out after {} seconds.",
             ARTISAN_ACTION_TIMEOUT.as_secs()
         ))
+        .with_details(
+            "The Artisan process may still be running or may already have completed. Verify the \
+             project state before retrying an action that changes files or caches.",
+        )
     })??;
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
