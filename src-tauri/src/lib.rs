@@ -83,6 +83,7 @@ pub fn run() {
             commands::queue::get_queue_supervisor_status,
             commands::logs::list_log_sources,
             commands::logs::read_log_tail,
+            commands::files::browse_remote_files,
             commands::known_hosts::list_known_hosts,
             commands::known_hosts::trust_host_key,
             commands::known_hosts::reject_host_key,
