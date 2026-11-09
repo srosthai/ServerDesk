@@ -93,6 +93,14 @@ Version and hint detection is bounded and non-secret:
 
 Project records are upserted by the unique `(server_id, remote_path)` pair, so rescanning updates metadata and detection time instead of creating duplicates. Saved projects and their SQLite records survive application restarts. The dashboard shows recent recorded operations with success, failure, or unknown status, the Laravel log path, quick links to the terminal at the project path and the log viewer, and the stored queue and scheduler hints.
 
+## Queue and Supervisor status
+
+The project dashboard can inspect Laravel queue workers and Supervisor without changing either. Detection is read-only and uses fixed commands: a `command -v supervisorctl`/`supervisord` presence probe, `supervisorctl status`, and the server-wide `ps -eo pid=,etimes=,args=` process list. ServerDesk never reads Supervisor configuration, rewrites it, starts or stops Supervisor, or installs packages.
+
+The typed result reports Supervisor as `available`, `missing`, or `unavailable`, and queue workers as `available` or `unavailable`. Program names and states come only from Supervisor; a missing or unreadable result is never replaced with guessed names. Queue worker detection recognizes `queue:work`, `queue:listen`, and Horizon processes and keeps only the PID, elapsed time, worker kind, and bounded queue/connection options. Raw process arguments are not stored or returned, so credentials in a command line cannot leak into the UI or history.
+
+The panel states that a Laravel `queue:restart` is a graceful application-level restart, not a Supervisor or systemd restart. Queue and Supervisor data is a sample, not configuration, and is kept in memory only.
+
 ## Safe Artisan actions
 
 The project dashboard exposes a closed allowlist of fixed commands: `about`, `route:list`, `config:cache`, `config:clear`, `cache:clear`, `optimize:clear`, `queue:restart`, and `migrate:status`. The frontend never sends command text or a project path for an action: it sends a typed action name and the saved project ID. The Rust backend looks up the stored path, validates it again, and builds the command as `cd -- '<project path>' && php artisan <fixed command>`.
