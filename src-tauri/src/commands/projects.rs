@@ -194,9 +194,21 @@ pub async fn run_project_artisan_action(
 }
 
 #[tauri::command]
-pub fn delete_project(database: State<'_, Database>, id: String) -> Result<(), AppError> {
+pub fn delete_project(
+    database: State<'_, Database>,
+    id: String,
+    confirmed: bool,
+) -> Result<(), AppError> {
     if id.trim().is_empty() {
         return Err(AppError::validation("Project ID is required."));
+    }
+    if !confirmed {
+        return Err(AppError::validation(
+            "Deleting a saved project requires explicit confirmation.",
+        )
+        .with_details(
+            "The local project record and its project link are removed. No remote command is sent.",
+        ));
     }
 
     database.delete_project(&id)?;

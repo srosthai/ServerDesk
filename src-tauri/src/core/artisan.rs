@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::{
     AppError,
-    projects::{RemotePath, normalize_remote_path, shell_quote},
+    command::artisan_command,
+    projects::{RemotePath, normalize_remote_path},
+    redaction::redact_text,
     ssh::{ConnectionManager, ConnectionState},
 };
 
@@ -131,11 +133,7 @@ impl ArtisanAction {
     /// quoted as one POSIX shell argument. No other user-controlled text is
     /// interpolated.
     pub fn command(self, path: &RemotePath) -> String {
-        format!(
-            "cd -- {} && php artisan {}",
-            shell_quote(path.as_str()),
-            self.argument()
-        )
+        artisan_command(path.as_str(), self.argument())
     }
 }
 
@@ -263,204 +261,30 @@ fn now_unix_seconds() -> i64 {
         .unwrap_or_default()
 }
 
-/// Removes ANSI control sequences before the output reaches history or the UI.
-fn strip_ansi(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut characters = input.chars().peekable();
-
-    while let Some(character) = characters.next() {
-        if character != '\x1b' {
-            output.push(character);
-            continue;
-        }
-
-        match characters.peek() {
-            Some('[') => {
-                characters.next();
-                for character in characters.by_ref() {
-                    if ('@'..='~').contains(&character) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                characters.next();
-                while let Some(character) = characters.next() {
-                    if character == '\x07' {
-                        break;
-                    }
-                    if character == '\x1b' && characters.peek() == Some(&'\\') {
-                        characters.next();
-                        break;
-                    }
-                }
-            }
-            Some(_) => {
-                characters.next();
-            }
-            None => {}
-        }
-    }
-
-    output
-}
-
 fn sanitize_stream(raw: &str) -> SanitizedStream {
-    let stripped = strip_ansi(raw);
-    let mut stream = SanitizedStream::default();
-    let mut used_chars = 0usize;
-    let mut in_private_key = false;
-
-    for line in stripped.lines() {
-        if in_private_key {
-            if is_private_key_end(line) {
-                in_private_key = false;
-            }
-            continue;
-        }
-
-        let sanitized = if is_private_key_begin(line) {
-            stream.redacted = true;
-            in_private_key = !is_private_key_end(line);
-            "[redacted private key]".to_string()
-        } else if looks_like_dotenv_line(line) {
-            stream.redacted = true;
-            "[redacted environment line]".to_string()
-        } else if let Some(redacted) = redact_bearer_token(line) {
-            stream.redacted = true;
-            redacted
-        } else if let Some(redacted) = redact_url_password(line) {
-            stream.redacted = true;
-            redacted
-        } else if let Some(redacted) = redact_secret_assignment(line) {
-            stream.redacted = true;
-            redacted
-        } else {
-            strip_line_controls(line)
-        };
-
-        let line_chars = sanitized.chars().count();
-        if used_chars.saturating_add(line_chars).saturating_add(1) > MAX_ARTISAN_STREAM_CHARS {
-            stream.truncated = true;
-            break;
-        }
-
-        stream.text.push_str(&sanitized);
-        stream.text.push('\n');
-        used_chars = used_chars.saturating_add(line_chars).saturating_add(1);
-    }
-
-    if stream.truncated {
-        stream
-            .text
-            .push_str("[output truncated at the ServerDesk display limit]\n");
-    }
-
-    stream
-}
-
-fn strip_line_controls(line: &str) -> String {
-    line.chars()
-        .filter(|character| !character.is_control() || *character == '\t')
-        .collect()
-}
-
-fn is_private_key_begin(line: &str) -> bool {
-    let line = line.trim();
-    line.starts_with("-----BEGIN") && line.contains("PRIVATE KEY")
-}
-
-fn is_private_key_end(line: &str) -> bool {
-    let line = line.trim();
-    line.starts_with("-----END") && line.contains("PRIVATE KEY")
-}
-
-/// Detects a dotenv-style assignment such as `APP_KEY=...` or `export DB_...`.
-///
-/// The whole line is replaced because a `.env` file must never appear in the UI
-/// or logs, including apparently harmless entries.
-fn looks_like_dotenv_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    let candidate = trimmed.strip_prefix("export ").unwrap_or(trimmed);
-    let Some((key, _)) = candidate.split_once('=') else {
-        return false;
+    let redacted = redact_text(raw);
+    let mut stream = SanitizedStream {
+        redacted: redacted.redacted,
+        ..SanitizedStream::default()
     };
-    let key = key.trim();
-    !key.is_empty()
-        && key
+    let mut text = redacted.text;
+
+    if text.chars().count() > MAX_ARTISAN_STREAM_CHARS {
+        stream.truncated = true;
+        text = text
             .chars()
-            .next()
-            .is_some_and(|character| character.is_ascii_uppercase())
-        && key.chars().all(|character| {
-            character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
-        })
-}
-
-fn redact_secret_assignment(line: &str) -> Option<String> {
-    let (index, separator) = line
-        .char_indices()
-        .find(|(_, character)| matches!(character, '=' | ':'))?;
-    let key = line[..index]
-        .trim()
-        .trim_matches(|character| matches!(character, '"' | '\'' | '{' | '[' | ','));
-    let value = &line[index + separator.len_utf8()..];
-    if key.is_empty() || value.trim().is_empty() || !is_secret_key(key) {
-        return None;
+            .take(MAX_ARTISAN_STREAM_CHARS)
+            .collect::<String>();
+        if let Some(index) = text.rfind('\n') {
+            text.truncate(index + 1);
+        } else {
+            text.clear();
+        }
+        text.push_str("[output truncated at the ServerDesk display limit]\n");
     }
 
-    Some(format!(
-        "{}<redacted>",
-        &line[..index + separator.len_utf8()]
-    ))
-}
-
-fn is_secret_key(key: &str) -> bool {
-    let key = key.to_ascii_uppercase();
-    [
-        "PASSWORD",
-        "PASSWD",
-        "SECRET",
-        "TOKEN",
-        "PRIVATE_KEY",
-        "PRIVATE KEY",
-        "API_KEY",
-        "APIKEY",
-        "APP_KEY",
-        "ACCESS_KEY",
-        "CREDENTIAL",
-        "AUTH_KEY",
-        "SIGNING_KEY",
-        "ENCRYPTION_KEY",
-    ]
-    .iter()
-    .any(|needle| key.contains(needle))
-}
-
-fn redact_bearer_token(line: &str) -> Option<String> {
-    let lower = line.to_ascii_lowercase();
-    let index = lower.find("bearer ")?;
-    let value_start = index + "bearer ".len();
-    if line[value_start..].trim().is_empty() {
-        return None;
-    }
-
-    Some(format!("{}<redacted>", &line[..value_start]))
-}
-
-fn redact_url_password(line: &str) -> Option<String> {
-    let scheme = line.find("://")?;
-    let authority_start = scheme + 3;
-    let authority_len = line[authority_start..]
-        .find(['/', '?', '#'])
-        .unwrap_or(line.len() - authority_start);
-    let authority_end = authority_start + authority_len;
-    let at = authority_start + line[authority_start..authority_end].rfind('@')?;
-    let colon = authority_start + line[authority_start..at].find(':')?;
-    if colon + 1 >= at {
-        return None;
-    }
-
-    Some(format!("{}:<redacted>{}", &line[..colon], &line[at..]))
+    stream.text = text;
+    stream
 }
 
 #[cfg(test)]

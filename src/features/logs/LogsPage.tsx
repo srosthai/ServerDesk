@@ -437,6 +437,7 @@ function LogMetadataCard({ tail, pending }: { tail: LogTail; pending: boolean })
               {tail.truncated ? "Truncated" : "Complete tail"}
             </Badge>
             {tail.rotated ? <Badge variant="warning">Rotated</Badge> : null}
+            {tail.secretsRedacted ? <Badge variant="info">Secrets redacted</Badge> : null}
             {pending ? <Badge variant="info">Refreshing</Badge> : null}
             <Badge variant="secondary">
               {tail.sourceKind === "laravel" ? "Laravel log" : "System log"}
