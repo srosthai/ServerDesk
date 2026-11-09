@@ -233,9 +233,22 @@ jobs:
           merge-multiple: true
           path: release-assets
 
+      - name: Prepare release assets and checksums
+        run: |
+          set -euo pipefail
+          flat="$RUNNER_TEMP/serverdesk-release"
+          rm -rf "$flat"
+          mkdir -p "$flat"
+          find release-assets -type f \(             -name '*.deb' -o             -name '*.rpm' -o             -name '*.AppImage' -o             -name '*-setup.exe' -o             -name '*.dmg' -o             -name 'ServerDesk.app.zip'           \) -exec cp {} "$flat/" \;
+          test -n "$(find "$flat" -type f | head -1)"
+          (cd "$flat" && sha256sum * > SHA256SUMS)
+          ls -lh "$flat"
+
       - name: Create draft GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          name: ServerDesk ${{ github.ref_name }}
           draft: true
+          fail_on_unmatched_files: true
           generate_release_notes: true
-          files: release-assets/*
+          files: ${{ runner.temp }}/serverdesk-release/*
