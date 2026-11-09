@@ -397,10 +397,12 @@ fn record_mutation(
     started_at: i64,
     started: Instant,
 ) {
-    let (operation, summary) = match result.action {
+    let created_target = result.target_path.as_deref().unwrap_or(&result.path);
+    let (operation, summary, history_path) = match result.action {
         RemoteMutationAction::CreateFolder => (
             "sftp-create-folder",
-            format!("Created folder {}", result.path),
+            format!("Created folder {created_target}"),
+            created_target,
         ),
         RemoteMutationAction::Rename => (
             "sftp-rename",
@@ -409,6 +411,7 @@ fn record_mutation(
                 result.path,
                 result.target_path.as_deref().unwrap_or("the new name")
             ),
+            result.path.as_str(),
         ),
         RemoteMutationAction::Delete => (
             "sftp-delete",
@@ -417,6 +420,7 @@ fn record_mutation(
             } else {
                 format!("Deleted {}", result.path)
             },
+            result.path.as_str(),
         ),
     };
     let output_summary = result
@@ -444,7 +448,7 @@ fn record_mutation(
             category: OperationCategory::Sftp,
             operation: operation.to_string(),
             safe_summary: summary,
-            path: Some(result.path.clone()),
+            path: Some(history_path.to_string()),
             output_summary,
             result: result_kind,
             exit_code: None,
