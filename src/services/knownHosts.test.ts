@@ -60,6 +60,7 @@ describe("known host service", () => {
     expect(invoke).toHaveBeenNthCalledWith(4, "delete_known_host", {
       id: "server-1",
       keyType: "ssh-ed25519",
+      confirmed: true,
     });
   });
 });

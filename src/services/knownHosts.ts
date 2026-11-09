@@ -40,5 +40,6 @@ export function deleteKnownHost(serverId: string, keyType: string): Promise<void
   return invoke<void>(knownHostCommands.remove, {
     id: serverId,
     keyType,
+    confirmed: true,
   });
 }

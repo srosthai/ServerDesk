@@ -316,7 +316,7 @@ async fn start_stop_and_restart_change_state_and_verify_each_action() {
     assert_eq!(initial.state, ServiceState::Inactive);
     assert_eq!(initial.unit_file_state.as_deref(), Some("enabled"));
 
-    let started = run_service_action(&manager, "fixture-server", UNIT, ServiceAction::Start)
+    let started = run_service_action(&manager, "fixture-server", UNIT, ServiceAction::Start, true)
         .await
         .expect("start the unit");
     assert!(started.succeeded);
@@ -344,7 +344,7 @@ async fn start_stop_and_restart_change_state_and_verify_each_action() {
     assert_eq!(started.state_verified, Some(true));
     assert_eq!(started.connection_state, ConnectionState::Connected);
 
-    let stopped = run_service_action(&manager, "fixture-server", UNIT, ServiceAction::Stop)
+    let stopped = run_service_action(&manager, "fixture-server", UNIT, ServiceAction::Stop, true)
         .await
         .expect("stop the unit");
     assert!(stopped.succeeded);
@@ -355,9 +355,15 @@ async fn start_stop_and_restart_change_state_and_verify_each_action() {
     );
     assert_eq!(stopped.state_verified, Some(true));
 
-    let restarted = run_service_action(&manager, "fixture-server", UNIT, ServiceAction::Restart)
-        .await
-        .expect("restart the unit");
+    let restarted = run_service_action(
+        &manager,
+        "fixture-server",
+        UNIT,
+        ServiceAction::Restart,
+        true,
+    )
+    .await
+    .expect("restart the unit");
     assert!(restarted.succeeded);
     assert_eq!(restarted.stdout, "restarted\n");
     assert_eq!(
@@ -369,9 +375,15 @@ async fn start_stop_and_restart_change_state_and_verify_each_action() {
     );
     assert_eq!(restarted.state_verified, Some(true));
 
-    let inspected = run_service_action(&manager, "fixture-server", UNIT, ServiceAction::Status)
-        .await
-        .expect("inspect through the typed action");
+    let inspected = run_service_action(
+        &manager,
+        "fixture-server",
+        UNIT,
+        ServiceAction::Status,
+        true,
+    )
+    .await
+    .expect("inspect through the typed action");
     assert!(inspected.succeeded);
     assert_eq!(inspected.action, ServiceAction::Status);
     assert_eq!(inspected.state_verified, None);
@@ -405,11 +417,49 @@ async fn start_stop_and_restart_change_state_and_verify_each_action() {
 }
 
 #[tokio::test]
+async fn stop_and_restart_fail_closed_without_confirmation() {
+    let fixture = FixtureServer::start(FixtureMode::Normal, true).await;
+    let manager = connect(&fixture).await;
+
+    for action in [ServiceAction::Stop, ServiceAction::Restart] {
+        let error = run_service_action(&manager, "fixture-server", UNIT, action, false)
+            .await
+            .expect_err("destructive action must be rejected");
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.message.contains("explicit confirmation"));
+        assert!(error.message.contains(UNIT));
+        assert!(error.message.contains("fixture-server"));
+    }
+
+    assert_eq!(
+        fixture.executed(),
+        vec!["true".to_string()],
+        "no service command may be sent before confirmation"
+    );
+
+    let inspected = run_service_action(
+        &manager,
+        "fixture-server",
+        UNIT,
+        ServiceAction::Status,
+        false,
+    )
+    .await
+    .expect("status remains read-only");
+    assert!(inspected.succeeded);
+
+    manager
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+}
+
+#[tokio::test]
 async fn permission_denial_is_a_typed_error_with_scoped_sudo_guidance_and_output() {
     let fixture = FixtureServer::start(FixtureMode::DenySudo, false).await;
     let manager = connect(&fixture).await;
 
-    let denied = run_service_action(&manager, "fixture-server", UNIT, ServiceAction::Start)
+    let denied = run_service_action(&manager, "fixture-server", UNIT, ServiceAction::Start, true)
         .await
         .expect("command-level denial is a structured result");
 
@@ -460,7 +510,7 @@ async fn failed_action_preserves_output_exit_status_and_verified_state() {
     let fixture = FixtureServer::start(FixtureMode::FailAction, false).await;
     let manager = connect(&fixture).await;
 
-    let failed = run_service_action(&manager, "fixture-server", UNIT, ServiceAction::Start)
+    let failed = run_service_action(&manager, "fixture-server", UNIT, ServiceAction::Start, true)
         .await
         .expect("command-level failure is a structured result");
 
@@ -500,9 +550,15 @@ async fn invalid_unit_names_are_rejected_before_any_remote_command() {
         "nginx.socket",
         "$(reboot).service",
     ] {
-        let error = run_service_action(&manager, "fixture-server", invalid, ServiceAction::Start)
-            .await
-            .expect_err("invalid units must never reach the server");
+        let error = run_service_action(
+            &manager,
+            "fixture-server",
+            invalid,
+            ServiceAction::Start,
+            true,
+        )
+        .await
+        .expect_err("invalid units must never reach the server");
         assert_eq!(error.code, ErrorCode::Validation, "{invalid:?}");
     }
 

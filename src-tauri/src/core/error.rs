@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::Serialize;
 
-use crate::storage::StorageError;
+use crate::{core::redaction::redact_text, storage::StorageError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,13 +36,13 @@ impl AppError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
-            message: message.into(),
+            message: sanitize_diagnostic(message.into()),
             details: None,
         }
     }
 
     pub fn with_details(mut self, details: impl Into<String>) -> Self {
-        self.details = Some(details.into());
+        self.details = Some(sanitize_diagnostic(details.into()));
         self
     }
 
@@ -111,6 +111,12 @@ impl fmt::Display for AppError {
 
 impl std::error::Error for AppError {}
 
+/// Redacts known secret patterns at the error boundary so diagnostics and
+/// crash-report-style dumps can never contain credentials.
+fn sanitize_diagnostic(value: String) -> String {
+    redact_text(&value).text.trim_end().to_string()
+}
+
 impl From<StorageError> for AppError {
     fn from(error: StorageError) -> Self {
         Self::new(ErrorCode::Storage, "Local storage error").with_details(error.to_string())
@@ -137,6 +143,31 @@ mod tests {
 
         assert_eq!(value["code"], "validation");
         assert!(value.get("details").is_none());
+    }
+
+    #[test]
+    fn redacts_secrets_at_the_error_boundary() {
+        let error = AppError::remote("Remote command failed: DB_PASSWORD=hunter2")
+            .with_details(
+                "APP_KEY=base64:super-secret\nAuthorization: Bearer abc123\n                 https://deploy:url-secret@example.test/app\nghp_1234567890abcdef",
+            );
+        let debug = format!("{error:?}");
+        let serialized = serde_json::to_string(&error).expect("serialized error");
+
+        for secret in [
+            "hunter2",
+            "base64:super-secret",
+            "abc123",
+            "url-secret",
+            "ghp_1234567890abcdef",
+        ] {
+            assert!(!debug.contains(secret), "{secret:?} leaked in debug output");
+            assert!(
+                !serialized.contains(secret),
+                "{secret:?} leaked in serialized error"
+            );
+        }
+        assert!(debug.contains("<redacted>"));
     }
 
     #[test]

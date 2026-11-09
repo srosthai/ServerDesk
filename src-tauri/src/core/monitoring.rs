@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::core::{
     AppError,
+    redaction::redact_text,
     ssh::{CommandOutput, ConnectionManager, ConnectionState},
 };
 
@@ -312,7 +313,7 @@ fn failure_detail(command: &str, output: &CommandOutput) -> String {
         .stderr
         .lines()
         .find(|line| !line.trim().is_empty())
-        .map(|line| bounded_detail(line.trim()))
+        .map(|line| bounded_detail(redact_text(line.trim()).text.trim()))
         .unwrap_or_default();
 
     if stderr.is_empty() {

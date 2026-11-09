@@ -776,7 +776,7 @@ function ServicesPage() {
       return;
     }
 
-    void runAction(selectedServerId, unit, action);
+    void runAction(selectedServerId, unit, action, false);
   };
 
   const selectServer = (serverId: string) => {
@@ -1026,7 +1026,7 @@ function ServicesPage() {
                 return;
               }
               const { unit, action } = pendingAction;
-              void runAction(selectedServerId, unit, action);
+              void runAction(selectedServerId, unit, action, true);
               setPendingAction(null);
             }}
           />

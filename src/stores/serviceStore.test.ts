@@ -194,10 +194,10 @@ describe("service store", () => {
     vi.mocked(runServiceAction).mockResolvedValue(actionResult());
 
     await expect(
-      useServiceStore.getState().runAction("server-1", "nginx.service", "stop"),
+      useServiceStore.getState().runAction("server-1", "nginx.service", "stop", true),
     ).resolves.toBe(true);
 
-    expect(runServiceAction).toHaveBeenCalledWith("server-1", "nginx.service", "stop");
+    expect(runServiceAction).toHaveBeenCalledWith("server-1", "nginx.service", "stop", true);
     expect(getSystemdServices).toHaveBeenCalledTimes(2);
     const actionEntry = useServiceStore.getState().actions["server-1"];
     expect(actionEntry?.pending).toBeNull();
@@ -227,7 +227,7 @@ describe("service store", () => {
     vi.mocked(runServiceAction).mockResolvedValue(actionResult());
 
     await expect(
-      useServiceStore.getState().runAction("server-1", "nginx.service", "stop"),
+      useServiceStore.getState().runAction("server-1", "nginx.service", "stop", true),
     ).resolves.toBe(true);
 
     const actionEntry = useServiceStore.getState().actions["server-1"];
@@ -271,7 +271,7 @@ describe("service store", () => {
     );
 
     await expect(
-      useServiceStore.getState().runAction("server-1", "nginx.service", "start"),
+      useServiceStore.getState().runAction("server-1", "nginx.service", "start", false),
     ).resolves.toBe(false);
 
     const result = useServiceStore.getState().actions["server-1"]?.result;
@@ -294,7 +294,7 @@ describe("service store", () => {
       }),
     );
 
-    await useServiceStore.getState().runAction("server-1", "nginx.service", "stop");
+    await useServiceStore.getState().runAction("server-1", "nginx.service", "stop", true);
 
     const nginx = useServiceStore
       .getState()
@@ -316,7 +316,7 @@ describe("service store", () => {
     });
 
     await expect(
-      useServiceStore.getState().runAction("server-1", "nginx.service", "restart"),
+      useServiceStore.getState().runAction("server-1", "nginx.service", "restart", true),
     ).resolves.toBe(false);
 
     const actionEntry = useServiceStore.getState().actions["server-1"];

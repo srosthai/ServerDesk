@@ -341,7 +341,7 @@ describe("ServicesPage", () => {
     await user.click(within(restartDialog).getByRole("button", { name: "Restart unit" }));
 
     await waitFor(() => {
-      expect(runServiceAction).toHaveBeenCalledWith(server.id, "nginx.service", "restart");
+      expect(runServiceAction).toHaveBeenCalledWith(server.id, "nginx.service", "restart", true);
     });
   });
 
@@ -355,13 +355,13 @@ describe("ServicesPage", () => {
 
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     await waitFor(() => {
-      expect(runServiceAction).toHaveBeenCalledWith(server.id, "nginx.service", "start");
+      expect(runServiceAction).toHaveBeenCalledWith(server.id, "nginx.service", "start", false);
     });
 
     await user.click(screen.getByLabelText("Inspect nginx.service"));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     await waitFor(() => {
-      expect(runServiceAction).toHaveBeenCalledWith(server.id, "nginx.service", "status");
+      expect(runServiceAction).toHaveBeenCalledWith(server.id, "nginx.service", "status", false);
     });
   });
 
