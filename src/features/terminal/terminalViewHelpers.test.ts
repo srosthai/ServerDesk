@@ -3,7 +3,7 @@ import {
   measureTerminalSize,
   stripAnsi,
   terminalKeySequence,
-} from "@/features/terminal/terminalView";
+} from "@/features/terminal/terminalViewHelpers";
 
 function key(key: string, overrides: Partial<Parameters<typeof terminalKeySequence>[0]> = {}) {
   return terminalKeySequence({
