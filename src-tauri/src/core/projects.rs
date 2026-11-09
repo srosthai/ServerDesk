@@ -20,6 +20,11 @@ use serde::Serialize;
 use crate::{
     core::{
         AppError,
+        command::{
+            browse_directories_command, laravel_package_command as package_command,
+            project_probe_command as probe_command, queue_connection_command as queue_command,
+            scheduler_cron_command as cron_command,
+        },
         ssh::{CommandOutput, ConnectionManager, ConnectionState},
     },
     storage::{OperationRecord, Project},
@@ -157,56 +162,29 @@ fn invalid_path_error(message: &str) -> AppError {
     )
 }
 
-/// Quotes one value as a single POSIX shell argument.
-///
-/// The path validator has already rejected control characters. This function
-/// keeps spaces, quotes, and other printable characters usable without ever
-/// letting them escape the argument.
-pub(crate) fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 /// The fixed command used to list immediate child directories.
 pub fn browse_command(path: &RemotePath) -> String {
-    format!(
-        "find {} -mindepth 1 -maxdepth 1 \\( -type d -o -xtype d \\) -print0",
-        shell_quote(path.as_str())
-    )
+    browse_directories_command(path.as_str())
 }
 
 /// The fixed command used to probe one candidate project path.
 pub fn project_probe_command(path: &RemotePath) -> String {
-    let path = shell_quote(path.as_str());
-    format!(
-        "if [ -d {path} ]; then echo __directory__; else echo __missing__; fi; \
-         if [ -f {path}/artisan ]; then echo artisan; fi; \
-         if [ -f {path}/composer.json ]; then echo composer.json; fi; \
-         if [ -d {path}/bootstrap ]; then echo bootstrap; fi; \
-         if [ -d {path}/storage ]; then echo storage; fi; \
-         if [ -f {path}/routes/console.php ]; then echo routes/console.php; fi; \
-         if [ -f {path}/app/Console/Kernel.php ]; then echo app/Console/Kernel.php; fi; \
-         if [ -f {path}/config/queue.php ]; then echo config/queue.php; fi"
-    )
+    probe_command(path.as_str())
 }
 
 /// The fixed command used to read Composer's installed package metadata.
 pub fn laravel_package_command(path: &RemotePath) -> String {
-    let path = shell_quote(path.as_str());
-    format!(
-        "if [ -f {path}/vendor/composer/installed.json ]; then cat {path}/vendor/composer/installed.json; fi"
-    )
+    package_command(path.as_str())
 }
 
 /// The fixed command used to read only the queue connection name from `.env`.
 pub fn queue_connection_command(path: &RemotePath) -> String {
-    let path = shell_quote(path.as_str());
-    format!("if [ -f {path}/.env ]; then sed -n 's/^QUEUE_CONNECTION=//p' {path}/.env; fi")
+    queue_command(path.as_str())
 }
 
 /// The fixed command used to find a schedule:run cron entry for this path.
 pub fn scheduler_cron_command(path: &RemotePath) -> String {
-    let path = shell_quote(path.as_str());
-    format!("crontab -l 2>/dev/null | grep -F -- 'schedule:run' | grep -F -- {path} || true")
+    cron_command(path.as_str())
 }
 
 /// One immediate child directory of a browsed path.
@@ -883,6 +861,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::core::command::shell_quote;
 
     #[test]
     fn normalizes_absolute_paths_and_rejects_unsafe_forms() {

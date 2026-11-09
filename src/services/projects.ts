@@ -53,5 +53,5 @@ export function runProjectArtisanAction(
 }
 
 export function deleteProject(projectId: string): Promise<void> {
-  return invoke<void>(projectCommands.delete, { id: projectId });
+  return invoke<void>(projectCommands.delete, { id: projectId, confirmed: true });
 }

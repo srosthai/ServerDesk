@@ -24,6 +24,7 @@ export function runServiceAction(
   id: string,
   unit: string,
   action: ServiceActionName,
+  confirmed: boolean,
 ): Promise<ServiceActionResult> {
-  return invoke<ServiceActionResult>(serviceCommands.action, { id, unit, action });
+  return invoke<ServiceActionResult>(serviceCommands.action, { id, unit, action, confirmed });
 }

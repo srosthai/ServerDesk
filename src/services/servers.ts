@@ -26,5 +26,5 @@ export function updateServer(id: string, input: ServerProfileInput): Promise<Ser
 }
 
 export function deleteServer(id: string): Promise<void> {
-  return invoke<void>(serverCommands.delete, { id });
+  return invoke<void>(serverCommands.delete, { id, confirmed: true });
 }

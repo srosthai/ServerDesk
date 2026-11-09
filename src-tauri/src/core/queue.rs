@@ -17,6 +17,7 @@ use serde::Serialize;
 
 use crate::core::{
     AppError, ErrorCode,
+    redaction::redact_text,
     ssh::{CommandOutput, ConnectionManager, ConnectionState},
 };
 
@@ -406,7 +407,8 @@ fn is_unavailable_detection_error(error: &AppError) -> bool {
 }
 
 fn bounded_error_message(message: &str) -> String {
-    message
+    redact_text(message)
+        .text
         .chars()
         .filter(|character| !character.is_control() || *character == '\t')
         .take(MAX_DETAIL_CHARS)
@@ -645,7 +647,9 @@ fn failure_detail(output: &CommandOutput) -> String {
         .lines()
         .find(|line| !line.trim().is_empty())
         .map(|line| {
-            line.chars()
+            redact_text(line)
+                .text
+                .chars()
                 .filter(|character| !character.is_control() || *character == '\t')
                 .take(MAX_DETAIL_CHARS)
                 .collect::<String>()

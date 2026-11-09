@@ -50,6 +50,10 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 GitHub Actions runs the frontend and Rust checks on pushes and pull requests to `dev`, `production`, and `main`.
 
+## Security
+
+The security model, command-construction rules, confirmation matrix, redaction patterns, and accepted risks are documented in [docs/security.md](docs/security.md). The dedicated Rust security suite is `src-tauri/tests/security.rs`.
+
 ## Credentials
 
 SSH passwords and private key material are stored in the operating system credential store through the Rust keyring integration. SQLite stores only a credential reference. Secret input is available in the desktop build, not the browser preview.
@@ -116,7 +120,7 @@ The Services table is built for large unit lists: free-text filtering covers uni
 
 ## Verified service actions
 
-Status inspection, start, stop, and restart use fixed command templates and a validated unit name. Actions run through non-interactive, narrowly scoped sudo: `/usr/bin/sudo -n -- /usr/bin/systemctl <verb> -- <unit>`, and status uses the same non-interactive path with `systemctl show`. The SSH account is expected to be a dedicated non-root account. ServerDesk never prompts for a sudo password and never assumes unrestricted sudo. If sudo denies an action, the result includes the exact `NOPASSWD` sudoers rule for that single unit, plus the remote stdout, stderr, and exit status.
+Status inspection, start, stop, and restart use fixed command templates and a validated unit name. Actions run through non-interactive, narrowly scoped sudo: `/usr/bin/sudo -n -- /usr/bin/systemctl <verb> -- <unit>`, and status uses the same non-interactive path with `systemctl show`. The SSH account is expected to be a dedicated non-root account. ServerDesk never prompts for a sudo password and never assumes unrestricted sudo. Stop and restart are rejected by the Rust backend unless the request carries explicit confirmation, and the confirmation dialog names the server, unit, and operation. If sudo denies an action, the result includes the exact `NOPASSWD` sudoers rule for that single unit, plus the remote stdout, stderr, and exit status.
 
 After every action the unit is queried again with `systemctl show`, then the unit list is refreshed so counts, unaffected rows, and the sample time stay in sync. The UI updates the row from the verified re-query and labels the result as verified, mismatched, or unverified; a zero exit status alone is never treated as proof that the service reached the requested state. The result panel shows the exact command, exit status, duration, stdout, and stderr in one terminal-like panel whose Copy action copies the whole transcript. Action output, exit code, and duration are returned to the UI and kept in memory only. They are never written to SQLite or logs. Invalid unit names, including shell operators, whitespace, slashes, option-like names, and non-`.service` units, are rejected before any remote command is sent. There is no generic shell command endpoint.
 
@@ -147,7 +151,7 @@ The project dashboard exposes a closed allowlist of fixed commands: `about`, `ro
 
 Every card shows the exact command and working directory before a button can run it. Cache clears, config cache changes, optimize, and queue restart require an explicit confirmation dialog that repeats the server, target path, and command. The backend independently rejects a destructive action unless the request includes confirmation, so bypassing the UI cannot run one. `queue:restart` is described as a graceful Laravel worker restart, not a Supervisor or systemd restart.
 
-Action output is bounded to 64 KiB per command and each stream is shortened at a display limit while the exit status, stdout, stderr, and duration stay visible. ANSI escapes are stripped. Environment-style lines, secret assignments, bearer tokens, credentialed URLs, and private-key blocks are redacted before output reaches the UI or local history. Operation history stores only the fixed action name and a safe summary with the target path and exit status; it never stores raw output or `.env` values.
+Action output is bounded to 64 KiB per command and each stream is shortened at a display limit while the exit status, stdout, stderr, and duration stay visible. ANSI escapes are stripped. Environment-style lines, secret assignments, bearer tokens, credentialed URLs, common token prefixes, and private-key blocks are redacted by the central redactor before output reaches the UI or local history. Operation history stores only the fixed action name and a safe summary with the target path and exit status; it never stores raw output or `.env` values.
 
 ## Operation history
 
@@ -163,7 +167,7 @@ The Logs page reads only a bounded tail from approved remote log locations. Syst
 
 Each request uses one fixed shell template with a quoted path and `tail -c` bounded to 64 KiB. The Rust side then keeps at most 2,000 lines (200 by default) and reports a typed `available`, `missing`, `not_file`, `unreadable`, or `unavailable` result. The result carries the requested and resolved remote path, retrieval time, duration, file size, returned line and byte counts, truncation flags, and whether the file rotated during the read. A partial first line from a byte-bounded tail is dropped and disclosed instead of displayed as corrupted text.
 
-The page shows the remote path and retrieval time beside every tail, supports refresh, and filters the already retrieved text locally without another remote read. Missing files, permission errors, non-regular files, rotation, and truncation are shown as explicit alerts. ServerDesk does not use sudo to read logs, and raw log content is kept in memory only.
+The page shows the remote path and retrieval time beside every tail, supports refresh, and filters the already retrieved text locally without another remote read. Missing files, permission errors, non-regular files, rotation, and truncation are shown as explicit alerts. Known secret patterns are redacted from the returned tail, and a `Secrets redacted` badge discloses when that happened. ServerDesk does not use sudo to read logs, and raw log content is kept in memory only.
 
 ## Command contracts
 

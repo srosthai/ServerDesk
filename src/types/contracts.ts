@@ -511,6 +511,7 @@ export type LogTail = {
   truncatedBytes: boolean;
   truncatedLines: boolean;
   partialFirstLine: boolean;
+  secretsRedacted: boolean;
   rotated: boolean;
   rotationDetail: string | null;
   retrievedAt: number;

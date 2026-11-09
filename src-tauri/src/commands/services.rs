@@ -43,11 +43,12 @@ pub async fn run_service_action(
     id: String,
     unit: String,
     action: ServiceAction,
+    confirmed: bool,
 ) -> Result<ServiceActionResult, AppError> {
     let started_at = now_unix_seconds();
     let started = Instant::now();
     let operation = format!("service-{}", action.as_str());
-    let outcome = run_action(manager.inner().as_ref(), &id, &unit, action).await;
+    let outcome = run_action(manager.inner().as_ref(), &id, &unit, action, confirmed).await;
     let elapsed_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
 
     match outcome {
