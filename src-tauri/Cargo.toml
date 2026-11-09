@@ -22,6 +22,7 @@ thiserror = "2.0.21"
 uuid = { version = "1.29.1", features = ["v4"] }
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 async-trait = "0.1.92"
+base64 = "0.23.1"
 russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"] }
 tokio = { version = "1.54.1", features = ["macros", "net", "rt", "sync", "time"] }
 

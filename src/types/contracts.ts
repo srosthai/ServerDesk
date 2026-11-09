@@ -393,6 +393,40 @@ export type LogTail = {
   connectionState: ConnectionState;
 };
 
+export type TerminalSize = {
+  cols: number;
+  rows: number;
+  pixelWidth: number;
+  pixelHeight: number;
+};
+
+export type TerminalSessionInfo = {
+  sessionId: string;
+  serverId: string;
+  term: string;
+  cols: number;
+  rows: number;
+  openedAt: number;
+};
+
+export type TerminalExitReason = "remote-exit" | "closed" | "disconnected" | "error";
+
+export type TerminalEvent =
+  | {
+      type: "output";
+      sessionId: string;
+      sequence: number;
+      data: string;
+    }
+  | {
+      type: "exited";
+      sessionId: string;
+      sequence: number;
+      reason: TerminalExitReason;
+      exitCode: number | null;
+      message: string | null;
+    };
+
 export type ServerProfile = {
   id: string;
   name: string;

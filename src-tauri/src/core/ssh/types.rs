@@ -2,7 +2,10 @@ use std::{fmt, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::{AppError, ErrorCode};
+use crate::core::{
+    AppError, ErrorCode,
+    terminal::{TerminalChannel, TerminalOptions},
+};
 
 pub const CONNECTION_STATE_EVENT: &str = "connection-state-changed";
 
@@ -236,6 +239,20 @@ pub trait SshSession: Send + Sync {
             ));
         }
         Ok(output)
+    }
+
+    /// Opens a dedicated PTY-backed interactive shell channel on this session.
+    ///
+    /// Implementations that cannot provide an interactive terminal keep the
+    /// default typed failure. The returned channel is independent from other
+    /// command executions on the same SSH session.
+    async fn open_terminal(
+        &self,
+        _options: TerminalOptions,
+    ) -> Result<std::sync::Arc<dyn TerminalChannel>, TransportError> {
+        Err(TransportError::Remote(
+            "This SSH session does not support an interactive terminal.".to_string(),
+        ))
     }
 
     async fn is_healthy(&self) -> bool;
