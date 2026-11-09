@@ -151,6 +151,21 @@ export const useTerminalStore = create<TerminalStore>((set, get) => {
 
       try {
         await resizeTerminalService(sessionId, size);
+        set((state) => {
+          const current = state.sessions[sessionId];
+          if (!current || (current.info.cols === size.cols && current.info.rows === size.rows)) {
+            return state;
+          }
+          return {
+            sessions: {
+              ...state.sessions,
+              [sessionId]: {
+                ...current,
+                info: { ...current.info, cols: size.cols, rows: size.rows },
+              },
+            },
+          };
+        });
         return true;
       } catch (error) {
         set((state) => ({

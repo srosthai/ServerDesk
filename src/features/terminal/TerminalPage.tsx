@@ -1,7 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import {
+  ArrowClockwiseIcon,
   CircleNotchIcon,
+  LinkBreakIcon,
+  PlusIcon,
   TerminalWindowIcon,
   WarningCircleIcon,
   XIcon,
@@ -19,11 +22,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { ErrorState, LoadingState } from "@/components/ui/states";
-import {
-  measureTerminalSize,
-  stripAnsi,
-  terminalKeySequence,
-} from "@/features/terminal/terminalView";
+import { StatusBadge } from "@/components/ui/status-badge";
+import { TerminalView } from "@/features/terminal/TerminalView";
+import { cn } from "@/lib/utils";
 import { isTauriRuntime } from "@/lib/tauri";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useServerStore } from "@/stores/serverStore";
@@ -37,16 +38,39 @@ const exitLabels: Record<TerminalExitReason, string> = {
   error: "Terminal error",
 };
 
-function sessionBadge(session: TerminalSessionState) {
-  if (session.status === "open") {
-    return <Badge variant="success">Live</Badge>;
+const exitShortLabels: Record<TerminalExitReason, string> = {
+  "remote-exit": "Exited",
+  closed: "Closed",
+  disconnected: "Disconnected",
+  error: "Error",
+};
+
+function exitDescription(session: TerminalSessionState): string {
+  const reason = session.exitReason ? exitLabels[session.exitReason] : "Terminal session ended";
+  if (session.exitReason === "remote-exit" && session.exitCode !== null) {
+    return `${reason} with exit code ${session.exitCode}.`;
   }
+  return `${reason}.`;
+}
+
+function sessionBadge(session: TerminalSessionState, connected: boolean) {
+  if (session.status === "open") {
+    return connected ? (
+      <Badge variant="success">Live</Badge>
+    ) : (
+      <Badge variant="warning">Offline</Badge>
+    );
+  }
+
   const reason = session.exitReason ? exitLabels[session.exitReason] : "Exited";
   const code =
     session.exitReason === "remote-exit" && session.exitCode !== null
       ? ` · code ${session.exitCode}`
       : "";
-  return <Badge variant="outline">{`${reason}${code}`}</Badge>;
+  const variant =
+    session.exitReason === "error" || session.exitReason === "disconnected" ? "warning" : "outline";
+
+  return <Badge variant={variant}>{`${reason}${code}`}</Badge>;
 }
 
 function TerminalToolbar({
@@ -102,7 +126,12 @@ function TerminalPage() {
   const servers = useServerStore((state) => state.servers);
   const serverStatus = useServerStore((state) => state.status);
   const fetchServers = useServerStore((state) => state.fetchServers);
+
   const connections = useConnectionStore((state) => state.connections);
+  const connectionBusy = useConnectionStore((state) => state.busy);
+  const refreshConnectionStates = useConnectionStore((state) => state.refreshStates);
+  const connect = useConnectionStore((state) => state.connect);
+
   const sessions = useTerminalStore((state) => state.sessions);
   const openingByServer = useTerminalStore((state) => state.openingByServer);
   const activeByServer = useTerminalStore((state) => state.activeByServer);
@@ -116,8 +145,6 @@ function TerminalPage() {
   const clearError = useTerminalStore((state) => state.clearError);
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const outputRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     if (serverStatus === "idle") {
@@ -125,8 +152,19 @@ function TerminalPage() {
     }
   }, [fetchServers, serverStatus]);
 
+  useEffect(() => {
+    if (serverStatus === "ready" && servers.length > 0) {
+      void refreshConnectionStates(servers.map((server) => server.id));
+    }
+  }, [refreshConnectionStates, serverStatus, servers]);
+
   const selected = servers.find((server) => server.id === selectedId) ?? servers[0] ?? null;
-  const connected = selected ? connections[selected.id]?.state === "connected" : false;
+  const connection = selected ? connections[selected.id] : undefined;
+  const connectionState = connection?.state ?? "disconnected";
+  const connected = connectionState === "connected";
+  const busy = selected ? Boolean(connectionBusy[selected.id]) : false;
+  const opening = selected ? Boolean(openingByServer[selected.id]) : false;
+
   const serverSessions = useMemo(
     () =>
       Object.values(sessions)
@@ -134,49 +172,15 @@ function TerminalPage() {
         .sort((left, right) => left.info.openedAt - right.info.openedAt),
     [selected?.id, sessions],
   );
-  const activeSessionId =
-    activeByServer[selected?.id ?? ""] ?? serverSessions[0]?.info.sessionId ?? null;
+  const preferredSessionId = activeByServer[selected?.id ?? ""] ?? null;
+  const activeSessionId = serverSessions.some(
+    (session) => session.info.sessionId === preferredSessionId,
+  )
+    ? preferredSessionId
+    : (serverSessions[0]?.info.sessionId ?? null);
   const activeSession = activeSessionId ? sessions[activeSessionId] : null;
-  const preview = useMemo(
-    () => (activeSession ? stripAnsi(activeSession.output) : ""),
-    [activeSession],
-  );
-
-  useEffect(() => {
-    const element = outputRef.current;
-    if (element) {
-      element.scrollTop = element.scrollHeight;
-    }
-  }, [preview]);
-
-  useEffect(() => {
-    if (activeSession?.status === "open") {
-      inputRef.current?.focus();
-    }
-  }, [activeSession?.status, activeSessionId]);
-
-  useEffect(() => {
-    const element = outputRef.current;
-    if (!element || !activeSessionId || activeSession?.status !== "open") {
-      return;
-    }
-
-    let lastSize = "";
-    const resize = () => {
-      const size = measureTerminalSize(element.clientWidth, element.clientHeight);
-      const key = `${size.cols}x${size.rows}`;
-      if (key === lastSize) {
-        return;
-      }
-      lastSize = key;
-      void resizeSession(activeSessionId, size);
-    };
-
-    resize();
-    const observer = new ResizeObserver(resize);
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [activeSession?.status, activeSessionId, resizeSession]);
+  const connectionLost = Boolean(selected && !connected && serverSessions.length > 0);
+  const connectionError = connection?.error?.message ?? null;
 
   const handleOpen = async () => {
     if (!selected) {
@@ -192,7 +196,21 @@ function TerminalPage() {
   };
 
   const handleCloseSession = async (sessionId: string) => {
-    await closeSession(sessionId);
+    const session = useTerminalStore.getState().sessions[sessionId];
+    if (session?.status === "open") {
+      const closed = await closeSession(sessionId);
+      if (!closed) {
+        return;
+      }
+    }
+    dismissSession(sessionId);
+  };
+
+  const handleReconnect = async () => {
+    if (!selected) {
+      return;
+    }
+    await connect(selected.id);
   };
 
   if (!isTauriRuntime()) {
@@ -219,14 +237,14 @@ function TerminalPage() {
     <div className="space-y-5">
       <PageHeader
         title="Terminal"
-        description="Open a dedicated PTY-backed shell on a connected server. Resize events and ANSI output are forwarded to the remote terminal."
+        description="Open dedicated xterm.js shells on a connected server. ANSI colors, cursor movement, selection, and scrollback are rendered locally while input and resize events are forwarded to the remote PTY."
       />
 
       <TerminalToolbar
         servers={servers}
         selected={selected}
         connected={connected}
-        opening={selected ? Boolean(openingByServer[selected.id]) : false}
+        opening={opening}
         onSelect={setSelectedId}
         onOpen={() => {
           void handleOpen();
@@ -269,169 +287,301 @@ function TerminalPage() {
         />
       ) : null}
 
-      {selected && !connected ? (
-        <Alert variant="info">
-          <WarningCircleIcon className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-          <div>
-            <AlertTitle>Server is not connected</AlertTitle>
+      {connectionLost && selected ? (
+        <Alert variant="warning">
+          <LinkBreakIcon className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden="true" />
+          <div className="min-w-0 flex-1">
+            <AlertTitle>
+              {connectionState === "reconnecting" ? "Reconnecting" : "Connection lost"}
+            </AlertTitle>
             <AlertDescription>
-              Connect to {selected.name} before opening a terminal. Terminal sessions share the
-              managed SSH connection but use independent channels.
+              {connectionError ??
+                `${selected.name} is not connected. Existing shells can no longer receive input. Reconnect deliberately before opening another shell.`}
             </AlertDescription>
           </div>
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={
+              busy || connectionState === "connecting" || connectionState === "reconnecting"
+            }
+            onClick={() => {
+              void handleReconnect();
+            }}
+          >
+            {busy ? (
+              <CircleNotchIcon className="animate-spin" aria-hidden="true" />
+            ) : (
+              <ArrowClockwiseIcon aria-hidden="true" />
+            )}
+            Reconnect
+          </Button>
+        </Alert>
+      ) : null}
+
+      {selected && !connected && !connectionLost ? (
+        <Alert variant="info">
+          <WarningCircleIcon className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+          <div className="min-w-0 flex-1">
+            <AlertTitle>Server is not connected</AlertTitle>
+            <AlertDescription>
+              {connectionError ??
+                `Connect to ${selected.name} before opening a terminal. Terminal sessions share the managed SSH connection but use independent channels.`}
+            </AlertDescription>
+          </div>
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={
+              busy || connectionState === "connecting" || connectionState === "reconnecting"
+            }
+            onClick={() => {
+              void handleReconnect();
+            }}
+          >
+            {busy ? (
+              <CircleNotchIcon className="animate-spin" aria-hidden="true" />
+            ) : (
+              <ArrowClockwiseIcon aria-hidden="true" />
+            )}
+            {connectionState === "reconnecting" ? "Reconnecting" : "Connect"}
+          </Button>
         </Alert>
       ) : null}
 
       {selected && (connected || serverSessions.length > 0) ? (
-        <section className="overflow-hidden rounded-lg border border-border bg-card">
-          <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2">
-            <TerminalWindowIcon className="size-4 text-muted-foreground" aria-hidden="true" />
-            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
+        <section className="overflow-hidden rounded-xl border border-border bg-card shadow-sm">
+          <header className="flex flex-wrap items-center gap-3 border-b border-border bg-muted/30 px-4 py-3">
+            <div className="grid size-9 shrink-0 place-items-center rounded-md border border-border bg-card text-muted-foreground">
+              <TerminalWindowIcon className="size-4" aria-hidden="true" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="truncate text-[14px] font-semibold tracking-[-0.01em]">
+                  {selected.name}
+                </h2>
+                <StatusBadge state={connectionState} />
+                {activeSession ? sessionBadge(activeSession, connected) : null}
+              </div>
+              <p className="truncate font-mono text-[11px] leading-5 text-muted-foreground">
+                {selected.username}@{selected.host}:{selected.port}
+                {activeSession ? ` · ${activeSession.info.term}` : ""}
+              </p>
+            </div>
+            <div className="text-right text-[11px] leading-5 text-muted-foreground">
+              <div>
+                {serverSessions.length} {serverSessions.length === 1 ? "shell" : "shells"}
+              </div>
+              <div className="font-mono text-[10px]">
+                {activeSession
+                  ? `${activeSession.info.cols}×${activeSession.info.rows} cols/rows`
+                  : "No session"}
+              </div>
+            </div>
+          </header>
+
+          <div className="flex items-stretch border-b border-[#1e2a23] bg-[#0b1511]">
+            <div
+              role="tablist"
+              aria-label={`Terminal sessions for ${selected.name}`}
+              className="flex min-w-0 flex-1 overflow-x-auto"
+            >
               {serverSessions.length === 0 ? (
-                <span className="text-[12px] text-muted-foreground">No open sessions</span>
+                <span className="flex items-center px-4 py-2 text-[11px] text-[#7f9188]">
+                  No open sessions
+                </span>
               ) : (
                 serverSessions.map((session, index) => {
                   const active = session.info.sessionId === activeSessionId;
+                  const label = `Shell ${index + 1}`;
                   return (
-                    <button
+                    <div
                       key={session.info.sessionId}
-                      type="button"
-                      className={
-                        active
-                          ? "rounded-sm border border-primary/35 bg-primary/10 px-2 py-1 text-[11px] font-medium text-foreground"
-                          : "rounded-sm border border-transparent px-2 py-1 text-[11px] text-muted-foreground hover:border-border hover:text-foreground"
-                      }
-                      onClick={() => handleSelectSession(session.info.sessionId)}
+                      className={cn(
+                        "flex shrink-0 items-stretch border-r border-white/10",
+                        active ? "bg-[#07100c] shadow-[inset_0_2px_0_#f08a4b]" : "hover:bg-white/5",
+                      )}
                     >
-                      {`${index + 1}: ${session.info.cols}×${session.info.rows}`}
-                    </button>
+                      <button
+                        type="button"
+                        role="tab"
+                        id={`terminal-tab-${session.info.sessionId}`}
+                        aria-selected={active}
+                        aria-controls={`terminal-panel-${session.info.sessionId}`}
+                        tabIndex={active ? 0 : -1}
+                        className="flex min-w-[138px] items-center gap-2 px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-[#f08a4b]/60"
+                        onClick={() => handleSelectSession(session.info.sessionId)}
+                      >
+                        <span
+                          aria-hidden="true"
+                          className={cn(
+                            "size-1.5 shrink-0 rounded-full",
+                            session.status === "open"
+                              ? connected
+                                ? "bg-[#5bc46d]"
+                                : "bg-[#e7a33d]"
+                              : session.exitReason === "error" ||
+                                  session.exitReason === "disconnected"
+                                ? "bg-[#e7a33d]"
+                                : "bg-[#6f8177]",
+                          )}
+                        />
+                        <span className="min-w-0">
+                          <span
+                            className={cn(
+                              "block truncate text-[11px] font-medium",
+                              active ? "text-[#f0f6fc]" : "text-[#c3d0c8]",
+                            )}
+                          >
+                            {label}
+                          </span>
+                          <span className="block font-mono text-[10px] leading-4 text-[#7f9188]">
+                            {session.status === "open"
+                              ? `${session.info.cols}×${session.info.rows}`
+                              : session.exitReason
+                                ? exitShortLabels[session.exitReason]
+                                : "Exited"}
+                          </span>
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Close ${label}`}
+                        className="my-1 mr-1 grid w-6 place-items-center rounded-sm text-[#7f9188] outline-none transition-colors hover:bg-white/10 hover:text-[#f0f6fc] focus-visible:ring-2 focus-visible:ring-[#f08a4b]/60"
+                        onClick={() => {
+                          void handleCloseSession(session.info.sessionId);
+                        }}
+                      >
+                        <XIcon className="size-3" aria-hidden="true" />
+                      </button>
+                    </div>
                   );
                 })
               )}
             </div>
-            {activeSession ? sessionBadge(activeSession) : null}
-            {activeSession ? (
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                aria-label="Close terminal session"
-                onClick={() => {
-                  void handleCloseSession(activeSession.info.sessionId);
-                }}
-              >
-                <XIcon aria-hidden="true" />
-              </Button>
-            ) : null}
+            <button
+              type="button"
+              className="flex shrink-0 items-center gap-1.5 border-l border-white/10 px-3 text-[11px] font-medium text-[#c3d0c8] outline-none transition-colors hover:bg-white/10 hover:text-[#f0f6fc] focus-visible:ring-2 focus-visible:ring-[#f08a4b]/60 disabled:pointer-events-none disabled:opacity-40"
+              disabled={!connected || opening}
+              onClick={() => {
+                void handleOpen();
+              }}
+              title={
+                connected ? "Open another shell on this server" : "Reconnect before opening a shell"
+              }
+            >
+              {opening ? (
+                <CircleNotchIcon className="size-3.5 animate-spin" aria-hidden="true" />
+              ) : (
+                <PlusIcon className="size-3.5" aria-hidden="true" />
+              )}
+              New shell
+            </button>
           </div>
 
-          {activeSession ? (
-            <>
-              <div
-                ref={outputRef}
-                className="h-[360px] overflow-auto bg-[#07100c] px-4 py-3 font-mono text-[12px] leading-[18px] text-[#d7e4dc]"
-                role="log"
-                aria-label="Terminal output"
-                aria-live="polite"
-              >
-                {activeSession.output.length === 0 ? (
-                  <p className="text-[#7f9188]">
-                    Waiting for output from {selected.username}@{selected.host}…
+          <div className="relative h-[clamp(320px,52dvh,560px)]">
+            {serverSessions.length === 0 ? (
+              <div className="flex h-full items-center justify-center bg-[#07100c] px-6">
+                <div className="max-w-[48ch] text-center">
+                  <DiagnosticMark />
+                  <p className="mt-4 text-[13px] text-[#d7e4dc]">No terminal session is open.</p>
+                  <p className="mt-1 text-[12px] leading-5 text-[#7f9188]">
+                    Open a terminal to start a shell as {selected.username} on {selected.host}. Each
+                    tab owns an independent SSH channel and scrollback buffer.
                   </p>
-                ) : (
-                  <pre className="m-0 whitespace-pre-wrap break-words font-mono">{preview}</pre>
-                )}
-              </div>
-
-              {activeSession.outputTruncated ? (
-                <p className="border-t border-border px-4 py-2 text-[11px] text-muted-foreground">
-                  The visible preview is capped. The full xterm.js scrollback arrives in #27.
-                </p>
-              ) : null}
-
-              <div className="border-t border-border bg-background/40 px-3 py-2">
-                <label htmlFor="terminal-input" className="sr-only">
-                  Terminal input
-                </label>
-                <textarea
-                  id="terminal-input"
-                  ref={inputRef}
-                  aria-label="Terminal input"
-                  className="h-16 w-full resize-none rounded-md border border-input bg-[#07100c] px-3 py-2 font-mono text-[12px] leading-[18px] text-[#d7e4dc] outline-none placeholder:text-[#7f9188] focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/25 disabled:cursor-not-allowed disabled:opacity-60"
-                  value=""
-                  readOnly
-                  spellCheck={false}
-                  autoComplete="off"
-                  placeholder={
-                    activeSession.status === "open"
-                      ? "Type directly into the remote shell. Ctrl, Alt, arrows, and paste are forwarded."
-                      : "This terminal session has ended."
-                  }
-                  disabled={activeSession.status !== "open"}
-                  onKeyDown={(event) => {
-                    const sequence = terminalKeySequence(event);
-                    if (sequence !== null) {
-                      event.preventDefault();
-                      void writeInput(activeSession.info.sessionId, sequence);
-                    }
-                  }}
-                  onPaste={(event) => {
-                    const text = event.clipboardData.getData("text");
-                    if (text.length > 0) {
-                      event.preventDefault();
-                      void writeInput(activeSession.info.sessionId, text);
-                    }
-                  }}
-                />
-              </div>
-
-              {activeSession.status === "exited" ? (
-                <div className="border-t border-border px-4 py-3 text-[12px] text-muted-foreground">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span>
-                      {activeSession.exitReason
-                        ? exitLabels[activeSession.exitReason]
-                        : "Terminal session ended"}
-                      {activeSession.exitReason === "remote-exit" && activeSession.exitCode !== null
-                        ? ` with exit code ${activeSession.exitCode}.`
-                        : "."}
-                    </span>
-                    {activeSession.message ? <span>{activeSession.message}</span> : null}
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => dismissSession(activeSession.info.sessionId)}
-                    >
-                      Dismiss
-                    </Button>
-                  </div>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    className="mt-4"
+                    disabled={!connected || opening}
+                    onClick={() => {
+                      void handleOpen();
+                    }}
+                  >
+                    <PlusIcon aria-hidden="true" />
+                    Open terminal
+                  </Button>
                 </div>
-              ) : null}
-
-              {activeSession.error ? (
-                <div className="border-t border-border px-4 py-2 text-[12px] text-destructive">
-                  {activeSession.error}
-                </div>
-              ) : null}
-            </>
-          ) : (
-            <div className="flex h-[360px] items-center justify-center bg-[#07100c] px-6">
-              <div className="max-w-[46ch] text-center">
-                <p className="text-[13px] text-[#d7e4dc]">No terminal session is open.</p>
-                <p className="mt-1 text-[12px] leading-5 text-[#7f9188]">
-                  Open a terminal above. Each session gets its own SSH channel, so multiple shells
-                  can run against the same server.
-                </p>
               </div>
+            ) : (
+              serverSessions.map((session) => {
+                const active = session.info.sessionId === activeSessionId;
+                return (
+                  <TerminalView
+                    key={session.info.sessionId}
+                    id={`terminal-panel-${session.info.sessionId}`}
+                    labelledBy={`terminal-tab-${session.info.sessionId}`}
+                    session={session}
+                    active={active}
+                    inputEnabled={session.status === "open" && connected}
+                    onInput={(data) => {
+                      void writeInput(session.info.sessionId, data);
+                    }}
+                    onResize={(size) => {
+                      void resizeSession(session.info.sessionId, size);
+                    }}
+                  />
+                );
+              })
+            )}
+          </div>
+
+          {activeSession && activeSession.status === "exited" ? (
+            <div className="flex flex-wrap items-center gap-2 border-t border-[#1e2a23] bg-[#0b1511] px-4 py-2.5 text-[12px] text-[#9fb0a6]">
+              <span className="size-1.5 rounded-full bg-[#e7a33d]" aria-hidden="true" />
+              <span className="min-w-0 flex-1">
+                {exitDescription(activeSession)}
+                {activeSession.message ? ` ${activeSession.message}` : ""}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                className="border-white/15 bg-transparent text-[#e6ece8] hover:border-white/25 hover:bg-white/10"
+                disabled={!connected || opening}
+                onClick={() => {
+                  void handleOpen();
+                }}
+              >
+                Open new shell
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-[#9fb0a6] hover:bg-white/10 hover:text-[#f0f6fc]"
+                onClick={() => dismissSession(activeSession.info.sessionId)}
+              >
+                Dismiss
+              </Button>
             </div>
-          )}
+          ) : null}
+
+          {activeSession?.error ? (
+            <div
+              className="border-t border-[#1e2a23] bg-[#0b1511] px-4 py-2 text-[12px] text-[#ff7b72]"
+              role="alert"
+            >
+              {activeSession.error}
+            </div>
+          ) : null}
         </section>
       ) : null}
 
-      <p className="text-[11px] leading-5 text-muted-foreground">
-        The plain-text preview strips ANSI control sequences for readability. Raw ANSI bytes and
-        colors are preserved end to end for the xterm.js renderer in #27. Terminal input is never
-        written to application state or logs.
+      <p className="max-w-[90ch] text-[11px] leading-5 text-muted-foreground">
+        The terminal renders full ANSI colors, cursor movement, mouse selection, and a 5,000-line
+        scrollback locally. Copy uses Ctrl+Shift+C, paste uses Ctrl+Shift+V, and select all uses
+        Ctrl+Shift+A. Terminal input is forwarded directly and never stored in application state or
+        logs.
       </p>
+    </div>
+  );
+}
+
+function DiagnosticMark() {
+  return (
+    <div className="mx-auto flex w-fit items-center gap-1.5" aria-hidden="true">
+      <span className="font-mono text-[11px] text-[#5bc46d]">deploy@server</span>
+      <span className="font-mono text-[11px] text-[#7f9188]">$</span>
+      <span className="h-3.5 w-1.5 animate-pulse bg-[#f08a4b]" />
     </div>
   );
 }

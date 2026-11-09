@@ -219,6 +219,8 @@ describe("terminal store", () => {
     await expect(useTerminalStore.getState().resize(sessionId, size)).resolves.toBe(true);
 
     expect(resizeTerminal).toHaveBeenCalledWith(sessionId, size);
+    expect(useTerminalStore.getState().sessions[sessionId]?.info.cols).toBe(132);
+    expect(useTerminalStore.getState().sessions[sessionId]?.info.rows).toBe(43);
   });
 
   it("closes a session once and keeps an existing exit reason", async () => {
