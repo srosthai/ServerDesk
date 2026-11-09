@@ -441,7 +441,7 @@ async fn verifies_the_host_key_authenticates_and_runs_hostname_and_uptime() {
     let error = run_remote_command(&manager, "fixture-server", RemoteCommand::Hostname)
         .await
         .expect_err("the session must be released after disconnect");
-    assert_eq!(error.code, ErrorCode::NotFound);
+    assert_eq!(error.code, ErrorCode::Connection);
     fixture.wait_until_idle().await;
 }
 

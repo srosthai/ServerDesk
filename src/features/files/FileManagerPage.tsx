@@ -1271,16 +1271,25 @@ function FileManagerPage() {
 
           {mutation?.result ? (
             <Alert variant={mutation.result.verified ? "success" : "warning"}>
-              <InfoIcon className="mt-0.5 size-4 shrink-0 text-success" aria-hidden="true" />
+              <InfoIcon
+                className={`mt-0.5 size-4 shrink-0 ${mutation.result.verified ? "text-success" : "text-warning"}`}
+                aria-hidden="true"
+              />
               <div className="flex-1">
                 <AlertTitle>
-                  {mutation.result.action === "create_folder"
-                    ? "Folder created"
-                    : mutation.result.action === "rename"
-                      ? "Entry renamed"
-                      : mutation.result.deletedEntries === 1
-                        ? "Entry deleted"
-                        : `${mutation.result.deletedEntries} entries deleted`}
+                  {mutation.result.verified
+                    ? mutation.result.action === "create_folder"
+                      ? "Folder created"
+                      : mutation.result.action === "rename"
+                        ? "Entry renamed"
+                        : mutation.result.deletedEntries === 1
+                          ? "Entry deleted"
+                          : `${mutation.result.deletedEntries} entries deleted`
+                    : mutation.result.action === "create_folder"
+                      ? "Folder creation not verified"
+                      : mutation.result.action === "rename"
+                        ? "Rename not verified"
+                        : "Delete not verified"}
                 </AlertTitle>
                 <AlertDescription>
                   <span className="block">
