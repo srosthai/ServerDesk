@@ -1,9 +1,87 @@
-# Security model
+# Security and privacy model
 
-This document records the security audit of every remote execution path, the
-fixes that were applied, and the risks that remain accepted. ServerDesk is a
-local-first desktop application: the local UI is trusted, while the SSH server
-and everything it returns are untrusted.
+ServerDesk is a local-first desktop application. It has no hosted account,
+cloud backend, server-side agent, analytics service, crash reporter, or
+auto-updater. The local desktop session is trusted; the SSH server and
+everything it returns are untrusted.
+
+## Privacy summary
+
+### Data kept on this computer
+
+ServerDesk stores its working data locally in SQLite:
+
+- server profiles: name, host, port, username, authentication type, tags, and
+  notes;
+- preferences: theme, monitoring interval, and the last active server;
+- detected Laravel project metadata;
+- trusted SSH host-key fingerprints;
+- bounded, sanitized operation history.
+
+The database, WAL, and shared-memory sidecars are restricted to the owning user
+(`0600`) on Unix. SQLite contains credential references, not passwords, private
+keys, passphrases, or raw command output. The application-data and credential
+locations are listed in [packaging.md](packaging.md#local-data-and-credentials).
+
+### Credentials and the keychain
+
+SSH passwords and private keys, including key passphrases, are stored in the
+operating system credential store through the `keyring` crate:
+
+| Platform | Credential store                                                |
+| -------- | --------------------------------------------------------------- |
+| Linux    | Secret Service (GNOME Keyring, KWallet, or compatible provider) |
+| macOS    | Keychain                                                        |
+| Windows  | Credential Manager                                              |
+
+Entries use the service `com.serverdesk.app` and an account reference such as
+`serverdesk:ssh:<uuid>`. A desktop Linux session needs a running, unlocked
+Secret Service provider; a headless session without one cannot save or read
+credentials. The security of the credential store is the security boundary for
+secrets at rest. Malware or another process running as the same OS user can use
+the unlocked store.
+
+Private keys are wrapped in a versioned JSON envelope inside the credential
+entry. Debug output for key material and passphrases is redacted. Deleting a
+server profile deletes its credential and trusted host-key records. Package
+uninstallers and the documented macOS/AppImage cleanup run `--purge-data`, which
+removes every credential known to the installation before deleting the local
+database.
+
+### No telemetry
+
+ServerDesk does not send usage data, analytics, crash reports, diagnostics,
+server inventory, or credentials to the project or any third party. It has no
+telemetry setting to disable because there is no telemetry client.
+
+The application's only network activity is the SSH connection to a server
+profile you explicitly test or connect to, plus the DNS lookup needed to resolve
+that host. ServerDesk has no update checker, so it does not contact GitHub or any
+release service. The optional opener plugin is present in the desktop
+capability set but the current interface does not use it to load remote content;
+the webview loads local application assets.
+
+The remote SSH server necessarily sees the connection, the fixed commands
+ServerDesk runs, and any terminal input you type. That server and its
+administrators are outside ServerDesk's trust boundary. Log and command output
+is treated as untrusted input and is redacted on a best-effort basis.
+
+### Removing local data
+
+- Deleting a server profile removes the profile, its credential reference, its
+  trusted host keys, and its linked project records. Operation history keeps its
+  sanitized rows but clears the server reference.
+- Clearing operation history deletes the local history rows after confirmation.
+- Uninstalling with `--purge-data` removes credentials and the application-data
+  directory. The exact platform behavior and retry path are in
+  [packaging.md](packaging.md#uninstall-and-credential-cleanup).
+- There is no cloud copy to delete because there is no cloud account.
+
+## Security audit
+
+This section records the security audit of every remote execution path, the
+fixes that were applied, and the risks that remain accepted. The audit assumes
+the local desktop session is trusted and the SSH server is untrusted.
 
 ## Command construction
 
