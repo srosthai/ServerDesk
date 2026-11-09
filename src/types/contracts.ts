@@ -221,6 +221,40 @@ export type ServiceActionResult = {
 
 export type ProjectType = "laravel";
 
+export type OperationCategory = "command" | "service" | "artisan" | "sftp" | "queue";
+
+export type OperationResult = "success" | "failure" | "cancelled" | "unknown";
+
+export type OperationHistoryEntry = {
+  id: string;
+  serverId: string | null;
+  projectId: string | null;
+  category: OperationCategory;
+  operation: string;
+  safeSummary: string;
+  path: string | null;
+  outputSummary: string | null;
+  result: OperationResult;
+  exitCode: number | null;
+  startedAt: number;
+  durationMs: number;
+};
+
+export type OperationHistoryFilter = {
+  serverId?: string | null;
+  category?: OperationCategory | null;
+  result?: OperationResult | null;
+  startedAfter?: number | null;
+  startedBefore?: number | null;
+  limit?: number;
+};
+
+export type OperationHistoryPolicy = {
+  maxEntries: number;
+  outputSummaryMaxChars: number;
+  retention: string;
+};
+
 export type ProjectOperationStatus = "succeeded" | "failed" | "unknown";
 
 export type ProjectOperationSummary = {

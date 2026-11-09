@@ -35,5 +35,8 @@ export default defineConfig(() => ({
     setupFiles: ["./src/test/setup.ts"],
     restoreMocks: true,
     clearMocks: true,
+    // The suite runs many jsdom files in parallel; allow slower interactive
+    // tests to finish under CPU contention instead of timing out at 5 seconds.
+    testTimeout: 15_000,
   },
 }));

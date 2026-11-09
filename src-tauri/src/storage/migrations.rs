@@ -15,6 +15,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0003_project_detection",
         include_str!("../../../migrations/0003_project_detection.sql"),
     ),
+    (
+        "0004_operation_history",
+        include_str!("../../../migrations/0004_operation_history.sql"),
+    ),
 ];
 
 pub(crate) fn run_migrations(connection: &mut Connection) -> Result<(), StorageError> {

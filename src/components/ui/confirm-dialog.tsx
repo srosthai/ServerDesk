@@ -26,6 +26,8 @@ type ConfirmDialogProps = {
   details?: ConfirmationDetail[];
   destructive?: boolean;
   pending?: boolean;
+  warningTitle?: string;
+  warningDescription?: string;
 };
 
 function ConfirmDialog({
@@ -38,6 +40,8 @@ function ConfirmDialog({
   details,
   destructive = true,
   pending = false,
+  warningTitle = "This action changes the remote server.",
+  warningDescription = "Review the target before continuing.",
 }: ConfirmDialogProps) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -64,8 +68,8 @@ function ConfirmDialog({
           <Alert variant="warning" className="py-2.5">
             <WarningCircle className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden="true" />
             <div>
-              <AlertTitle>This action changes the remote server.</AlertTitle>
-              <AlertDescription>Review the target before continuing.</AlertDescription>
+              <AlertTitle>{warningTitle}</AlertTitle>
+              <AlertDescription>{warningDescription}</AlertDescription>
             </div>
           </Alert>
         ) : null}

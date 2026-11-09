@@ -1,6 +1,7 @@
 pub mod connections;
 pub mod credentials;
 pub mod files;
+pub mod history;
 pub mod identity;
 pub mod known_hosts;
 pub mod logs;

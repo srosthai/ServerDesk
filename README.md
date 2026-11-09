@@ -149,6 +149,14 @@ Every card shows the exact command and working directory before a button can run
 
 Action output is bounded to 64 KiB per command and each stream is shortened at a display limit while the exit status, stdout, stderr, and duration stay visible. ANSI escapes are stripped. Environment-style lines, secret assignments, bearer tokens, credentialed URLs, and private-key blocks are redacted before output reaches the UI or local history. Operation history stores only the fixed action name and a safe summary with the target path and exit status; it never stores raw output or `.env` values.
 
+## Operation history
+
+Service actions, Laravel Artisan actions, SFTP transfers and mutations, and the fixed `hostname` and `uptime` commands record one local history row. Each row stores the server reference, operation category, a fixed safe summary, the project or remote path when applicable, start time, duration, exit status, a result of `success`, `failure`, `cancelled`, or `unknown`, and a short sanitized output summary. Terminal keystrokes and raw command output are never recorded.
+
+History text is sanitized again before it is written. Password, passphrase, secret, token, API key, private key, access key, credential, cookie, session, and authorization assignments are redacted; bearer tokens, credentialed URLs, common token prefixes, ANSI escapes, and private-key blocks are removed; and every dotenv-style line is replaced wholesale. The stored output summary is capped at 360 characters, and the safe summary and path fields are bounded as well.
+
+The Command History page filters by server, category, result, and date range. A details dialog shows only the sanitized fields, never raw stdout or stderr. The local database keeps the newest 1,000 rows and prunes older rows automatically whenever a new operation is recorded. Users can clear the remaining rows from the page only after an explicit confirmation dialog; clearing never sends a remote command. History is stored in SQLite, so it survives application restarts.
+
 ## Bounded log viewer
 
 The Logs page reads only a bounded tail from approved remote log locations. System logs come from a fixed allowlist of common paths such as `/var/log/syslog`, `/var/log/auth.log`, Nginx and Apache access and error logs, MySQL, Redis, and UFW. A Laravel log must be a `.log` file directly inside a `storage/logs` directory. Relative paths, parent segments, control characters, arbitrary files, and symlinks that resolve outside those locations are rejected before any remote command is sent.
