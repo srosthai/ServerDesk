@@ -307,6 +307,58 @@ export type ProjectArtisanRun = {
   historyError: string | null;
 };
 
+export type SupervisorStatus = "available" | "missing" | "unavailable";
+
+export type SupervisorProgramState =
+  "running" | "stopped" | "starting" | "backoff" | "fatal" | "exited" | "unknown";
+
+export type SupervisorProgram = {
+  name: string;
+  state: SupervisorProgramState;
+  stateText: string;
+  queueRelated: boolean;
+  detail: string | null;
+};
+
+/**
+ * Supervisor detection from fixed read-only commands. `programs` is empty
+ * whenever `status` is not `available`; missing data is never guessed.
+ */
+export type SupervisorDetection = {
+  status: SupervisorStatus;
+  installed: boolean | null;
+  programs: SupervisorProgram[];
+  detail: string | null;
+};
+
+export type QueueWorkerStatus = "available" | "unavailable";
+
+export type QueueWorkerKind = "queue_work" | "queue_listen" | "horizon";
+
+export type QueueWorkerProcess = {
+  pid: number;
+  elapsedSeconds: number;
+  kind: QueueWorkerKind;
+  queue: string | null;
+  connection: string | null;
+};
+
+export type QueueWorkerDetection = {
+  status: QueueWorkerStatus;
+  workers: QueueWorkerProcess[];
+  truncated: boolean;
+  detail: string | null;
+};
+
+export type QueueSupervisorStatus = {
+  serverId: string;
+  supervisor: SupervisorDetection;
+  queueWorkers: QueueWorkerDetection;
+  sampledAt: number;
+  durationMs: number;
+  connectionState: ConnectionState;
+};
+
 export type SystemLogSource = {
   path: string;
   label: string;

@@ -39,6 +39,7 @@ import {
   artisanCommand,
   artisanTranscript,
 } from "@/features/projects/artisanActions";
+import { QueueSupervisorPanel } from "@/features/projects/QueueSupervisorPanel";
 import { normalizeProjectPath } from "@/features/projects/projectPaths";
 import { isTauriRuntime } from "@/lib/tauri";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -49,6 +50,7 @@ import {
   type ProjectActionEntry,
   type ProjectEntry,
 } from "@/stores/projectStore";
+import { useQueueStore } from "@/stores/queueStore";
 import { useServerStore } from "@/stores/serverStore";
 import type {
   ArtisanActionName,
@@ -273,6 +275,12 @@ function ArtisanActionsSection({
                   <p className="mt-0.5 text-[11px] leading-4 text-muted-foreground">
                     {config.description}
                   </p>
+                  {config.action === "queue-restart" ? (
+                    <p className="mt-1 text-[10px] leading-4 text-info">
+                      Laravel-level only. This does not restart Supervisor. Restart the Supervisor
+                      service from Services if that is what you intend.
+                    </p>
+                  ) : null}
                 </div>
                 <Button
                   type="button"
@@ -783,6 +791,8 @@ function ProjectsPage() {
   const clearScan = useProjectStore((state) => state.clearScan);
   const clearBrowse = useProjectStore((state) => state.clearBrowse);
   const clearError = useProjectStore((state) => state.clearError);
+  const queueEntries = useQueueStore((state) => state.entries);
+  const refreshQueueStatus = useQueueStore((state) => state.refresh);
 
   const [selectedId, setSelectedId] = useState<string | null>(lastActiveServerId);
   const [pathInput, setPathInput] = useState(DEFAULT_REMOTE_PATH);
@@ -801,6 +811,7 @@ function ProjectsPage() {
   const selectedServerId = selected?.id ?? null;
   const connected = selected ? connections[selected.id]?.state === "connected" : false;
   const entry = useProjectStore((state) => (selected ? state.entries[selected.id] : undefined));
+  const queueEntry = selected ? queueEntries[selected.id] : undefined;
   const projects = entry?.projects ?? [];
 
   useEffect(() => {
@@ -822,6 +833,35 @@ function ProjectsPage() {
     void fetchProjects(selectedServerId);
   }, [selectedServerId, fetchProjects]);
 
+  useEffect(() => {
+    if (!connected || !selectedServerId || !isTauriRuntime()) {
+      return;
+    }
+    if (queueEntry?.pending || queueEntry?.status || queueEntry?.error) {
+      return;
+    }
+
+    void refreshQueueStatus(selectedServerId);
+  }, [
+    connected,
+    selectedServerId,
+    queueEntry?.pending,
+    queueEntry?.status,
+    queueEntry?.error,
+    refreshQueueStatus,
+  ]);
+
+  function executeAction(project: ProjectRecord, action: ArtisanActionName, confirmed: boolean) {
+    void runAction(project.serverId, project.id, action, confirmed).finally(() => {
+      if (action === "queue-restart") {
+        // queue:restart only asks Laravel workers to restart. Refresh the
+        // read-only snapshot so the panel shows a new sample time and any
+        // workers that have reappeared; never treat it as a Supervisor restart.
+        void refreshQueueStatus(project.serverId);
+      }
+    });
+  }
+
   function selectServer(serverId: string) {
     setSelectedId(serverId);
     setPathInput(DEFAULT_REMOTE_PATH);
@@ -839,7 +879,7 @@ function ProjectsPage() {
       return;
     }
 
-    void runAction(project.serverId, project.id, action, false);
+    executeAction(project, action, false);
   }
 
   function validatePath(): string | null {
@@ -965,6 +1005,13 @@ function ProjectsPage() {
             onPathBlur={handlePathBlur}
             onBrowse={handleBrowse}
             onScan={handleScan}
+          />
+
+          <QueueSupervisorPanel
+            server={selected}
+            connected={connected}
+            entry={queueEntry}
+            onRefresh={() => void refreshQueueStatus(selected.id)}
           />
 
           {entry?.browseError ? (
@@ -1115,12 +1162,7 @@ function ProjectsPage() {
               if (!pendingAction) {
                 return;
               }
-              void runAction(
-                pendingAction.project.serverId,
-                pendingAction.project.id,
-                pendingAction.action,
-                true,
-              );
+              executeAction(pendingAction.project, pendingAction.action, true);
               setPendingAction(null);
             }}
           />
