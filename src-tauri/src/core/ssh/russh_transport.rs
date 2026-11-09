@@ -15,7 +15,7 @@ use russh::{
 };
 use russh_sftp::{
     client::{RawSftpSession, error::Error as SftpClientError},
-    protocol::{FileAttributes, FileType as SftpFileType, StatusCode},
+    protocol::{FileAttributes, FileType as SftpFileType, OpenFlags, StatusCode},
 };
 use tokio::net::TcpStream;
 
@@ -23,8 +23,8 @@ use crate::core::terminal::{TerminalChannel, TerminalChannelEvent, TerminalOptio
 
 use super::{
     Authentication, CommandOutput, ConnectionRequest, SftpBrowser, SftpDirEntry, SftpEntryKind,
-    SftpError, SftpMetadata, SshSession, SshTransport, TransportError, TrustedHostKey,
-    private_key::load_private_key,
+    SftpError, SftpFile, SftpMetadata, SftpOpenMode, SshSession, SshTransport, TransportError,
+    TrustedHostKey, private_key::load_private_key,
 };
 
 const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -454,7 +454,9 @@ impl SshSession for RusshSession {
                 let _ = session.close_session();
                 Err(map_sftp_setup_error(error))
             }
-            Ok(Ok(_)) => Ok(Arc::new(RusshSftpBrowser { session })),
+            Ok(Ok(_)) => Ok(Arc::new(RusshSftpBrowser {
+                session: Arc::new(session),
+            })),
         }
     }
 
@@ -552,7 +554,55 @@ impl TerminalChannel for RusshTerminalChannel {
 }
 
 struct RusshSftpBrowser {
-    session: RawSftpSession,
+    session: Arc<RawSftpSession>,
+}
+
+struct RusshSftpFile {
+    session: Arc<RawSftpSession>,
+    handle: String,
+    closed: AtomicBool,
+}
+
+#[async_trait]
+impl SftpFile for RusshSftpFile {
+    async fn read(&self, offset: u64, length: u32) -> Result<Vec<u8>, SftpError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(SftpError::Disconnected);
+        }
+        match self
+            .session
+            .read(self.handle.as_str(), offset, length)
+            .await
+        {
+            Ok(data) => Ok(data.data),
+            Err(SftpClientError::Status(status)) if status.status_code == StatusCode::Eof => {
+                Ok(Vec::new())
+            }
+            Err(error) => Err(map_sftp_client_error(error)),
+        }
+    }
+
+    async fn write(&self, offset: u64, data: &[u8]) -> Result<(), SftpError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(SftpError::Disconnected);
+        }
+        self.session
+            .write(self.handle.as_str(), offset, data.to_vec())
+            .await
+            .map_err(map_sftp_client_error)?;
+        Ok(())
+    }
+
+    async fn close(&self) -> Result<(), SftpError> {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.session
+            .close(self.handle.as_str())
+            .await
+            .map_err(map_sftp_client_error)?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -574,6 +624,15 @@ impl SftpBrowser for RusshSftpBrowser {
         let attrs = self
             .session
             .stat(path)
+            .await
+            .map_err(map_sftp_client_error)?;
+        Ok(metadata_from_attrs(&attrs.attrs))
+    }
+
+    async fn lstat(&self, path: &str) -> Result<SftpMetadata, SftpError> {
+        let attrs = self
+            .session
+            .lstat(path)
             .await
             .map_err(map_sftp_client_error)?;
         Ok(metadata_from_attrs(&attrs.attrs))
@@ -634,6 +693,59 @@ impl SftpBrowser for RusshSftpBrowser {
             .next()
             .map(|file| file.filename)
             .ok_or_else(|| SftpError::Protocol("The SFTP link has no target.".into()))
+    }
+
+    async fn open_file(
+        &self,
+        path: &str,
+        mode: SftpOpenMode,
+    ) -> Result<Box<dyn SftpFile>, SftpError> {
+        let flags = match mode {
+            SftpOpenMode::Read => OpenFlags::READ,
+            SftpOpenMode::Write => OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+        };
+        let handle = self
+            .session
+            .open(path, flags, FileAttributes::default())
+            .await
+            .map_err(map_sftp_client_error)?;
+        Ok(Box::new(RusshSftpFile {
+            session: Arc::clone(&self.session),
+            handle: handle.handle,
+            closed: AtomicBool::new(false),
+        }))
+    }
+
+    async fn mkdir(&self, path: &str) -> Result<(), SftpError> {
+        self.session
+            .mkdir(path, FileAttributes::default())
+            .await
+            .map_err(map_sftp_client_error)?;
+        Ok(())
+    }
+
+    async fn remove_file(&self, path: &str) -> Result<(), SftpError> {
+        self.session
+            .remove(path)
+            .await
+            .map_err(map_sftp_client_error)?;
+        Ok(())
+    }
+
+    async fn remove_dir(&self, path: &str) -> Result<(), SftpError> {
+        self.session
+            .rmdir(path)
+            .await
+            .map_err(map_sftp_client_error)?;
+        Ok(())
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), SftpError> {
+        self.session
+            .rename(from, to)
+            .await
+            .map_err(map_sftp_client_error)?;
+        Ok(())
     }
 
     async fn close(&self) -> Result<(), SftpError> {

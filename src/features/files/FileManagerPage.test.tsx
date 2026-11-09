@@ -5,15 +5,25 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { FileManagerPage } from "@/features/files/FileManagerPage";
 import { DEFAULT_PREFERENCES } from "@/lib/preferences";
 import { getConnectionState } from "@/services/connections";
-import { browseRemoteFiles } from "@/services/files";
+import {
+  browseRemoteFiles,
+  cancelFileTransfer,
+  createRemoteFolder,
+  deleteRemoteEntry,
+  downloadRemoteFile,
+  renameRemoteEntry,
+  uploadRemoteFile,
+} from "@/services/files";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { emptyFileBrowserEntry, useFileStore } from "@/stores/fileStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useServerStore } from "@/stores/serverStore";
 import type {
   ConnectionSnapshot,
+  FileTransferResult,
   RemoteFileEntry,
   RemoteFileListing,
+  RemoteMutationResult,
   ServerProfile,
 } from "@/types/contracts";
 
@@ -25,9 +35,19 @@ vi.mock("@/services/connections", async (importOriginal) => {
   };
 });
 
-vi.mock("@/services/files", () => ({
-  browseRemoteFiles: vi.fn(),
-}));
+vi.mock("@/services/files", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/services/files")>();
+  return {
+    ...actual,
+    browseRemoteFiles: vi.fn(),
+    uploadRemoteFile: vi.fn(),
+    downloadRemoteFile: vi.fn(),
+    cancelFileTransfer: vi.fn(),
+    createRemoteFolder: vi.fn(),
+    renameRemoteEntry: vi.fn(),
+    deleteRemoteEntry: vi.fn(),
+  };
+});
 
 const server: ServerProfile = {
   id: "server-1",
@@ -110,6 +130,49 @@ function listing(overrides: Partial<RemoteFileListing> = {}): RemoteFileListing 
   };
 }
 
+function transferResult(overrides: Partial<FileTransferResult> = {}): FileTransferResult {
+  const transferId = overrides.transferId ?? "transfer-1";
+  return {
+    transferId,
+    serverId: server.id,
+    direction: "upload",
+    kind: "file",
+    status: "completed",
+    sourcePath: "/home/user/readme.txt",
+    destinationPath: "/var/www/readme.txt",
+    bytesTransferred: 12,
+    totalBytes: 12,
+    filesTransferred: 1,
+    filesTotal: 1,
+    directoriesCreated: 0,
+    skippedEntries: 0,
+    warnings: [],
+    partialPaths: [],
+    mayBeIncomplete: false,
+    overwrite: false,
+    startedAt: 1_762_665_720_000,
+    finishedAt: 1_762_665_721_000,
+    durationMs: 1_000,
+    connectionState: "connected",
+    ...overrides,
+  };
+}
+
+function mutationResult(overrides: Partial<RemoteMutationResult> = {}): RemoteMutationResult {
+  return {
+    serverId: server.id,
+    action: "delete",
+    root: "/var/www",
+    path: "/var/www/readme.txt",
+    recursive: false,
+    deletedEntries: 1,
+    verified: true,
+    completedAt: 1_762_665_720_000,
+    connectionState: "connected",
+    ...overrides,
+  };
+}
+
 function enableTauriRuntime() {
   Object.defineProperty(window, "__TAURI_INTERNALS__", {
     configurable: true,
@@ -140,6 +203,12 @@ describe("FileManagerPage", () => {
     useFileStore.setState({ entries: {} });
     vi.mocked(getConnectionState).mockResolvedValue(connected);
     vi.mocked(browseRemoteFiles).mockReset();
+    vi.mocked(uploadRemoteFile).mockReset();
+    vi.mocked(downloadRemoteFile).mockReset();
+    vi.mocked(cancelFileTransfer).mockReset();
+    vi.mocked(createRemoteFolder).mockReset();
+    vi.mocked(renameRemoteEntry).mockReset();
+    vi.mocked(deleteRemoteEntry).mockReset();
   });
 
   async function openRoot(path = "/var/www") {
@@ -272,5 +341,246 @@ describe("FileManagerPage", () => {
     expect(screen.getByText("Disconnected")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Browse new root" })).toBeDisabled();
     expect(screen.getByText("readme.txt")).toBeInTheDocument();
+  });
+
+  it("uploads a file with live progress and reports completion", async () => {
+    vi.mocked(browseRemoteFiles).mockResolvedValue(listing());
+    vi.mocked(uploadRemoteFile).mockImplementation(async (input) => {
+      useFileStore.getState().applyTransferProgress({
+        transferId: input.transferId,
+        serverId: input.serverId,
+        direction: "upload",
+        status: "running",
+        kind: "file",
+        bytesTransferred: 6,
+        totalBytes: 12,
+        filesTransferred: 0,
+        filesTotal: 1,
+        currentPath: input.remotePath,
+        mayBeIncomplete: false,
+        emittedAt: 1_762_665_720_500,
+      });
+      return transferResult({
+        transferId: input.transferId,
+        sourcePath: input.localPath,
+        destinationPath: input.remotePath,
+      });
+    });
+    renderPage();
+
+    const user = await openRoot();
+    await screen.findByText("readme.txt");
+    await user.click(screen.getByRole("button", { name: "Upload" }));
+    await user.type(screen.getByLabelText("Local source path"), "/home/user/readme.txt");
+    expect(screen.getByText("/var/www/readme.txt")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Start upload" }));
+
+    await waitFor(() =>
+      expect(uploadRemoteFile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          serverId: server.id,
+          root: "/var/www",
+          localPath: "/home/user/readme.txt",
+          remotePath: "/var/www/readme.txt",
+          overwrite: false,
+        }),
+      ),
+    );
+    expect(await screen.findByText("Completed")).toBeInTheDocument();
+    expect(
+      screen.getByRole("progressbar", { name: /upload progress for readme.txt/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("12 B of 12 B")).toBeInTheDocument();
+  });
+
+  it("downloads an entry to an explicit local destination", async () => {
+    vi.mocked(browseRemoteFiles).mockResolvedValue(listing());
+    vi.mocked(downloadRemoteFile).mockResolvedValue(
+      transferResult({
+        direction: "download",
+        sourcePath: "/var/www/readme.txt",
+        destinationPath: "/home/user/readme.txt",
+      }),
+    );
+    renderPage();
+
+    const user = await openRoot();
+    await screen.findByText("readme.txt");
+    await user.click(screen.getByRole("button", { name: "Download readme.txt" }));
+    await user.type(screen.getByLabelText("Local destination path"), "/home/user/readme.txt");
+    await user.click(screen.getByRole("button", { name: "Start download" }));
+
+    await waitFor(() =>
+      expect(downloadRemoteFile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          remotePath: "/var/www/readme.txt",
+          localPath: "/home/user/readme.txt",
+          overwrite: false,
+        }),
+      ),
+    );
+  });
+
+  it("requires explicit confirmation before overwriting an existing destination", async () => {
+    vi.mocked(browseRemoteFiles).mockResolvedValue(listing());
+    vi.mocked(uploadRemoteFile)
+      .mockRejectedValueOnce({
+        code: "conflict",
+        message: "1 existing destination file would be overwritten.",
+        details: "Overwrite was not confirmed.",
+      })
+      .mockResolvedValueOnce(
+        transferResult({
+          overwrite: true,
+          sourcePath: "/home/user/readme.txt",
+          destinationPath: "/var/www/readme.txt",
+        }),
+      );
+    renderPage();
+
+    const user = await openRoot();
+    await screen.findByText("readme.txt");
+    await user.click(screen.getByRole("button", { name: "Upload" }));
+    await user.type(screen.getByLabelText("Local source path"), "/home/user/readme.txt");
+    await user.click(screen.getByRole("button", { name: "Start upload" }));
+
+    expect(await screen.findByText("Overwrite the existing destination?")).toBeInTheDocument();
+    expect(uploadRemoteFile).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(uploadRemoteFile).mock.calls[0][0].overwrite).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: "Overwrite and transfer" }));
+
+    await waitFor(() => expect(uploadRemoteFile).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(uploadRemoteFile).mock.calls[1][0].overwrite).toBe(true);
+  });
+
+  it("cancels a running transfer and reports the incomplete partial state", async () => {
+    vi.mocked(browseRemoteFiles).mockResolvedValue(listing());
+    let resolveUpload: (result: FileTransferResult) => void = () => undefined;
+    vi.mocked(uploadRemoteFile).mockImplementation(
+      (input) =>
+        new Promise<FileTransferResult>((resolve) => {
+          resolveUpload = (result) => resolve({ ...result, transferId: input.transferId });
+        }),
+    );
+    vi.mocked(cancelFileTransfer).mockResolvedValue(true);
+    renderPage();
+
+    const user = await openRoot();
+    await screen.findByText("readme.txt");
+    await user.click(screen.getByRole("button", { name: "Upload" }));
+    await user.type(screen.getByLabelText("Local source path"), "/home/user/readme.txt");
+    await user.click(screen.getByRole("button", { name: "Start upload" }));
+
+    await user.click(await screen.findByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(cancelFileTransfer).toHaveBeenCalledTimes(1));
+
+    const transferId = vi.mocked(uploadRemoteFile).mock.calls[0][0].transferId;
+    expect(cancelFileTransfer).toHaveBeenCalledWith(transferId);
+    resolveUpload(
+      transferResult({
+        status: "cancelled",
+        bytesTransferred: 4,
+        totalBytes: 12,
+        filesTransferred: 0,
+        mayBeIncomplete: true,
+        partialPaths: ["/var/www/readme.txt.serverdesk-abc.part"],
+      }),
+    );
+
+    expect(await screen.findByText("This transfer may be incomplete")).toBeInTheDocument();
+    expect(screen.getByText(/readme\.txt\.serverdesk-abc\.part/)).toBeInTheDocument();
+    expect(screen.getByText("Cancelled")).toBeInTheDocument();
+  });
+
+  it("requires confirmation before deleting a remote entry and reports verification", async () => {
+    vi.mocked(browseRemoteFiles).mockResolvedValue(listing());
+    vi.mocked(deleteRemoteEntry).mockResolvedValue(mutationResult());
+    renderPage();
+
+    const user = await openRoot();
+    await screen.findByText("readme.txt");
+    await user.click(screen.getByRole("button", { name: "Delete readme.txt" }));
+
+    expect(await screen.findByText("Delete readme.txt?")).toBeInTheDocument();
+    expect(deleteRemoteEntry).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Delete file" }));
+
+    await waitFor(() =>
+      expect(deleteRemoteEntry).toHaveBeenCalledWith(
+        expect.objectContaining({
+          path: "/var/www/readme.txt",
+          confirmed: true,
+          recursive: false,
+        }),
+      ),
+    );
+    expect(await screen.findByText("Entry deleted")).toBeInTheDocument();
+    expect(screen.getAllByText("Verified by re-reading the remote path.").length).toBeGreaterThan(
+      0,
+    );
+  });
+
+  it("renames an entry only after the confirmation dialog is submitted", async () => {
+    vi.mocked(browseRemoteFiles).mockResolvedValue(listing());
+    vi.mocked(renameRemoteEntry).mockResolvedValue(
+      mutationResult({
+        action: "rename",
+        targetPath: "/var/www/renamed.txt",
+      }),
+    );
+    renderPage();
+
+    const user = await openRoot();
+    await screen.findByText("readme.txt");
+    await user.click(screen.getByRole("button", { name: "Rename readme.txt" }));
+
+    const input = await screen.findByLabelText("New name");
+    await user.clear(input);
+    await user.type(input, "renamed.txt");
+    expect(renameRemoteEntry).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Rename" }));
+
+    await waitFor(() =>
+      expect(renameRemoteEntry).toHaveBeenCalledWith(
+        expect.objectContaining({
+          path: "/var/www/readme.txt",
+          newName: "renamed.txt",
+          confirmed: true,
+        }),
+      ),
+    );
+    expect(await screen.findByText("Entry renamed")).toBeInTheDocument();
+  });
+
+  it("creates a folder in the current directory after validating the name", async () => {
+    vi.mocked(browseRemoteFiles).mockResolvedValue(listing());
+    vi.mocked(createRemoteFolder).mockResolvedValue(
+      mutationResult({
+        action: "create_folder",
+        path: "/var/www",
+        targetPath: "/var/www/backups",
+      }),
+    );
+    renderPage();
+
+    const user = await openRoot();
+    await screen.findByText("readme.txt");
+    await user.click(screen.getByRole("button", { name: "New folder" }));
+
+    const input = await screen.findByLabelText("Folder name");
+    await user.type(input, "backups");
+    await user.click(screen.getByRole("button", { name: "Create folder" }));
+
+    await waitFor(() =>
+      expect(createRemoteFolder).toHaveBeenCalledWith(
+        expect.objectContaining({
+          root: "/var/www",
+          parent: "/var/www",
+          name: "backups",
+        }),
+      ),
+    );
+    expect(await screen.findByText("Folder created")).toBeInTheDocument();
   });
 });

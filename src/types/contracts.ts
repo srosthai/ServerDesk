@@ -9,6 +9,7 @@ export type ErrorCode =
   | "permission"
   | "remote"
   | "cancelled"
+  | "conflict"
   | "not_found"
   | "storage"
   | "credential"
@@ -272,6 +273,68 @@ export type RemoteFileListing = {
   truncated: boolean;
   sampledAt: number;
   durationMs: number;
+  connectionState: ConnectionState;
+};
+
+export type FileTransferDirection = "upload" | "download";
+
+export type FileTransferStatus = "running" | "completed" | "cancelled" | "failed";
+
+export type FileTransferKind = "file" | "directory";
+
+export type FileTransferProgress = {
+  transferId: string;
+  serverId: string;
+  direction: FileTransferDirection;
+  status: FileTransferStatus;
+  kind: FileTransferKind;
+  bytesTransferred: number;
+  totalBytes: number | null;
+  filesTransferred: number;
+  filesTotal: number | null;
+  currentPath: string | null;
+  mayBeIncomplete: boolean;
+  emittedAt: number;
+};
+
+export type FileTransferResult = {
+  transferId: string;
+  serverId: string;
+  direction: FileTransferDirection;
+  kind: FileTransferKind;
+  status: FileTransferStatus;
+  sourcePath: string;
+  destinationPath: string;
+  bytesTransferred: number;
+  totalBytes: number | null;
+  filesTransferred: number;
+  filesTotal: number | null;
+  directoriesCreated: number;
+  skippedEntries: number;
+  warnings: string[];
+  partialPaths: string[];
+  mayBeIncomplete: boolean;
+  overwrite: boolean;
+  startedAt: number;
+  finishedAt: number;
+  durationMs: number;
+  error?: CommandError;
+  connectionState: ConnectionState;
+};
+
+export type RemoteMutationAction = "create_folder" | "rename" | "delete";
+
+export type RemoteMutationResult = {
+  serverId: string;
+  action: RemoteMutationAction;
+  root: string;
+  path: string;
+  targetPath?: string;
+  recursive: boolean;
+  deletedEntries: number;
+  verified: boolean;
+  verificationDetail?: string;
+  completedAt: number;
   connectionState: ConnectionState;
 };
 
