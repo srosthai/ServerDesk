@@ -1,6 +1,7 @@
 pub mod artisan;
 pub mod credentials;
 pub mod error;
+pub mod files;
 pub mod identity;
 pub mod logs;
 pub mod monitoring;

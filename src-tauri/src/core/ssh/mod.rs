@@ -10,6 +10,7 @@ pub use russh_transport::RusshTransport;
 pub use testing::{ConnectionTestOutcome, test_connection};
 pub use types::{
     Authentication, CONNECTION_STATE_EVENT, CommandOutput, ConnectionEventSink, ConnectionRequest,
-    ConnectionSnapshot, ConnectionState, ConnectionTimeouts, HostKeyDetails, SshSession,
-    SshTransport, TransportError, TrustedHostKey, validate_host_key_metadata,
+    ConnectionSnapshot, ConnectionState, ConnectionTimeouts, HostKeyDetails, SftpBrowser,
+    SftpDirEntry, SftpEntryKind, SftpError, SftpMetadata, SshSession, SshTransport, TransportError,
+    TrustedHostKey, validate_host_key_metadata,
 };

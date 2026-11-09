@@ -247,6 +247,34 @@ export type ProjectRecord = {
   recentOperations: ProjectOperationSummary[];
 };
 
+export type RemoteEntryType = "file" | "directory" | "symlink" | "other";
+
+export type RemoteFileEntry = {
+  name: string;
+  path: string;
+  entryType: RemoteEntryType;
+  size: number | null;
+  permissions: string | null;
+  mode: number | null;
+  modifiedAt: number | null;
+  symlinkTarget?: string;
+  resolvedPath?: string;
+  symlinkEscapesRoot?: boolean;
+  brokenSymlink: boolean;
+};
+
+export type RemoteFileListing = {
+  serverId: string;
+  root: string;
+  path: string;
+  resolvedPath: string;
+  entries: RemoteFileEntry[];
+  truncated: boolean;
+  sampledAt: number;
+  durationMs: number;
+  connectionState: ConnectionState;
+};
+
 export type RemoteDirectory = {
   name: string;
   path: string;

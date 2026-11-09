@@ -159,6 +159,105 @@ pub struct CommandOutput {
     pub exit_code: Option<u32>,
 }
 
+/// The file type reported by the remote SFTP server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SftpEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+/// Metadata for one remote file or directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SftpMetadata {
+    pub kind: SftpEntryKind,
+    pub size: Option<u64>,
+    pub mode: Option<u32>,
+    /// Modification time in seconds since the Unix epoch.
+    pub modified_at: Option<i64>,
+}
+
+/// One directory entry returned by the remote SFTP server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SftpDirEntry {
+    pub name: String,
+    pub metadata: SftpMetadata,
+}
+
+/// Typed failures from the SFTP subsystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SftpError {
+    PermissionDenied,
+    NotFound,
+    NotDirectory,
+    Timeout,
+    Disconnected,
+    Unsupported,
+    Protocol(String),
+}
+
+impl SftpError {
+    pub fn to_app_error(&self) -> AppError {
+        match self {
+            Self::PermissionDenied => AppError::permission(
+                "The SSH account does not have permission to read this remote location.",
+            )
+            .with_details(
+                "ServerDesk does not elevate with sudo. Grant read access to the SSH account, \
+                 or choose another directory.",
+            ),
+            Self::NotFound => AppError::not_found("The remote path does not exist.").with_details(
+                "The directory may have been moved or removed. Browse to its parent and try again.",
+            ),
+            Self::NotDirectory => AppError::validation(
+                "The selected remote path is not a directory, so it cannot be browsed.",
+            ),
+            Self::Timeout => AppError::timeout("The remote file request timed out."),
+            Self::Disconnected => AppError::connection(
+                "The SSH connection is not available. Reconnect before browsing files.",
+            ),
+            Self::Unsupported => AppError::remote(
+                "The SSH server does not support the SFTP subsystem required for file browsing.",
+            )
+            .with_details(
+                "ServerDesk browses files over the authenticated SSH connection. No separate \
+                 file-transfer port is used.",
+            ),
+            Self::Protocol(detail) => {
+                AppError::remote("The remote file request failed.").with_details(detail.clone())
+            }
+        }
+    }
+}
+
+/// A live SFTP subsystem channel on an authenticated SSH session.
+///
+/// Implementations only expose read-only metadata operations. File content is
+/// not read by the browsing layer, and paths are always supplied by the caller
+/// after validation. The channel is closed when the listing is complete.
+#[async_trait::async_trait]
+pub trait SftpBrowser: Send + Sync {
+    /// Resolves `.`/`..` and symlinks to one canonical absolute remote path.
+    async fn canonicalize(&self, path: &str) -> Result<String, SftpError>;
+
+    /// Stats one path, following a symlink at the final component.
+    async fn stat(&self, path: &str) -> Result<SftpMetadata, SftpError>;
+
+    /// Lists at most `max_entries` entries and reports whether more existed.
+    async fn read_dir(
+        &self,
+        path: &str,
+        max_entries: usize,
+    ) -> Result<(Vec<SftpDirEntry>, bool), SftpError>;
+
+    /// Reads the raw target of one symbolic link.
+    async fn read_link(&self, path: &str) -> Result<String, SftpError>;
+
+    /// Closes the SFTP subsystem channel.
+    async fn close(&self) -> Result<(), SftpError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {
     HostKeyUnknown {
@@ -252,6 +351,17 @@ pub trait SshSession: Send + Sync {
     ) -> Result<std::sync::Arc<dyn TerminalChannel>, TransportError> {
         Err(TransportError::Remote(
             "This SSH session does not support an interactive terminal.".to_string(),
+        ))
+    }
+
+    /// Opens an SFTP subsystem channel over the already authenticated session.
+    ///
+    /// The SFTP subsystem runs inside the SSH connection on the same port. No
+    /// separate file-transfer listener or public port is opened. Implementations
+    /// that cannot provide SFTP keep the typed default failure.
+    async fn open_sftp(&self) -> Result<std::sync::Arc<dyn SftpBrowser>, TransportError> {
+        Err(TransportError::Remote(
+            "This SSH session does not support SFTP file browsing.".to_string(),
         ))
     }
 
