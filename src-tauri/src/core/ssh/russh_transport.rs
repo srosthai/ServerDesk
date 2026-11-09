@@ -660,6 +660,14 @@ impl SftpBrowser for RusshSftpBrowser {
             match self.session.readdir(handle.handle.as_str()).await {
                 Ok(name) => {
                     for file in name.files {
+                        // OpenSSH and other SFTP servers include the synthetic
+                        // `.` and `..` entries in directory listings. They are
+                        // not real children, are never valid file names, and
+                        // must not count against the entry bound or reach the
+                        // recursive delete/transfer walkers.
+                        if file.filename == "." || file.filename == ".." {
+                            continue;
+                        }
                         if entries.len() >= max_entries {
                             truncated = true;
                             break;
