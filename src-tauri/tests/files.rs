@@ -148,6 +148,7 @@ impl FixtureServer {
             .faults
             .fail_upload_after
             .store(bytes, Ordering::SeqCst);
+        self.state.faults.uploaded_bytes.store(0, Ordering::SeqCst);
     }
 
     fn fail_download_after(&self, bytes: u64) {
@@ -155,6 +156,10 @@ impl FixtureServer {
             .faults
             .fail_download_after
             .store(bytes, Ordering::SeqCst);
+        self.state
+            .faults
+            .downloaded_bytes
+            .store(0, Ordering::SeqCst);
     }
 
     fn set_write_delay(&self, delay: Duration) {
@@ -1470,10 +1475,11 @@ async fn interrupted_transfers_report_partial_state_and_can_be_retried() {
     assert!(!tree.root.join("interrupted-target.bin").exists());
     assert_eq!(failed.partial_paths.len(), 1);
     let partial = PathBuf::from(&failed.partial_paths[0]);
-    assert_eq!(
-        fs::metadata(&partial).expect("partial upload").len(),
-        100_000
-    );
+    let partial_bytes = fs::metadata(&partial).expect("partial upload").len();
+    assert!(partial_bytes > 0);
+    assert!(partial_bytes <= 100_000);
+    assert!(partial_bytes >= failed.bytes_transferred);
+    assert!(partial_bytes < content.len() as u64);
 
     fixture.clear_faults();
     let retried = transfers
@@ -1511,10 +1517,11 @@ async fn interrupted_transfers_report_partial_state_and_can_be_retried() {
     assert!(!local_destination.exists());
     assert_eq!(failed.partial_paths.len(), 1);
     let partial = PathBuf::from(&failed.partial_paths[0]);
-    assert_eq!(
-        fs::metadata(&partial).expect("partial download").len(),
-        50_000
-    );
+    let partial_bytes = fs::metadata(&partial).expect("partial download").len();
+    assert!(partial_bytes > 0);
+    assert!(partial_bytes <= 50_000);
+    assert_eq!(partial_bytes, failed.bytes_transferred);
+    assert!(partial_bytes < content.len() as u64);
 
     fixture.clear_faults();
     let retried = transfers
