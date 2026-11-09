@@ -49,6 +49,10 @@ const presentations: Record<ErrorCode, ConnectionErrorPresentation> = {
     title: "Connection cancelled",
     action: "Start the connection test again when you are ready.",
   },
+  conflict: {
+    title: "The destination already exists",
+    action: "Confirm overwrite explicitly before replacing an existing file.",
+  },
   not_found: {
     title: "Server or credential not found",
     action: "Refresh the server list and check that the saved credential still exists.",

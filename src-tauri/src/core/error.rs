@@ -17,6 +17,7 @@ pub enum ErrorCode {
     Permission,
     Remote,
     Cancelled,
+    Conflict,
     NotFound,
     Storage,
     Credential,
@@ -83,6 +84,10 @@ impl AppError {
 
     pub fn cancelled(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Cancelled, message)
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Conflict, message)
     }
 
     pub fn not_found(message: impl Into<String>) -> Self {
