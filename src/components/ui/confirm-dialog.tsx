@@ -52,7 +52,7 @@ function ConfirmDialog({
             {details.map((detail) => (
               <React.Fragment key={detail.label}>
                 <dt className="text-[11px] leading-5 text-muted-foreground">{detail.label}</dt>
-                <dd className="break-words font-mono text-[12px] leading-5 text-foreground">
+                <dd className="break-words whitespace-pre-line font-mono text-[12px] leading-5 text-foreground">
                   {detail.value}
                 </dd>
               </React.Fragment>
