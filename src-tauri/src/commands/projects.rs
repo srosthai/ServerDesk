@@ -5,7 +5,7 @@ use tauri::State;
 
 use crate::{
     core::{
-        AppError,
+        AppError, ErrorCode,
         artisan::{ArtisanAction, ArtisanActionResult, run_artisan_action as run_artisan},
         history::{
             now_unix_seconds, record_operation, result_from_exit_code, summarize_error,
@@ -144,6 +144,7 @@ pub async fn run_project_artisan_action(
     let result = match outcome {
         Ok(result) => result,
         Err(error) => {
+            let outcome_unknown = artisan_failure_is_unknown(action, &error);
             let _ = record_operation(
                 database.inner(),
                 &NewOperationRecord {
@@ -151,14 +152,27 @@ pub async fn run_project_artisan_action(
                     project_id: Some(project_id),
                     category: OperationCategory::Artisan,
                     operation: action.operation_name().to_string(),
-                    safe_summary: format!(
-                        "The Artisan {} action for {} did not complete",
-                        action.argument(),
-                        target_path
-                    ),
+                    safe_summary: if outcome_unknown {
+                        format!(
+                            "The Artisan {} action for {} has an unknown outcome; verify the \
+                             project state before retrying",
+                            action.argument(),
+                            target_path
+                        )
+                    } else {
+                        format!(
+                            "The Artisan {} action for {} did not complete",
+                            action.argument(),
+                            target_path
+                        )
+                    },
                     path: Some(target_path),
                     output_summary: summarize_error(&error),
-                    result: OperationResult::Failure,
+                    result: if outcome_unknown {
+                        OperationResult::Unknown
+                    } else {
+                        OperationResult::Failure
+                    },
                     exit_code: None,
                     started_at,
                     duration_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
@@ -193,6 +207,16 @@ pub async fn run_project_artisan_action(
     })
 }
 
+/// A destructive Artisan action that loses its connection may have completed
+/// on the server. Its history must stay unknown until the user verifies it.
+fn artisan_failure_is_unknown(action: ArtisanAction, error: &AppError) -> bool {
+    action.destructive()
+        && matches!(
+            error.code,
+            ErrorCode::Timeout | ErrorCode::Network | ErrorCode::Connection
+        )
+}
+
 #[tauri::command]
 pub fn delete_project(
     database: State<'_, Database>,
@@ -213,4 +237,33 @@ pub fn delete_project(
 
     database.delete_project(&id)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_destructive_action_transport_failures_have_unknown_outcomes() {
+        for code in [
+            ErrorCode::Timeout,
+            ErrorCode::Network,
+            ErrorCode::Connection,
+        ] {
+            let error = AppError::new(code, "lost");
+            assert!(artisan_failure_is_unknown(
+                ArtisanAction::CacheClear,
+                &error
+            ));
+            assert!(!artisan_failure_is_unknown(
+                ArtisanAction::RouteList,
+                &error
+            ));
+        }
+
+        assert!(!artisan_failure_is_unknown(
+            ArtisanAction::CacheClear,
+            &AppError::validation("not confirmed")
+        ));
+    }
 }

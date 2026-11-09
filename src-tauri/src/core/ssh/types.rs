@@ -235,7 +235,11 @@ impl SftpError {
             Self::NotDirectory => AppError::validation(
                 "The selected remote path is not a directory, so it cannot be browsed.",
             ),
-            Self::Timeout => AppError::timeout("The remote file request timed out."),
+            Self::Timeout => AppError::timeout("The remote file request timed out.").with_details(
+                "The SFTP server may have applied the request without returning its response. \
+                 Re-read the path before retrying a change; transfer results report any preserved \
+                 partial data.",
+            ),
             Self::Disconnected => AppError::connection(
                 "The SSH connection is not available. Reconnect before browsing files.",
             ),

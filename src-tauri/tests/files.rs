@@ -43,20 +43,28 @@ const PASSWORD: &str = "fixture-password";
 
 struct FixtureFaults {
     fail_upload_after: AtomicU64,
+    truncate_upload_after: AtomicU64,
     fail_download_after: AtomicU64,
     uploaded_bytes: AtomicU64,
     downloaded_bytes: AtomicU64,
     write_delay_millis: AtomicU64,
+    read_delay_millis: AtomicU64,
+    fail_remove_after: AtomicU64,
+    remove_count: AtomicU64,
 }
 
 impl FixtureFaults {
     fn new() -> Self {
         Self {
             fail_upload_after: AtomicU64::new(u64::MAX),
+            truncate_upload_after: AtomicU64::new(u64::MAX),
             fail_download_after: AtomicU64::new(u64::MAX),
             uploaded_bytes: AtomicU64::new(0),
             downloaded_bytes: AtomicU64::new(0),
             write_delay_millis: AtomicU64::new(0),
+            read_delay_millis: AtomicU64::new(0),
+            fail_remove_after: AtomicU64::new(u64::MAX),
+            remove_count: AtomicU64::new(0),
         }
     }
 }
@@ -162,10 +170,33 @@ impl FixtureServer {
             .store(0, Ordering::SeqCst);
     }
 
+    fn truncate_upload_after(&self, bytes: u64) {
+        self.state
+            .faults
+            .truncate_upload_after
+            .store(bytes, Ordering::SeqCst);
+        self.state.faults.uploaded_bytes.store(0, Ordering::SeqCst);
+    }
+
+    fn fail_remove_after(&self, removals: u64) {
+        self.state
+            .faults
+            .fail_remove_after
+            .store(removals, Ordering::SeqCst);
+        self.state.faults.remove_count.store(0, Ordering::SeqCst);
+    }
+
     fn set_write_delay(&self, delay: Duration) {
         self.state
             .faults
             .write_delay_millis
+            .store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    fn set_read_delay(&self, delay: Duration) {
+        self.state
+            .faults
+            .read_delay_millis
             .store(delay.as_millis() as u64, Ordering::SeqCst);
     }
 
@@ -186,6 +217,10 @@ impl FixtureServer {
             .faults
             .fail_download_after
             .store(u64::MAX, Ordering::SeqCst);
+        self.state
+            .faults
+            .truncate_upload_after
+            .store(u64::MAX, Ordering::SeqCst);
         self.state.faults.uploaded_bytes.store(0, Ordering::SeqCst);
         self.state
             .faults
@@ -195,6 +230,15 @@ impl FixtureServer {
             .faults
             .write_delay_millis
             .store(0, Ordering::SeqCst);
+        self.state
+            .faults
+            .read_delay_millis
+            .store(0, Ordering::SeqCst);
+        self.state
+            .faults
+            .fail_remove_after
+            .store(u64::MAX, Ordering::SeqCst);
+        self.state.faults.remove_count.store(0, Ordering::SeqCst);
     }
 
     async fn wait_until_idle(&self) {
@@ -448,6 +492,10 @@ impl SftpHandler for FixtureSftpSession {
         offset: u64,
         len: u32,
     ) -> Result<Data, Self::Error> {
+        let delay = self.state.faults.read_delay_millis.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         let Some(OpenHandle::File(entry)) = self.handles.get_mut(&handle) else {
             return Err(StatusCode::Failure);
         };
@@ -499,6 +547,11 @@ impl SftpHandler for FixtureSftpSession {
             .map_err(map_io_error)?;
 
         let limit = self.state.faults.fail_upload_after.load(Ordering::SeqCst);
+        let truncate = self
+            .state
+            .faults
+            .truncate_upload_after
+            .load(Ordering::SeqCst);
         let mut accepted = data.len();
         if limit != u64::MAX {
             let written_so_far = self.state.faults.uploaded_bytes.load(Ordering::SeqCst);
@@ -506,6 +559,10 @@ impl SftpHandler for FixtureSftpSession {
                 return Err(StatusCode::Failure);
             }
             accepted = accepted.min((limit - written_so_far) as usize);
+        }
+        if truncate != u64::MAX {
+            let written_so_far = self.state.faults.uploaded_bytes.load(Ordering::SeqCst);
+            accepted = accepted.min((truncate.saturating_sub(written_so_far)) as usize);
         }
 
         entry
@@ -517,7 +574,7 @@ impl SftpHandler for FixtureSftpSession {
             .faults
             .uploaded_bytes
             .fetch_add(accepted as u64, Ordering::SeqCst);
-        if accepted < data.len() {
+        if limit != u64::MAX && accepted < data.len() {
             return Err(StatusCode::Failure);
         }
 
@@ -566,6 +623,14 @@ impl SftpHandler for FixtureSftpSession {
     }
 
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
+        let limit = self.state.faults.fail_remove_after.load(Ordering::SeqCst);
+        if limit != u64::MAX && self.state.faults.remove_count.load(Ordering::SeqCst) >= limit {
+            return Err(StatusCode::Failure);
+        }
+        self.state
+            .faults
+            .remove_count
+            .fetch_add(1, Ordering::SeqCst);
         let path = self.check_path(&filename)?;
         fs::remove_file(path).map_err(map_io_error)?;
         Ok(Status {
@@ -1446,6 +1511,63 @@ async fn cancellation_stops_upload_and_preserves_the_partial_file() {
 }
 
 #[tokio::test]
+async fn cancellation_stops_download_and_preserves_the_partial_file() {
+    let tree = fixture_tree();
+    let fixture = FixtureServer::start(tree.root.clone(), vec![tree.denied.clone()]).await;
+    let connections = manager();
+    connect(&connections, &fixture).await;
+    let (transfers, sink) = transfer_manager(Arc::clone(&connections));
+    let root = root_string(&tree.root);
+    let remote_source = tree.root.join("cancel-download-source.bin");
+    let content = test_content(1_500_000);
+    fs::write(&remote_source, &content).expect("download source");
+    let local_destination = tree._directory.path().join("cancel-download.bin");
+    fixture.set_read_delay(Duration::from_millis(5));
+
+    let download_transfers = Arc::clone(&transfers);
+    let request = download_request(
+        "cancel-download-1",
+        &root,
+        &root_string(&remote_source),
+        &local_destination,
+        false,
+    );
+    let task = tokio::spawn(async move { download_transfers.download(request).await });
+
+    sink.wait_for(|event| {
+        event.transfer_id == "cancel-download-1"
+            && event.status == FileTransferStatus::Running
+            && event.bytes_transferred > 0
+    })
+    .await;
+    assert!(
+        transfers
+            .cancel("cancel-download-1")
+            .expect("cancel download")
+    );
+
+    let result: FileTransferResult = task
+        .await
+        .expect("download task")
+        .expect("cancelled download result");
+    assert_eq!(result.status, FileTransferStatus::Cancelled);
+    assert!(result.may_be_incomplete);
+    assert!(result.bytes_transferred > 0);
+    assert!(result.bytes_transferred < content.len() as u64);
+    assert!(!local_destination.exists());
+    assert_eq!(result.partial_paths.len(), 1);
+    let partial = PathBuf::from(&result.partial_paths[0]);
+    assert!(partial.exists(), "the partial download must be preserved");
+    assert!(fs::metadata(&partial).expect("partial metadata").len() > 0);
+
+    connections
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+    fixture.wait_until_idle().await;
+}
+
+#[tokio::test]
 async fn interrupted_transfers_report_partial_state_and_can_be_retried() {
     let tree = fixture_tree();
     let fixture = FixtureServer::start(tree.root.clone(), vec![tree.denied.clone()]).await;
@@ -1540,6 +1662,209 @@ async fn interrupted_transfers_report_partial_state_and_can_be_retried() {
     assert_eq!(
         fs::read(&local_destination).expect("retried download"),
         content
+    );
+
+    connections
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+    fixture.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn uploads_reverify_the_remote_size_and_remove_a_truncated_destination() {
+    let tree = fixture_tree();
+    let fixture = FixtureServer::start(tree.root.clone(), vec![tree.denied.clone()]).await;
+    let connections = manager();
+    connect(&connections, &fixture).await;
+    let (transfers, _sink) = transfer_manager(Arc::clone(&connections));
+    let root = root_string(&tree.root);
+    let local_source = tree._directory.path().join("truncated-source.bin");
+    let content = test_content(220_000);
+    fs::write(&local_source, &content).expect("truncated source");
+    let remote_target = root_string(&tree.root.join("truncated-target.bin"));
+    fixture.truncate_upload_after(100_000);
+
+    let result = transfers
+        .upload(upload_request(
+            "truncated-upload-1",
+            &root,
+            &local_source,
+            &remote_target,
+            false,
+        ))
+        .await
+        .expect("a verification failure still returns transfer state");
+
+    assert_eq!(result.status, FileTransferStatus::Failed);
+    assert!(result.may_be_incomplete);
+    assert!(result.error.is_some());
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("rolled back")),
+        "the result must disclose the rollback: {:?}",
+        result.warnings
+    );
+    assert!(
+        !tree.root.join("truncated-target.bin").exists(),
+        "an unverified remote file must not be left in place as a completed upload"
+    );
+
+    connections
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+    fixture.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn failed_upload_verification_restores_an_existing_destination() {
+    let tree = fixture_tree();
+    let fixture = FixtureServer::start(tree.root.clone(), vec![tree.denied.clone()]).await;
+    let connections = manager();
+    connect(&connections, &fixture).await;
+    let (transfers, _sink) = transfer_manager(Arc::clone(&connections));
+    let root = root_string(&tree.root);
+    let local_source = tree
+        ._directory
+        .path()
+        .join("overwrite-truncated-source.bin");
+    let content = test_content(220_000);
+    fs::write(&local_source, &content).expect("overwrite source");
+    let remote_target = tree.root.join("overwrite-truncated-target.bin");
+    fs::write(&remote_target, b"previous complete contents\n").expect("existing destination");
+    fixture.truncate_upload_after(100_000);
+
+    let result = transfers
+        .upload(upload_request(
+            "truncated-overwrite-1",
+            &root,
+            &local_source,
+            &root_string(&remote_target),
+            true,
+        ))
+        .await
+        .expect("a verification failure still returns transfer state");
+
+    assert_eq!(result.status, FileTransferStatus::Failed);
+    assert!(result.may_be_incomplete);
+    assert_eq!(
+        fs::read(&remote_target).expect("destination restored"),
+        b"previous complete contents\n",
+        "a failed overwrite verification must restore the previous complete file"
+    );
+
+    connections
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+    fixture.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn duplicate_transfers_to_the_same_destination_are_rejected() {
+    let tree = fixture_tree();
+    let fixture = FixtureServer::start(tree.root.clone(), vec![tree.denied.clone()]).await;
+    fixture.set_write_delay(Duration::from_millis(5));
+    let connections = manager();
+    connect(&connections, &fixture).await;
+    let (transfers, sink) = transfer_manager(Arc::clone(&connections));
+    let root = root_string(&tree.root);
+    let local_source = tree._directory.path().join("duplicate-source.bin");
+    fs::write(&local_source, test_content(1_500_000)).expect("duplicate source");
+    let remote_target = root_string(&tree.root.join("duplicate-target.bin"));
+
+    let upload_transfers = Arc::clone(&transfers);
+    let request = upload_request(
+        "duplicate-upload-1",
+        &root,
+        &local_source,
+        &remote_target,
+        false,
+    );
+    let task = tokio::spawn(async move { upload_transfers.upload(request).await });
+    sink.wait_for(|event| {
+        event.transfer_id == "duplicate-upload-1"
+            && event.status == FileTransferStatus::Running
+            && event.bytes_transferred > 0
+    })
+    .await;
+
+    let error = transfers
+        .upload(upload_request(
+            "duplicate-upload-2",
+            &root,
+            &local_source,
+            &remote_target,
+            false,
+        ))
+        .await
+        .expect_err("a second transfer to the same destination must be rejected");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(
+        error
+            .details
+            .as_deref()
+            .is_some_and(|details| details.contains("network retry"))
+    );
+
+    assert!(
+        transfers
+            .cancel("duplicate-upload-1")
+            .expect("cancel first")
+    );
+    let result = task
+        .await
+        .expect("upload task")
+        .expect("cancelled upload result");
+    assert_eq!(result.status, FileTransferStatus::Cancelled);
+    assert!(
+        !transfers
+            .cancel("duplicate-upload-2")
+            .expect("never started")
+    );
+
+    connections
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+    fixture.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn recursive_delete_reports_entries_already_removed_when_a_later_removal_fails() {
+    let tree = fixture_tree();
+    let partial = tree.root.join("partial-delete");
+    fs::create_dir(&partial).expect("partial delete directory");
+    fs::write(partial.join("first.txt"), b"first").expect("first partial file");
+    fs::write(partial.join("second.txt"), b"second").expect("second partial file");
+    let fixture = FixtureServer::start(tree.root.clone(), vec![tree.denied.clone()]).await;
+    let connections = manager();
+    connect(&connections, &fixture).await;
+    let root = root_string(&tree.root);
+    fixture.fail_remove_after(1);
+
+    let error = delete_remote_entry(
+        &connections,
+        "fixture-server",
+        &root,
+        &root_string(&partial),
+        true,
+        true,
+    )
+    .await
+    .expect_err("a partial recursive delete must not report success");
+    assert_eq!(error.code, ErrorCode::Remote);
+    let details = error.details.as_deref().expect("partial delete detail");
+    assert!(details.contains("1 remote entry had already been deleted"));
+    assert!(details.contains("verify what remains before retrying"));
+    assert!(partial.exists(), "the partially deleted directory remains");
+    let remaining = fs::read_dir(&partial).expect("remaining entries").count();
+    assert_eq!(
+        remaining, 1,
+        "exactly one child was removed before the failure"
     );
 
     connections

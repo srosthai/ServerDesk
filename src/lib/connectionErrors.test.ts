@@ -10,6 +10,9 @@ describe("describeConnectionError", () => {
       ["timeout", "Connection timed out"],
       ["dns", "Hostname could not be resolved"],
       ["network", "Network connection lost"],
+      ["permission", "Permission denied"],
+      ["remote", "Remote check failed"],
+      ["cancelled", "Connection cancelled"],
       ["credential", "Credential unavailable"],
     ];
 
