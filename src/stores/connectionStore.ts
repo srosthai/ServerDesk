@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { getCommandErrorMessage, isCommandError } from "@/lib/errors";
 import { isTauriRuntime } from "@/lib/tauri";
+import { usePreferencesStore } from "@/stores/preferencesStore";
 import {
   connectServer as connectServerCommand,
   disconnectServer as disconnectServerCommand,
@@ -84,6 +85,7 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
       busy: { ...state.busy, [serverId]: true },
       error: null,
     }));
+    usePreferencesStore.getState().setLastActiveServerId(serverId);
 
     try {
       const snapshot = await connectServerCommand(serverId);
