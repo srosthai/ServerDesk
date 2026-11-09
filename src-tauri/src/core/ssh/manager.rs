@@ -530,6 +530,42 @@ impl ConnectionManager {
         }
     }
 
+    /// Opens an SFTP subsystem channel on the managed session for `server_id`.
+    ///
+    /// The channel runs inside the authenticated SSH connection on the same
+    /// port. ServerDesk never opens a separate file-transfer listener.
+    pub async fn open_sftp(
+        &self,
+        server_id: &str,
+    ) -> Result<Arc<dyn super::SftpBrowser>, AppError> {
+        let session = {
+            let inner = self.lock()?;
+            inner
+                .sessions
+                .get(server_id)
+                .map(|entry| Arc::clone(&entry.session))
+                .ok_or_else(|| {
+                    AppError::connection(
+                        "The server is not connected. Reconnect before browsing files.",
+                    )
+                })?
+        };
+
+        match tokio::time::timeout(self.timeouts.command, session.open_sftp()).await {
+            Err(_) => Err(AppError::timeout(format!(
+                "Opening the SFTP file browser timed out after {} seconds.",
+                timeout_seconds(self.timeouts.command)
+            ))),
+            Ok(Err(error)) => {
+                if !session.is_healthy().await {
+                    let _ = self.mark_error(server_id, error.to_app_error());
+                }
+                Err(error.to_app_error())
+            }
+            Ok(Ok(browser)) => Ok(browser),
+        }
+    }
+
     fn state_locked(&self, server_id: &str) -> Result<ConnectionState, AppError> {
         let inner = self.lock()?;
         Ok(inner

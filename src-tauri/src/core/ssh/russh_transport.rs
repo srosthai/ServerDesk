@@ -13,18 +13,25 @@ use russh::{
     client::{self, Config, Handle, Msg},
     keys::{HashAlg, PrivateKeyWithHashAlg},
 };
+use russh_sftp::{
+    client::{RawSftpSession, error::Error as SftpClientError},
+    protocol::{FileAttributes, FileType as SftpFileType, StatusCode},
+};
 use tokio::net::TcpStream;
 
 use crate::core::terminal::{TerminalChannel, TerminalChannelEvent, TerminalOptions, TerminalSize};
 
 use super::{
-    Authentication, CommandOutput, ConnectionRequest, SshSession, SshTransport, TransportError,
-    TrustedHostKey, private_key::load_private_key,
+    Authentication, CommandOutput, ConnectionRequest, SftpBrowser, SftpDirEntry, SftpEntryKind,
+    SftpError, SftpMetadata, SshSession, SshTransport, TransportError, TrustedHostKey,
+    private_key::load_private_key,
 };
 
 const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_TERMINAL_HANDSHAKE_BUFFER_BYTES: usize = 1024 * 1024;
 const TERMINAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const SFTP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const SFTP_REQUEST_TIMEOUT_SECONDS: u64 = 10;
 
 #[derive(Debug, Clone)]
 enum HostKeyObservation {
@@ -411,6 +418,46 @@ impl SshSession for RusshSession {
         }))
     }
 
+    async fn open_sftp(&self) -> Result<Arc<dyn SftpBrowser>, TransportError> {
+        let channel = {
+            let handle = self.handle.lock().await;
+            if self.closed.load(Ordering::SeqCst) || handle.is_closed() {
+                return Err(TransportError::Network);
+            }
+            handle
+                .channel_open_session()
+                .await
+                .map_err(map_russh_error)?
+        };
+
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(map_russh_error)?;
+
+        // The subsystem runs over this SSH channel on the authenticated
+        // connection. No separate SFTP listener or file-transfer port is used.
+        let session = RawSftpSession::new_with_config(
+            channel.into_stream(),
+            russh_sftp::client::Config {
+                request_timeout_secs: SFTP_REQUEST_TIMEOUT_SECONDS,
+                ..Default::default()
+            },
+        );
+
+        match tokio::time::timeout(SFTP_HANDSHAKE_TIMEOUT, session.init()).await {
+            Err(_) => {
+                let _ = session.close_session();
+                Err(TransportError::Timeout)
+            }
+            Ok(Err(error)) => {
+                let _ = session.close_session();
+                Err(map_sftp_setup_error(error))
+            }
+            Ok(Ok(_)) => Ok(Arc::new(RusshSftpBrowser { session })),
+        }
+    }
+
     async fn is_healthy(&self) -> bool {
         if self.closed.load(Ordering::SeqCst) {
             return false;
@@ -501,6 +548,144 @@ impl TerminalChannel for RusshTerminalChannel {
             return Ok(());
         }
         self.write.close().await.map_err(map_russh_error)
+    }
+}
+
+struct RusshSftpBrowser {
+    session: RawSftpSession,
+}
+
+#[async_trait]
+impl SftpBrowser for RusshSftpBrowser {
+    async fn canonicalize(&self, path: &str) -> Result<String, SftpError> {
+        let name = self
+            .session
+            .realpath(path)
+            .await
+            .map_err(map_sftp_client_error)?;
+        name.files
+            .into_iter()
+            .next()
+            .map(|file| file.filename)
+            .ok_or_else(|| SftpError::Protocol("The SFTP server returned no resolved path.".into()))
+    }
+
+    async fn stat(&self, path: &str) -> Result<SftpMetadata, SftpError> {
+        let attrs = self
+            .session
+            .stat(path)
+            .await
+            .map_err(map_sftp_client_error)?;
+        Ok(metadata_from_attrs(&attrs.attrs))
+    }
+
+    async fn read_dir(
+        &self,
+        path: &str,
+        max_entries: usize,
+    ) -> Result<(Vec<SftpDirEntry>, bool), SftpError> {
+        let handle = self
+            .session
+            .opendir(path)
+            .await
+            .map_err(map_sftp_client_error)?;
+        let mut entries = Vec::new();
+        let mut truncated = false;
+
+        loop {
+            match self.session.readdir(handle.handle.as_str()).await {
+                Ok(name) => {
+                    for file in name.files {
+                        if entries.len() >= max_entries {
+                            truncated = true;
+                            break;
+                        }
+                        entries.push(SftpDirEntry {
+                            name: file.filename,
+                            metadata: metadata_from_attrs(&file.attrs),
+                        });
+                    }
+                    if truncated {
+                        break;
+                    }
+                }
+                Err(SftpClientError::Status(status)) if status.status_code == StatusCode::Eof => {
+                    break;
+                }
+                Err(error) => {
+                    let _ = self.session.close(handle.handle).await;
+                    return Err(map_sftp_client_error(error));
+                }
+            }
+        }
+
+        let _ = self.session.close(handle.handle).await;
+        Ok((entries, truncated))
+    }
+
+    async fn read_link(&self, path: &str) -> Result<String, SftpError> {
+        let name = self
+            .session
+            .readlink(path)
+            .await
+            .map_err(map_sftp_client_error)?;
+        name.files
+            .into_iter()
+            .next()
+            .map(|file| file.filename)
+            .ok_or_else(|| SftpError::Protocol("The SFTP link has no target.".into()))
+    }
+
+    async fn close(&self) -> Result<(), SftpError> {
+        self.session.close_session().map_err(map_sftp_client_error)
+    }
+}
+
+fn metadata_from_attrs(attrs: &FileAttributes) -> SftpMetadata {
+    SftpMetadata {
+        kind: match attrs.file_type() {
+            SftpFileType::Dir => SftpEntryKind::Directory,
+            SftpFileType::File => SftpEntryKind::File,
+            SftpFileType::Symlink => SftpEntryKind::Symlink,
+            SftpFileType::Other => SftpEntryKind::Other,
+        },
+        size: attrs.size,
+        mode: attrs.permissions,
+        modified_at: attrs.mtime.map(i64::from),
+    }
+}
+
+fn map_sftp_client_error(error: SftpClientError) -> SftpError {
+    match error {
+        SftpClientError::Status(status) => match status.status_code {
+            StatusCode::NoSuchFile => SftpError::NotFound,
+            StatusCode::PermissionDenied => SftpError::PermissionDenied,
+            StatusCode::NoConnection | StatusCode::ConnectionLost => SftpError::Disconnected,
+            StatusCode::OpUnsupported => SftpError::Unsupported,
+            _ => SftpError::Protocol(status.error_message),
+        },
+        SftpClientError::Timeout => SftpError::Timeout,
+        SftpClientError::IO(detail)
+            if detail.to_ascii_lowercase().contains("eof")
+                || detail.to_ascii_lowercase().contains("closed") =>
+        {
+            SftpError::Disconnected
+        }
+        SftpClientError::UnexpectedBehavior(detail) if detail.contains("session closed") => {
+            SftpError::Disconnected
+        }
+        other => SftpError::Protocol(other.to_string()),
+    }
+}
+
+fn map_sftp_setup_error(error: SftpClientError) -> TransportError {
+    match map_sftp_client_error(error) {
+        SftpError::Timeout => TransportError::Timeout,
+        SftpError::Disconnected => TransportError::Network,
+        SftpError::Unsupported => TransportError::Remote(
+            "The SSH server does not support the SFTP subsystem.".to_string(),
+        ),
+        other => TransportError::Remote(other.to_app_error().message),
     }
 }
 
