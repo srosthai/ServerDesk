@@ -185,6 +185,28 @@ pub struct SftpDirEntry {
     pub metadata: SftpMetadata,
 }
 
+/// How an SFTP file handle is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SftpOpenMode {
+    /// Read an existing file.
+    Read,
+    /// Create or truncate a file and write it from the beginning.
+    Write,
+}
+
+/// One open remote file handle returned by [`SftpBrowser::open_file`].
+#[async_trait::async_trait]
+pub trait SftpFile: Send + Sync {
+    /// Reads at most `length` bytes starting at `offset`.
+    async fn read(&self, offset: u64, length: u32) -> Result<Vec<u8>, SftpError>;
+
+    /// Writes `data` at `offset`, extending the file when needed.
+    async fn write(&self, offset: u64, data: &[u8]) -> Result<(), SftpError>;
+
+    /// Closes the remote file handle.
+    async fn close(&self) -> Result<(), SftpError>;
+}
+
 /// Typed failures from the SFTP subsystem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SftpError {
@@ -233,9 +255,8 @@ impl SftpError {
 
 /// A live SFTP subsystem channel on an authenticated SSH session.
 ///
-/// Implementations only expose read-only metadata operations. File content is
-/// not read by the browsing layer, and paths are always supplied by the caller
-/// after validation. The channel is closed when the listing is complete.
+/// Paths are always supplied by the caller after validation against the
+/// selected root. The channel is closed when the operation is complete.
 #[async_trait::async_trait]
 pub trait SftpBrowser: Send + Sync {
     /// Resolves `.`/`..` and symlinks to one canonical absolute remote path.
@@ -243,6 +264,9 @@ pub trait SftpBrowser: Send + Sync {
 
     /// Stats one path, following a symlink at the final component.
     async fn stat(&self, path: &str) -> Result<SftpMetadata, SftpError>;
+
+    /// Stats one path without following a symlink at the final component.
+    async fn lstat(&self, path: &str) -> Result<SftpMetadata, SftpError>;
 
     /// Lists at most `max_entries` entries and reports whether more existed.
     async fn read_dir(
@@ -253,6 +277,25 @@ pub trait SftpBrowser: Send + Sync {
 
     /// Reads the raw target of one symbolic link.
     async fn read_link(&self, path: &str) -> Result<String, SftpError>;
+
+    /// Opens one remote file for reading or writing.
+    async fn open_file(
+        &self,
+        path: &str,
+        mode: SftpOpenMode,
+    ) -> Result<Box<dyn SftpFile>, SftpError>;
+
+    /// Creates one remote directory.
+    async fn mkdir(&self, path: &str) -> Result<(), SftpError>;
+
+    /// Removes one remote file or symbolic link.
+    async fn remove_file(&self, path: &str) -> Result<(), SftpError>;
+
+    /// Removes one empty remote directory.
+    async fn remove_dir(&self, path: &str) -> Result<(), SftpError>;
+
+    /// Renames one remote entry without following symlinks.
+    async fn rename(&self, from: &str, to: &str) -> Result<(), SftpError>;
 
     /// Closes the SFTP subsystem channel.
     async fn close(&self) -> Result<(), SftpError>;

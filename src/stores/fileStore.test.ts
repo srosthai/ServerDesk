@@ -1,11 +1,34 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { browseRemoteFiles } from "@/services/files";
+import {
+  browseRemoteFiles,
+  cancelFileTransfer,
+  createRemoteFolder,
+  createTransferId,
+  deleteRemoteEntry,
+  renameRemoteEntry,
+  uploadRemoteFile,
+} from "@/services/files";
 import { emptyFileBrowserEntry, useFileStore } from "@/stores/fileStore";
-import type { RemoteFileListing } from "@/types/contracts";
+import type {
+  FileTransferResult,
+  RemoteFileListing,
+  RemoteMutationResult,
+} from "@/types/contracts";
 
-vi.mock("@/services/files", () => ({
-  browseRemoteFiles: vi.fn(),
-}));
+vi.mock("@/services/files", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/services/files")>();
+  return {
+    ...actual,
+    browseRemoteFiles: vi.fn(),
+    uploadRemoteFile: vi.fn(),
+    downloadRemoteFile: vi.fn(),
+    cancelFileTransfer: vi.fn(),
+    createRemoteFolder: vi.fn(),
+    renameRemoteEntry: vi.fn(),
+    deleteRemoteEntry: vi.fn(),
+    createTransferId: vi.fn(() => "transfer-test-1"),
+  };
+});
 
 function listing(overrides: Partial<RemoteFileListing> = {}): RemoteFileListing {
   return {
@@ -40,11 +63,60 @@ function enableTauriRuntime() {
   });
 }
 
+function transferResult(overrides: Partial<FileTransferResult> = {}): FileTransferResult {
+  return {
+    transferId: "transfer-test-1",
+    serverId: "server-1",
+    direction: "upload",
+    kind: "file",
+    status: "completed",
+    sourcePath: "/home/user/file.txt",
+    destinationPath: "/var/www/file.txt",
+    bytesTransferred: 8,
+    totalBytes: 8,
+    filesTransferred: 1,
+    filesTotal: 1,
+    directoriesCreated: 0,
+    skippedEntries: 0,
+    warnings: [],
+    partialPaths: [],
+    mayBeIncomplete: false,
+    overwrite: false,
+    startedAt: 1_762_665_720_000,
+    finishedAt: 1_762_665_721_000,
+    durationMs: 1_000,
+    connectionState: "connected",
+    ...overrides,
+  };
+}
+
+function mutationResult(overrides: Partial<RemoteMutationResult> = {}): RemoteMutationResult {
+  return {
+    serverId: "server-1",
+    action: "create_folder",
+    root: "/var/www",
+    path: "/var/www",
+    targetPath: "/var/www/backups",
+    recursive: false,
+    deletedEntries: 0,
+    verified: true,
+    completedAt: 1_762_665_720_000,
+    connectionState: "connected",
+    ...overrides,
+  };
+}
+
 describe("file browser store", () => {
   beforeEach(() => {
     enableTauriRuntime();
-    useFileStore.setState({ entries: {} });
+    useFileStore.setState({ entries: {}, transfers: {}, mutations: {} });
     vi.mocked(browseRemoteFiles).mockReset();
+    vi.mocked(uploadRemoteFile).mockReset();
+    vi.mocked(cancelFileTransfer).mockReset();
+    vi.mocked(createRemoteFolder).mockReset();
+    vi.mocked(renameRemoteEntry).mockReset();
+    vi.mocked(deleteRemoteEntry).mockReset();
+    vi.mocked(createTransferId).mockReturnValue("transfer-test-1");
   });
 
   it("opens a root and stores the listing with the canonical root", async () => {
@@ -147,5 +219,209 @@ describe("file browser store", () => {
 
     useFileStore.getState().clearServer("server-1");
     expect(useFileStore.getState().entries["server-1"]).toBeUndefined();
+  });
+
+  it("stores upload progress and the completed transfer result", async () => {
+    vi.mocked(uploadRemoteFile).mockResolvedValue(transferResult());
+
+    const transferId = await useFileStore.getState().startUpload({
+      serverId: "server-1",
+      root: "/var/www",
+      localPath: "/home/user/file.txt",
+      remotePath: "/var/www/file.txt",
+    });
+
+    expect(uploadRemoteFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        transferId: "transfer-test-1",
+        overwrite: false,
+      }),
+    );
+    const transfer = useFileStore.getState().transfers[transferId];
+    expect(transfer?.status).toBe("completed");
+    expect(transfer?.bytesTransferred).toBe(8);
+    expect(transfer?.mayBeIncomplete).toBe(false);
+    expect(transfer?.request).toEqual({
+      direction: "upload",
+      serverId: "server-1",
+      root: "/var/www",
+      localPath: "/home/user/file.txt",
+      remotePath: "/var/www/file.txt",
+      overwrite: false,
+    });
+  });
+
+  it("keeps a conflict failure so the UI can ask for overwrite confirmation", async () => {
+    vi.mocked(uploadRemoteFile).mockRejectedValue({
+      code: "conflict",
+      message: "1 existing destination file would be overwritten.",
+      details: "Overwrite was not confirmed.",
+    });
+
+    const transferId = await useFileStore.getState().startUpload({
+      serverId: "server-1",
+      root: "/var/www",
+      localPath: "/home/user/file.txt",
+      remotePath: "/var/www/file.txt",
+    });
+
+    const transfer = useFileStore.getState().transfers[transferId];
+    expect(transfer?.status).toBe("failed");
+    expect(transfer?.errorCode).toBe("conflict");
+    expect(transfer?.error).toContain("overwritten");
+    expect(transfer?.request.overwrite).toBe(false);
+  });
+
+  it("tracks live progress, cancellation, and partial paths", async () => {
+    let resolveUpload: (result: FileTransferResult) => void = () => undefined;
+    vi.mocked(uploadRemoteFile).mockImplementation(
+      () =>
+        new Promise<FileTransferResult>((resolve) => {
+          resolveUpload = resolve;
+        }),
+    );
+    vi.mocked(cancelFileTransfer).mockResolvedValue(true);
+
+    const start = useFileStore.getState().startUpload({
+      serverId: "server-1",
+      root: "/var/www",
+      localPath: "/home/user/large.bin",
+      remotePath: "/var/www/large.bin",
+    });
+    const transferId = Object.keys(useFileStore.getState().transfers)[0];
+
+    useFileStore.getState().applyTransferProgress({
+      transferId,
+      serverId: "server-1",
+      direction: "upload",
+      status: "running",
+      kind: "file",
+      bytesTransferred: 4_096,
+      totalBytes: 8_192,
+      filesTransferred: 0,
+      filesTotal: 1,
+      currentPath: "/var/www/large.bin",
+      mayBeIncomplete: false,
+      emittedAt: 1_762_665_720_500,
+    });
+
+    let transfer = useFileStore.getState().transfers[transferId];
+    expect(transfer?.bytesTransferred).toBe(4_096);
+    expect(transfer?.totalBytes).toBe(8_192);
+
+    await expect(useFileStore.getState().cancelTransfer(transferId)).resolves.toBe(true);
+    expect(cancelFileTransfer).toHaveBeenCalledWith(transferId);
+    expect(useFileStore.getState().transfers[transferId]?.cancelling).toBe(true);
+
+    resolveUpload(
+      transferResult({
+        status: "cancelled",
+        bytesTransferred: 4_096,
+        totalBytes: 8_192,
+        filesTransferred: 0,
+        mayBeIncomplete: true,
+        partialPaths: ["/var/www/large.bin.serverdesk-test.part"],
+      }),
+    );
+    await start;
+
+    transfer = useFileStore.getState().transfers[transferId];
+    expect(transfer?.status).toBe("cancelled");
+    expect(transfer?.mayBeIncomplete).toBe(true);
+    expect(transfer?.partialPaths).toEqual(["/var/www/large.bin.serverdesk-test.part"]);
+    expect(transfer?.cancelling).toBe(false);
+  });
+
+  it("retries a failed transfer with overwrite unconfirmed", async () => {
+    vi.mocked(uploadRemoteFile)
+      .mockRejectedValueOnce({
+        code: "network",
+        message: "The SSH connection was lost.",
+      })
+      .mockResolvedValueOnce(transferResult());
+    vi.mocked(createTransferId)
+      .mockReturnValueOnce("transfer-test-1")
+      .mockReturnValueOnce("transfer-test-2");
+
+    const firstId = await useFileStore.getState().startUpload({
+      serverId: "server-1",
+      root: "/var/www",
+      localPath: "/home/user/file.txt",
+      remotePath: "/var/www/file.txt",
+      overwrite: true,
+    });
+    expect(useFileStore.getState().transfers[firstId]?.status).toBe("failed");
+
+    const retryId = await useFileStore.getState().retryTransfer(firstId);
+    expect(retryId).toBe("transfer-test-2");
+    expect(vi.mocked(uploadRemoteFile).mock.calls[1][0].overwrite).toBe(false);
+    expect(useFileStore.getState().transfers[retryId ?? ""]?.status).toBe("completed");
+  });
+
+  it("runs confirmed mutations and refreshes the current listing", async () => {
+    vi.mocked(browseRemoteFiles).mockResolvedValue(listing());
+    vi.mocked(createRemoteFolder).mockResolvedValue(mutationResult());
+    vi.mocked(renameRemoteEntry).mockResolvedValue(
+      mutationResult({
+        action: "rename",
+        path: "/var/www/readme.txt",
+        targetPath: "/var/www/renamed.txt",
+      }),
+    );
+    vi.mocked(deleteRemoteEntry).mockResolvedValue(
+      mutationResult({
+        action: "delete",
+        path: "/var/www/renamed.txt",
+        targetPath: undefined,
+        deletedEntries: 1,
+      }),
+    );
+    useFileStore.setState({
+      entries: {
+        "server-1": {
+          ...emptyFileBrowserEntry(),
+          root: "/var/www",
+          path: "/var/www",
+          listing: listing(),
+        },
+      },
+    });
+
+    await expect(
+      useFileStore.getState().createFolder("server-1", "/var/www", "/var/www", "backups"),
+    ).resolves.toBe(true);
+    expect(createRemoteFolder).toHaveBeenCalledWith({
+      serverId: "server-1",
+      root: "/var/www",
+      parent: "/var/www",
+      name: "backups",
+    });
+
+    await expect(
+      useFileStore
+        .getState()
+        .renameEntry("server-1", "/var/www", "/var/www/readme.txt", "renamed.txt"),
+    ).resolves.toBe(true);
+    expect(renameRemoteEntry).toHaveBeenCalledWith({
+      serverId: "server-1",
+      root: "/var/www",
+      path: "/var/www/readme.txt",
+      newName: "renamed.txt",
+      confirmed: true,
+    });
+
+    await expect(
+      useFileStore.getState().deleteEntry("server-1", "/var/www", "/var/www/renamed.txt", false),
+    ).resolves.toBe(true);
+    expect(deleteRemoteEntry).toHaveBeenCalledWith({
+      serverId: "server-1",
+      root: "/var/www",
+      path: "/var/www/renamed.txt",
+      confirmed: true,
+      recursive: false,
+    });
+
+    expect(useFileStore.getState().mutations["server-1"]?.result?.verified).toBe(true);
+    expect(vi.mocked(browseRemoteFiles).mock.calls.length).toBeGreaterThanOrEqual(3);
   });
 });

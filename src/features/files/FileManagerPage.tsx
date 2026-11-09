@@ -5,18 +5,24 @@ import {
   ArrowUpIcon,
   CaretRightIcon,
   CircleNotchIcon,
+  DownloadSimpleIcon,
   FileIcon,
   FilesIcon,
   FolderOpenIcon,
+  FolderPlusIcon,
   FolderSimpleIcon,
   InfoIcon,
   LinkIcon,
   ListMagnifyingGlassIcon,
+  PencilSimpleIcon,
+  TrashIcon,
+  UploadSimpleIcon,
   WarningCircleIcon,
 } from "@phosphor-icons/react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
@@ -37,6 +43,13 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { CreateFolderDialog, RenameEntryDialog } from "@/features/files/FileMutationDialogs";
+import {
+  FileTransferPanel,
+  TransferDialog,
+  type TransferPrompt,
+} from "@/features/files/FileTransferPanel";
+import { useFileTransferEvents } from "@/hooks/useFileTransferEvents";
 import {
   formatFileSize,
   normalizeRemotePath,
@@ -45,7 +58,7 @@ import {
 } from "@/lib/remotePaths";
 import { isTauriRuntime } from "@/lib/tauri";
 import { useConnectionStore } from "@/stores/connectionStore";
-import { useFileStore, type FileBrowserEntry } from "@/stores/fileStore";
+import { useFileStore, type FileBrowserEntry, type FileTransferState } from "@/stores/fileStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useServerStore } from "@/stores/serverStore";
 import type {
@@ -353,11 +366,17 @@ function DirectoryListing({
   pending,
   onNavigate,
   onOpenEntry,
+  onDownload,
+  onRename,
+  onDelete,
 }: {
   listing: RemoteFileListing;
   pending: boolean;
   onNavigate: (path: string) => void;
   onOpenEntry: (entry: RemoteFileEntry) => void;
+  onDownload: (entry: RemoteFileEntry) => void;
+  onRename: (entry: RemoteFileEntry) => void;
+  onDelete: (entry: RemoteFileEntry) => void;
 }) {
   const directoryCount = listing.entries.filter((entry) => entry.entryType === "directory").length;
 
@@ -406,6 +425,7 @@ function DirectoryListing({
               <TableHead className="text-right">Size</TableHead>
               <TableHead>Permissions</TableHead>
               <TableHead>Modified</TableHead>
+              <TableHead className="text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -458,6 +478,40 @@ function DirectoryListing({
                       {formatModifiedAt(entry.modifiedAt)}
                     </time>
                   </TableCell>
+                  <TableCell>
+                    <div className="flex justify-end gap-1">
+                      {entry.entryType === "file" || entry.entryType === "directory" ? (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => onDownload(entry)}
+                          aria-label={`Download ${entry.name}`}
+                        >
+                          <DownloadSimpleIcon className="size-3.5" aria-hidden="true" />
+                          Download
+                        </Button>
+                      ) : null}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => onRename(entry)}
+                        aria-label={`Rename ${entry.name}`}
+                      >
+                        <PencilSimpleIcon className="size-3.5" aria-hidden="true" />
+                        Rename
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => onDelete(entry)}
+                        aria-label={`Delete ${entry.name}`}
+                        className="text-destructive hover:text-destructive"
+                      >
+                        <TrashIcon className="size-3.5" aria-hidden="true" />
+                        Delete
+                      </Button>
+                    </div>
+                  </TableCell>
                 </TableRow>
               );
             })}
@@ -473,8 +527,8 @@ function DirectoryListing({
           </time>
         </span>
         <span>
-          Entry metadata only. ServerDesk does not read file content from this view and does not
-          open a separate file-transfer port.
+          Transfers use this same authenticated SSH session. No separate file-transfer port is
+          opened.
         </span>
       </div>
       {listing.truncated ? (
@@ -488,6 +542,8 @@ function DirectoryListing({
 }
 
 function FileManagerPage() {
+  useFileTransferEvents();
+
   const servers = useServerStore((state) => state.servers);
   const status = useServerStore((state) => state.status);
   const serverError = useServerStore((state) => state.error);
@@ -500,6 +556,23 @@ function FileManagerPage() {
   const refresh = useFileStore((state) => state.refresh);
   const goUp = useFileStore((state) => state.goUp);
   const clearError = useFileStore((state) => state.clearError);
+  const startUpload = useFileStore((state) => state.startUpload);
+  const startDownload = useFileStore((state) => state.startDownload);
+  const cancelTransfer = useFileStore((state) => state.cancelTransfer);
+  const retryTransfer = useFileStore((state) => state.retryTransfer);
+  const dismissTransfer = useFileStore((state) => state.dismissTransfer);
+  const createFolder = useFileStore((state) => state.createFolder);
+  const renameEntry = useFileStore((state) => state.renameEntry);
+  const deleteEntry = useFileStore((state) => state.deleteEntry);
+  const clearMutation = useFileStore((state) => state.clearMutation);
+  const transfers = useFileStore((state) => state.transfers);
+  const mutations = useFileStore((state) => state.mutations);
+
+  const [createFolderOpen, setCreateFolderOpen] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<RemoteFileEntry | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<RemoteFileEntry | null>(null);
+  const [transferPrompt, setTransferPrompt] = useState<TransferPrompt | null>(null);
+  const [overwriteTransfer, setOverwriteTransfer] = useState<FileTransferState | null>(null);
 
   const [selectedId, setSelectedId] = useState<string | null>(lastActiveServerId);
   const [pathInput, setPathInput] = useState(() => {
@@ -521,6 +594,13 @@ function FileManagerPage() {
     selectedServerId ? state.entries[selectedServerId] : undefined,
   );
   const listing = entry?.listing ?? null;
+  const mutation = selectedServerId ? mutations[selectedServerId] : undefined;
+  const root = entry?.root ?? listing?.root ?? null;
+  const serverTransfers = selectedServerId
+    ? Object.values(transfers)
+        .filter((transfer) => transfer.serverId === selectedServerId)
+        .sort((left, right) => right.startedAt - left.startedAt)
+    : [];
 
   useEffect(() => {
     if (status === "idle") {
@@ -592,11 +672,67 @@ function FileManagerPage() {
     void browse(selected.id, entry.root, path);
   }
 
+  async function openOverwritePromptIfNeeded(transferId: string) {
+    const transfer = useFileStore.getState().transfers[transferId];
+    if (transfer?.errorCode === "conflict") {
+      setOverwriteTransfer(transfer);
+    }
+  }
+
+  function beginTransfer(input: {
+    direction: "upload" | "download";
+    remotePath: string;
+    localPath: string;
+  }): Promise<void> {
+    if (!selected || !root) {
+      return Promise.resolve();
+    }
+    const started =
+      input.direction === "upload"
+        ? startUpload({
+            serverId: selected.id,
+            root,
+            localPath: input.localPath,
+            remotePath: input.remotePath,
+          })
+        : startDownload({
+            serverId: selected.id,
+            root,
+            remotePath: input.remotePath,
+            localPath: input.localPath,
+          });
+    // Close the dialog immediately; the transfer panel owns progress and
+    // cancellation while the backend keeps running.
+    void started.then((transferId) => openOverwritePromptIfNeeded(transferId));
+    return Promise.resolve();
+  }
+
+  async function handleRetry(transferId: string) {
+    const nextId = await retryTransfer(transferId);
+    if (nextId) {
+      await openOverwritePromptIfNeeded(nextId);
+    }
+  }
+
+  async function handleConfirmOverwrite() {
+    const transfer = overwriteTransfer;
+    if (!transfer) {
+      return;
+    }
+    setOverwriteTransfer(null);
+    const request = transfer.request;
+    if (request.direction === "upload") {
+      await startUpload({ ...request, overwrite: true });
+    } else {
+      await startDownload({ ...request, overwrite: true });
+    }
+  }
+
   return (
     <div className="space-y-6">
       <PageHeader
         title="File Manager"
-        description="Browse remote files and directories over the authenticated SSH connection. Listings stay inside the selected root and report metadata without downloading file content."
+        description="Browse, upload, download, create, rename, and delete remote files over the authenticated SSH connection. Every transfer reports progress, cancellation, and partial-file state."
         actions={
           <Button asChild variant="secondary" size="sm">
             <Link to="/servers">Open servers</Link>
@@ -610,8 +746,8 @@ function FileManagerPage() {
           <div>
             <AlertTitle>Web preview</AlertTitle>
             <AlertDescription>
-              Remote file browsing needs a live SSH session. Open the desktop build and connect a
-              server to browse directories. No remote files are fabricated in browser preview.
+              Remote file operations need a live SSH session. Open the desktop build and connect a
+              server to browse or transfer files. No remote files are fabricated in browser preview.
             </AlertDescription>
           </div>
         </Alert>
@@ -713,11 +849,131 @@ function FileManagerPage() {
           {entry?.pending && !listing ? <LoadingState rows={5} /> : null}
 
           {listing ? (
+            <section
+              aria-label="File operations"
+              className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border bg-card px-3.5 py-3"
+            >
+              <div>
+                <h2 className="text-[13px] font-semibold text-foreground">File operations</h2>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  Upload files or directories into {listing.path}. Rename and delete actions require
+                  confirmation.
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => setCreateFolderOpen(true)}
+                  disabled={!connected || (entry?.pending ?? false)}
+                >
+                  <FolderPlusIcon className="size-3.5" aria-hidden="true" />
+                  New folder
+                </Button>
+                <Button
+                  size="sm"
+                  onClick={() => setTransferPrompt({ direction: "upload" })}
+                  disabled={!connected || (entry?.pending ?? false)}
+                >
+                  <UploadSimpleIcon className="size-3.5" aria-hidden="true" />
+                  Upload
+                </Button>
+              </div>
+            </section>
+          ) : null}
+
+          <FileTransferPanel
+            transfers={serverTransfers}
+            onCancel={(transferId) => void cancelTransfer(transferId)}
+            onRetry={(transferId) => void handleRetry(transferId)}
+            onRequestOverwrite={(transfer) => setOverwriteTransfer(transfer)}
+            onDismiss={dismissTransfer}
+          />
+
+          {mutation?.pending ? (
+            <p className="flex items-center gap-2 text-[12px] text-muted-foreground" role="status">
+              <CircleNotchIcon className="size-3.5 animate-spin" aria-hidden="true" />
+              Applying the remote change and verifying the result...
+            </p>
+          ) : null}
+
+          {mutation?.result ? (
+            <Alert variant={mutation.result.verified ? "success" : "warning"}>
+              <InfoIcon className="mt-0.5 size-4 shrink-0 text-success" aria-hidden="true" />
+              <div className="flex-1">
+                <AlertTitle>
+                  {mutation.result.action === "create_folder"
+                    ? "Folder created"
+                    : mutation.result.action === "rename"
+                      ? "Entry renamed"
+                      : "Entry deleted"}
+                </AlertTitle>
+                <AlertDescription>
+                  <span className="block">
+                    {mutation.result.targetPath ?? mutation.result.path}
+                  </span>
+                  <span className="mt-0.5 block">
+                    {mutation.result.verified
+                      ? "Verified by re-reading the remote path."
+                      : (mutation.result.verificationDetail ??
+                        "The operation completed but could not be fully verified.")}
+                  </span>
+                </AlertDescription>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  if (selectedServerId) {
+                    clearMutation(selectedServerId);
+                  }
+                }}
+              >
+                Dismiss
+              </Button>
+            </Alert>
+          ) : null}
+
+          {mutation?.error ? (
+            <Alert variant="destructive">
+              <WarningCircleIcon
+                className="mt-0.5 size-4 shrink-0 text-destructive"
+                aria-hidden="true"
+              />
+              <div className="flex-1">
+                <AlertTitle>Could not change the remote filesystem</AlertTitle>
+                <AlertDescription>
+                  <span className="block">{mutation.error}</span>
+                  {mutation.errorDetails ? (
+                    <span className="mt-1 block whitespace-pre-wrap font-mono text-[10px]">
+                      {mutation.errorDetails}
+                    </span>
+                  ) : null}
+                </AlertDescription>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  if (selectedServerId) {
+                    clearMutation(selectedServerId);
+                  }
+                }}
+              >
+                Dismiss
+              </Button>
+            </Alert>
+          ) : null}
+
+          {listing ? (
             <DirectoryListing
               listing={listing}
               pending={entry?.pending ?? false}
               onNavigate={handleBreadcrumb}
               onOpenEntry={handleOpenEntry}
+              onDownload={(target) => setTransferPrompt({ direction: "download", entry: target })}
+              onRename={setRenameTarget}
+              onDelete={setDeleteTarget}
             />
           ) : null}
 
@@ -741,10 +997,131 @@ function FileManagerPage() {
           ) : null}
 
           <p className="text-[10px] text-muted-foreground">
-            File metadata stays in memory only. ServerDesk does not stream file content in this
-            view, does not store listings in SQLite, and does not require a separate public
-            file-transfer port. Existing terminal and command flows use independent SSH channels.
+            File listings and transfer results stay in memory only. Transfers use the authenticated
+            SSH connection on the same port; ServerDesk never opens a separate public file-transfer
+            listener. Existing terminal and command flows use independent SSH channels.
           </p>
+
+          {createFolderOpen ? (
+            <CreateFolderDialog
+              open
+              parent={listing?.path ?? root ?? DEFAULT_ROOT}
+              onClose={() => setCreateFolderOpen(false)}
+              onCreate={(name) =>
+                selected && root && listing
+                  ? createFolder(selected.id, root, listing.path, name)
+                  : Promise.resolve(false)
+              }
+            />
+          ) : null}
+
+          {renameTarget ? (
+            <RenameEntryDialog
+              entry={renameTarget}
+              onClose={() => setRenameTarget(null)}
+              onRename={(newName) =>
+                selected && root && renameTarget
+                  ? renameEntry(selected.id, root, renameTarget.path, newName)
+                  : Promise.resolve(false)
+              }
+            />
+          ) : null}
+
+          <ConfirmDialog
+            open={deleteTarget !== null}
+            onOpenChange={(open) => {
+              if (!open) {
+                setDeleteTarget(null);
+              }
+            }}
+            title={deleteTarget ? `Delete ${deleteTarget.name}?` : "Delete remote entry?"}
+            description={
+              deleteTarget?.entryType === "directory"
+                ? "This deletes the directory and every entry inside it. ServerDesk re-reads the path afterward to verify the result."
+                : "This deletes the entry from the remote server. ServerDesk re-reads the path afterward to verify the result."
+            }
+            confirmLabel={
+              deleteTarget?.entryType === "directory" ? "Delete directory" : "Delete file"
+            }
+            details={
+              deleteTarget
+                ? [
+                    {
+                      label: "Server",
+                      value: selected
+                        ? `${selected.name} (${selected.username}@${selected.host}:${selected.port})`
+                        : "",
+                    },
+                    { label: "Path", value: deleteTarget.path },
+                    { label: "Type", value: typeLabels[deleteTarget.entryType] },
+                  ]
+                : undefined
+            }
+            pending={mutation?.pending ?? false}
+            onConfirm={() => {
+              const target = deleteTarget;
+              if (!selected || !root || !target) {
+                return;
+              }
+              void deleteEntry(
+                selected.id,
+                root,
+                target.path,
+                target.entryType === "directory",
+              ).finally(() => setDeleteTarget(null));
+            }}
+          />
+
+          {transferPrompt ? (
+            <TransferDialog
+              prompt={transferPrompt}
+              server={selected}
+              listing={listing}
+              onClose={() => setTransferPrompt(null)}
+              onStart={beginTransfer}
+            />
+          ) : null}
+
+          <ConfirmDialog
+            open={overwriteTransfer !== null}
+            onOpenChange={(open) => {
+              if (!open) {
+                setOverwriteTransfer(null);
+              }
+            }}
+            title="Overwrite the existing destination?"
+            description={
+              overwriteTransfer
+                ? "The destination already exists. ServerDesk writes to a separate partial file and replaces the destination only after the complete transfer is verified."
+                : ""
+            }
+            confirmLabel="Overwrite and transfer"
+            details={
+              overwriteTransfer
+                ? [
+                    {
+                      label: "Direction",
+                      value: overwriteTransfer.direction === "upload" ? "Upload" : "Download",
+                    },
+                    {
+                      label: "Source",
+                      value:
+                        overwriteTransfer.direction === "upload"
+                          ? overwriteTransfer.request.localPath
+                          : overwriteTransfer.request.remotePath,
+                    },
+                    {
+                      label: "Destination",
+                      value:
+                        overwriteTransfer.direction === "upload"
+                          ? overwriteTransfer.request.remotePath
+                          : overwriteTransfer.request.localPath,
+                    },
+                  ]
+                : undefined
+            }
+            onConfirm={() => void handleConfirmOverwrite()}
+          />
         </>
       ) : null}
 

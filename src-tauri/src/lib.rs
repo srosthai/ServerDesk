@@ -3,15 +3,22 @@ use std::sync::Arc;
 use tauri::Manager;
 
 use crate::{
-    commands::{connections::TauriConnectionEventSink, terminal::TauriTerminalEventSink},
+    commands::{
+        connections::TauriConnectionEventSink, files::TauriFileTransferEventSink,
+        terminal::TauriTerminalEventSink,
+    },
     core::{
         credentials::{CredentialStore, OsCredentialStore},
+        files::FileTransferManager,
         ssh::{ConnectionManager, ConnectionTimeouts, RusshTransport},
         terminal::TerminalManager,
     },
 };
 
 async fn release_connections(app: &tauri::AppHandle) {
+    if let Some(transfers) = app.try_state::<Arc<FileTransferManager>>() {
+        transfers.cancel_all();
+    }
     if let Some(terminal) = app.try_state::<Arc<TerminalManager>>() {
         terminal.close_all().await;
     }
@@ -35,10 +42,15 @@ pub fn run() {
             let database = storage::Database::open(data_directory.join("serverdesk.sqlite3"))?;
             app.manage(database);
             app.manage(Arc::new(OsCredentialStore) as Arc<dyn CredentialStore>);
-            app.manage(Arc::new(ConnectionManager::new(
+            let connections = Arc::new(ConnectionManager::new(
                 Arc::new(RusshTransport::new()),
                 Arc::new(TauriConnectionEventSink::new(app.handle().clone())),
                 ConnectionTimeouts::default(),
+            ));
+            app.manage(Arc::clone(&connections));
+            app.manage(Arc::new(FileTransferManager::new(
+                connections,
+                Arc::new(TauriFileTransferEventSink::new(app.handle().clone())),
             )));
             app.manage(Arc::new(TerminalManager::new(Arc::new(
                 TauriTerminalEventSink::new(app.handle().clone()),
@@ -84,6 +96,12 @@ pub fn run() {
             commands::logs::list_log_sources,
             commands::logs::read_log_tail,
             commands::files::browse_remote_files,
+            commands::files::upload_remote_file,
+            commands::files::download_remote_file,
+            commands::files::cancel_file_transfer,
+            commands::files::create_remote_folder,
+            commands::files::rename_remote_entry,
+            commands::files::delete_remote_entry,
             commands::known_hosts::list_known_hosts,
             commands::known_hosts::trust_host_key,
             commands::known_hosts::reject_host_key,

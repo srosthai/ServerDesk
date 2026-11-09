@@ -1,11 +1,12 @@
 use std::{
     collections::HashMap,
     fs,
+    io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -17,28 +18,61 @@ use russh::{
 };
 use russh_sftp::{
     protocol::{
-        Attrs, FileAttributes, FileType as SftpFileType, Handle, Name, Status, StatusCode, Version,
+        Attrs, Data, FileAttributes, FileType as SftpFileType, Handle, Name, OpenFlags, Status,
+        StatusCode, Version,
     },
     server::Handler as SftpHandler,
 };
 use serverdesk_lib::core::{
     ErrorCode,
-    files::{MAX_FILE_ENTRIES, RemoteEntryType, browse_remote_files},
+    files::{
+        DownloadRequest, FileTransferDirection, FileTransferEventSink, FileTransferManager,
+        FileTransferProgress, FileTransferResult, FileTransferStatus, MAX_FILE_ENTRIES,
+        RemoteEntryType, RemoteMutationAction, UploadRequest, browse_remote_files,
+        create_remote_folder, delete_remote_entry, rename_remote_entry,
+    },
     ssh::{
         Authentication, ConnectionEventSink, ConnectionManager, ConnectionRequest,
         ConnectionSnapshot, ConnectionState, ConnectionTimeouts, RusshTransport, TrustedHostKey,
     },
 };
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Notify};
 
 const USERNAME: &str = "deploy";
 const PASSWORD: &str = "fixture-password";
+
+struct FixtureFaults {
+    fail_upload_after: AtomicU64,
+    fail_download_after: AtomicU64,
+    uploaded_bytes: AtomicU64,
+    downloaded_bytes: AtomicU64,
+    write_delay_millis: AtomicU64,
+}
+
+impl FixtureFaults {
+    fn new() -> Self {
+        Self {
+            fail_upload_after: AtomicU64::new(u64::MAX),
+            fail_download_after: AtomicU64::new(u64::MAX),
+            uploaded_bytes: AtomicU64::new(0),
+            downloaded_bytes: AtomicU64::new(0),
+            write_delay_millis: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for FixtureFaults {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Default)]
 struct FixtureState {
     authenticated: AtomicUsize,
     subsystems: Mutex<Vec<String>>,
     active_connections: AtomicUsize,
+    faults: FixtureFaults,
 }
 
 struct FixtureServer {
@@ -107,6 +141,60 @@ impl FixtureServer {
             .lock()
             .expect("subsystem lock")
             .clone()
+    }
+
+    fn fail_upload_after(&self, bytes: u64) {
+        self.state
+            .faults
+            .fail_upload_after
+            .store(bytes, Ordering::SeqCst);
+        self.state.faults.uploaded_bytes.store(0, Ordering::SeqCst);
+    }
+
+    fn fail_download_after(&self, bytes: u64) {
+        self.state
+            .faults
+            .fail_download_after
+            .store(bytes, Ordering::SeqCst);
+        self.state
+            .faults
+            .downloaded_bytes
+            .store(0, Ordering::SeqCst);
+    }
+
+    fn set_write_delay(&self, delay: Duration) {
+        self.state
+            .faults
+            .write_delay_millis
+            .store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    fn uploaded_bytes(&self) -> u64 {
+        self.state.faults.uploaded_bytes.load(Ordering::SeqCst)
+    }
+
+    fn downloaded_bytes(&self) -> u64 {
+        self.state.faults.downloaded_bytes.load(Ordering::SeqCst)
+    }
+
+    fn clear_faults(&self) {
+        self.state
+            .faults
+            .fail_upload_after
+            .store(u64::MAX, Ordering::SeqCst);
+        self.state
+            .faults
+            .fail_download_after
+            .store(u64::MAX, Ordering::SeqCst);
+        self.state.faults.uploaded_bytes.store(0, Ordering::SeqCst);
+        self.state
+            .faults
+            .downloaded_bytes
+            .store(0, Ordering::SeqCst);
+        self.state
+            .faults
+            .write_delay_millis
+            .store(0, Ordering::SeqCst);
     }
 
     async fn wait_until_idle(&self) {
@@ -221,7 +309,7 @@ impl server::Handler for FixtureHandler {
         session.channel_success(channel_id)?;
         russh_sftp::server::run(
             channel.into_stream(),
-            FixtureSftpSession::new(self.denied.clone()),
+            FixtureSftpSession::new(self.denied.clone(), Arc::clone(&self.state)),
         )
         .await;
         Ok(())
@@ -248,15 +336,26 @@ struct DirHandle {
     sent: bool,
 }
 
+struct FileHandle {
+    file: fs::File,
+}
+
+enum OpenHandle {
+    Dir(DirHandle),
+    File(FileHandle),
+}
+
 struct FixtureSftpSession {
     denied: Vec<PathBuf>,
-    handles: HashMap<String, DirHandle>,
+    state: Arc<FixtureState>,
+    handles: HashMap<String, OpenHandle>,
 }
 
 impl FixtureSftpSession {
-    fn new(denied: Vec<PathBuf>) -> Self {
+    fn new(denied: Vec<PathBuf>, state: Arc<FixtureState>) -> Self {
         Self {
             denied,
+            state,
             handles: HashMap::new(),
         }
     }
@@ -314,6 +413,122 @@ impl SftpHandler for FixtureSftpSession {
         })
     }
 
+    async fn open(
+        &mut self,
+        id: u32,
+        filename: String,
+        pflags: OpenFlags,
+        _attrs: FileAttributes,
+    ) -> Result<Handle, Self::Error> {
+        let path = self.check_path(&filename)?;
+        let mut options = fs::OpenOptions::new();
+        if pflags.contains(OpenFlags::READ) {
+            options.read(true);
+        }
+        if pflags.contains(OpenFlags::WRITE) {
+            options.write(true);
+        }
+        if pflags.contains(OpenFlags::CREATE) {
+            options.create(true);
+        }
+        if pflags.contains(OpenFlags::TRUNCATE) {
+            options.truncate(true);
+        }
+        let file = options.open(path).map_err(map_io_error)?;
+        let handle = format!("file-{id}");
+        self.handles
+            .insert(handle.clone(), OpenHandle::File(FileHandle { file }));
+        Ok(Handle { id, handle })
+    }
+
+    async fn read(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<Data, Self::Error> {
+        let Some(OpenHandle::File(entry)) = self.handles.get_mut(&handle) else {
+            return Err(StatusCode::Failure);
+        };
+        entry
+            .file
+            .seek(SeekFrom::Start(offset))
+            .map_err(map_io_error)?;
+
+        let limit = self.state.faults.fail_download_after.load(Ordering::SeqCst);
+        let mut available = len as usize;
+        if limit != u64::MAX {
+            let read_so_far = self.state.faults.downloaded_bytes.load(Ordering::SeqCst);
+            if read_so_far >= limit {
+                return Err(StatusCode::Failure);
+            }
+            available = available.min((limit - read_so_far) as usize);
+        }
+
+        let mut buffer = vec![0u8; available];
+        let read = entry.file.read(&mut buffer).map_err(map_io_error)?;
+        if read == 0 {
+            return Err(StatusCode::Eof);
+        }
+        buffer.truncate(read);
+        self.state
+            .faults
+            .downloaded_bytes
+            .fetch_add(read as u64, Ordering::SeqCst);
+        Ok(Data { id, data: buffer })
+    }
+
+    async fn write(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<Status, Self::Error> {
+        let delay = self.state.faults.write_delay_millis.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        let Some(OpenHandle::File(entry)) = self.handles.get_mut(&handle) else {
+            return Err(StatusCode::Failure);
+        };
+        entry
+            .file
+            .seek(SeekFrom::Start(offset))
+            .map_err(map_io_error)?;
+
+        let limit = self.state.faults.fail_upload_after.load(Ordering::SeqCst);
+        let mut accepted = data.len();
+        if limit != u64::MAX {
+            let written_so_far = self.state.faults.uploaded_bytes.load(Ordering::SeqCst);
+            if written_so_far >= limit {
+                return Err(StatusCode::Failure);
+            }
+            accepted = accepted.min((limit - written_so_far) as usize);
+        }
+
+        entry
+            .file
+            .write_all(&data[..accepted])
+            .map_err(map_io_error)?;
+        entry.file.flush().map_err(map_io_error)?;
+        self.state
+            .faults
+            .uploaded_bytes
+            .fetch_add(accepted as u64, Ordering::SeqCst);
+        if accepted < data.len() {
+            return Err(StatusCode::Failure);
+        }
+
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".to_string(),
+            language_tag: "en-US".to_string(),
+        })
+    }
+
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
         let path = self.check_path(&path)?;
         let metadata = fs::metadata(&path).map_err(map_io_error)?;
@@ -321,13 +536,15 @@ impl SftpHandler for FixtureSftpSession {
             return Err(StatusCode::Failure);
         }
         let handle = format!("dir-{id}");
-        self.handles
-            .insert(handle.clone(), DirHandle { path, sent: false });
+        self.handles.insert(
+            handle.clone(),
+            OpenHandle::Dir(DirHandle { path, sent: false }),
+        );
         Ok(Handle { id, handle })
     }
 
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
-        let Some(entry) = self.handles.get_mut(&handle) else {
+        let Some(OpenHandle::Dir(entry)) = self.handles.get_mut(&handle) else {
             return Err(StatusCode::Failure);
         };
         if entry.sent {
@@ -346,6 +563,61 @@ impl SftpHandler for FixtureSftpSession {
         }
 
         Ok(Name { id, files })
+    }
+
+    async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
+        let path = self.check_path(&filename)?;
+        fs::remove_file(path).map_err(map_io_error)?;
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".to_string(),
+            language_tag: "en-US".to_string(),
+        })
+    }
+
+    async fn mkdir(
+        &mut self,
+        id: u32,
+        path: String,
+        _attrs: FileAttributes,
+    ) -> Result<Status, Self::Error> {
+        let path = self.check_path(&path)?;
+        fs::create_dir(path).map_err(map_io_error)?;
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".to_string(),
+            language_tag: "en-US".to_string(),
+        })
+    }
+
+    async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
+        let path = self.check_path(&path)?;
+        fs::remove_dir(path).map_err(map_io_error)?;
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".to_string(),
+            language_tag: "en-US".to_string(),
+        })
+    }
+
+    async fn rename(
+        &mut self,
+        id: u32,
+        oldpath: String,
+        newpath: String,
+    ) -> Result<Status, Self::Error> {
+        let oldpath = self.check_path(&oldpath)?;
+        let newpath = self.check_path(&newpath)?;
+        fs::rename(oldpath, newpath).map_err(map_io_error)?;
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".to_string(),
+            language_tag: "en-US".to_string(),
+        })
     }
 
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
@@ -778,4 +1050,710 @@ fn fixture_handles_symlink_types_consistently() {
         SftpFileType::Symlink,
         "the fixture must expose symlinks as links, not regular files"
     );
+}
+
+#[derive(Default)]
+struct RecordingTransferSink {
+    events: Mutex<Vec<FileTransferProgress>>,
+    notify: Notify,
+}
+
+impl RecordingTransferSink {
+    async fn wait_for<F>(&self, predicate: F) -> FileTransferProgress
+    where
+        F: Fn(&FileTransferProgress) -> bool,
+    {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let notified = self.notify.notified();
+                if let Some(event) = self
+                    .events
+                    .lock()
+                    .expect("transfer event lock")
+                    .iter()
+                    .find(|event| predicate(event))
+                    .cloned()
+                {
+                    return event;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("transfer progress event")
+    }
+}
+
+impl FileTransferEventSink for RecordingTransferSink {
+    fn emit(&self, progress: &FileTransferProgress) {
+        self.events
+            .lock()
+            .expect("transfer event lock")
+            .push(progress.clone());
+        self.notify.notify_waiters();
+    }
+}
+
+fn transfer_manager(
+    connections: Arc<ConnectionManager>,
+) -> (Arc<FileTransferManager>, Arc<RecordingTransferSink>) {
+    let sink = Arc::new(RecordingTransferSink::default());
+    let manager = Arc::new(FileTransferManager::new(
+        connections,
+        Arc::clone(&sink) as Arc<dyn FileTransferEventSink>,
+    ));
+    (manager, sink)
+}
+
+fn upload_request(
+    transfer_id: &str,
+    root: &str,
+    local_path: &Path,
+    remote_path: &str,
+    overwrite: bool,
+) -> UploadRequest {
+    UploadRequest {
+        transfer_id: transfer_id.to_string(),
+        server_id: "fixture-server".to_string(),
+        root: root.to_string(),
+        local_path: local_path.to_string_lossy().to_string(),
+        remote_path: remote_path.to_string(),
+        overwrite,
+    }
+}
+
+fn download_request(
+    transfer_id: &str,
+    root: &str,
+    remote_path: &str,
+    local_path: &Path,
+    overwrite: bool,
+) -> DownloadRequest {
+    DownloadRequest {
+        transfer_id: transfer_id.to_string(),
+        server_id: "fixture-server".to_string(),
+        root: root.to_string(),
+        remote_path: remote_path.to_string(),
+        local_path: local_path.to_string_lossy().to_string(),
+        overwrite,
+    }
+}
+
+fn test_content(bytes: usize) -> Vec<u8> {
+    (0..bytes)
+        .map(|index| ((index * 31 + 7) % 251) as u8)
+        .collect()
+}
+
+#[tokio::test]
+async fn uploads_and_downloads_exact_file_contents() {
+    let tree = fixture_tree();
+    let fixture = FixtureServer::start(tree.root.clone(), vec![tree.denied.clone()]).await;
+    let connections = manager();
+    connect(&connections, &fixture).await;
+    let (transfers, sink) = transfer_manager(Arc::clone(&connections));
+    let root = root_string(&tree.root);
+    let local_source = tree._directory.path().join("upload-source.bin");
+    let content = test_content(180_000);
+    fs::write(&local_source, &content).expect("local upload source");
+
+    let upload = transfers
+        .upload(upload_request(
+            "upload-file-1",
+            &root,
+            &local_source,
+            &root_string(&tree.root.join("uploaded.bin")),
+            false,
+        ))
+        .await
+        .expect("upload file");
+    assert_eq!(upload.status, FileTransferStatus::Completed);
+    assert_eq!(upload.direction, FileTransferDirection::Upload);
+    assert_eq!(upload.bytes_transferred, content.len() as u64);
+    assert_eq!(upload.total_bytes, Some(content.len() as u64));
+    assert_eq!(upload.files_transferred, 1);
+    assert!(!upload.may_be_incomplete);
+    assert!(upload.partial_paths.is_empty());
+    assert_eq!(
+        fs::read(tree.root.join("uploaded.bin")).expect("uploaded file"),
+        content
+    );
+    assert!(
+        sink.wait_for(|event| event.status == FileTransferStatus::Completed)
+            .await
+            .transfer_id
+            == "upload-file-1"
+    );
+
+    let local_destination = tree._directory.path().join("download-target.bin");
+    let download = transfers
+        .download(download_request(
+            "download-file-1",
+            &root,
+            &root_string(&tree.root.join("uploaded.bin")),
+            &local_destination,
+            false,
+        ))
+        .await
+        .expect("download file");
+    assert_eq!(download.status, FileTransferStatus::Completed);
+    assert_eq!(download.direction, FileTransferDirection::Download);
+    assert_eq!(download.bytes_transferred, content.len() as u64);
+    assert!(!download.may_be_incomplete);
+    assert_eq!(
+        fs::read(&local_destination).expect("downloaded file"),
+        content
+    );
+    assert_eq!(fixture.uploaded_bytes(), content.len() as u64);
+    assert_eq!(fixture.downloaded_bytes(), content.len() as u64);
+
+    assert_eq!(
+        fixture.state.authenticated.load(Ordering::SeqCst),
+        1,
+        "uploads and downloads reuse the single authenticated SSH connection"
+    );
+    assert_eq!(
+        fixture.subsystems(),
+        vec!["sftp".to_string(), "sftp".to_string()]
+    );
+
+    connections
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+    fixture.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn uploads_and_downloads_directories_recursively() {
+    let tree = fixture_tree();
+    let fixture = FixtureServer::start(tree.root.clone(), vec![tree.denied.clone()]).await;
+    let connections = manager();
+    connect(&connections, &fixture).await;
+    let (transfers, _sink) = transfer_manager(Arc::clone(&connections));
+    let root = root_string(&tree.root);
+
+    let local_source = tree._directory.path().join("upload-tree");
+    fs::create_dir_all(local_source.join("nested/deeper")).expect("local upload tree");
+    fs::write(local_source.join("root.txt"), b"root file").expect("root file");
+    fs::write(local_source.join("nested/child.txt"), b"child file").expect("child file");
+    fs::write(
+        local_source.join("nested/deeper/grandchild.txt"),
+        b"grandchild file",
+    )
+    .expect("grandchild file");
+
+    let remote_destination = root_string(&tree.root.join("upload-tree"));
+    let upload = transfers
+        .upload(upload_request(
+            "upload-dir-1",
+            &root,
+            &local_source,
+            &remote_destination,
+            false,
+        ))
+        .await
+        .expect("upload directory");
+    assert_eq!(upload.status, FileTransferStatus::Completed);
+    assert_eq!(upload.files_transferred, 3);
+    assert_eq!(upload.directories_created, 3);
+    assert_eq!(
+        fs::read(tree.root.join("upload-tree/nested/deeper/grandchild.txt"))
+            .expect("uploaded grandchild"),
+        b"grandchild file"
+    );
+
+    let local_destination = tree._directory.path().join("download-tree");
+    let remote_source = root_string(&tree.root.join("upload-tree"));
+    let download = transfers
+        .download(download_request(
+            "download-dir-1",
+            &root,
+            &remote_source,
+            &local_destination,
+            false,
+        ))
+        .await
+        .expect("download directory");
+    assert_eq!(download.status, FileTransferStatus::Completed);
+    assert_eq!(download.files_transferred, 3);
+    assert_eq!(
+        fs::read(local_destination.join("nested/child.txt")).expect("downloaded child"),
+        b"child file"
+    );
+    assert_eq!(
+        fs::read(local_destination.join("nested/deeper/grandchild.txt"))
+            .expect("downloaded grandchild"),
+        b"grandchild file"
+    );
+
+    connections
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+    fixture.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn overwrite_requires_explicit_confirmation_for_upload_and_download() {
+    let tree = fixture_tree();
+    let fixture = FixtureServer::start(tree.root.clone(), vec![tree.denied.clone()]).await;
+    let connections = manager();
+    connect(&connections, &fixture).await;
+    let (transfers, _sink) = transfer_manager(Arc::clone(&connections));
+    let root = root_string(&tree.root);
+    let local_source = tree._directory.path().join("replacement.bin");
+    fs::write(&local_source, b"replacement contents").expect("replacement source");
+    let remote_target = root_string(&tree.root.join("readme.txt"));
+
+    let error = transfers
+        .upload(upload_request(
+            "upload-conflict-1",
+            &root,
+            &local_source,
+            &remote_target,
+            false,
+        ))
+        .await
+        .expect_err("unconfirmed overwrite must fail");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(error.message.contains("overwritten"));
+    assert_eq!(
+        fs::read(tree.root.join("readme.txt")).expect("original file"),
+        b"hello world\n",
+        "an unconfirmed upload must not modify the existing file"
+    );
+
+    let upload = transfers
+        .upload(upload_request(
+            "upload-conflict-2",
+            &root,
+            &local_source,
+            &remote_target,
+            true,
+        ))
+        .await
+        .expect("confirmed overwrite");
+    assert_eq!(upload.status, FileTransferStatus::Completed);
+    assert!(upload.overwrite);
+    assert_eq!(
+        fs::read(tree.root.join("readme.txt")).expect("replaced file"),
+        b"replacement contents"
+    );
+
+    let local_destination = tree._directory.path().join("existing-download.txt");
+    fs::write(&local_destination, b"old local file").expect("existing local file");
+    let error = transfers
+        .download(download_request(
+            "download-conflict-1",
+            &root,
+            &root_string(&tree.root.join("nested/deeper/secret.txt")),
+            &local_destination,
+            false,
+        ))
+        .await
+        .expect_err("unconfirmed download overwrite must fail");
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(
+        fs::read(&local_destination).expect("existing local content"),
+        b"old local file"
+    );
+
+    let download = transfers
+        .download(download_request(
+            "download-conflict-2",
+            &root,
+            &root_string(&tree.root.join("nested/deeper/secret.txt")),
+            &local_destination,
+            true,
+        ))
+        .await
+        .expect("confirmed download overwrite");
+    assert_eq!(download.status, FileTransferStatus::Completed);
+    assert_eq!(
+        fs::read(&local_destination).expect("replaced local content"),
+        b"deep file"
+    );
+
+    connections
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+    fixture.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn cancellation_stops_upload_and_preserves_the_partial_file() {
+    let tree = fixture_tree();
+    let fixture = FixtureServer::start(tree.root.clone(), vec![tree.denied.clone()]).await;
+    fixture.set_write_delay(Duration::from_millis(5));
+    let connections = manager();
+    connect(&connections, &fixture).await;
+    let (transfers, sink) = transfer_manager(Arc::clone(&connections));
+    let root = root_string(&tree.root);
+    let local_source = tree._directory.path().join("cancel-source.bin");
+    let content = test_content(1_500_000);
+    fs::write(&local_source, &content).expect("cancel source");
+    let remote_target = root_string(&tree.root.join("cancel-target.bin"));
+
+    let upload_transfers = Arc::clone(&transfers);
+    let request = upload_request(
+        "cancel-upload-1",
+        &root,
+        &local_source,
+        &remote_target,
+        false,
+    );
+    let task = tokio::spawn(async move { upload_transfers.upload(request).await });
+
+    sink.wait_for(|event| {
+        event.transfer_id == "cancel-upload-1"
+            && event.status == FileTransferStatus::Running
+            && event.bytes_transferred > 0
+    })
+    .await;
+    assert!(
+        transfers
+            .cancel("cancel-upload-1")
+            .expect("cancel transfer"),
+        "the running transfer must be cancellable"
+    );
+
+    let result: FileTransferResult = task
+        .await
+        .expect("upload task")
+        .expect("cancelled upload result");
+    assert_eq!(result.status, FileTransferStatus::Cancelled);
+    assert!(result.may_be_incomplete);
+    assert!(result.bytes_transferred > 0);
+    assert!(result.bytes_transferred < content.len() as u64);
+    assert!(!tree.root.join("cancel-target.bin").exists());
+    assert_eq!(result.partial_paths.len(), 1);
+    let partial = PathBuf::from(&result.partial_paths[0]);
+    assert!(partial.exists(), "the partial upload must be preserved");
+    assert_eq!(
+        fs::metadata(&partial).expect("partial metadata").len(),
+        result.bytes_transferred,
+        "the partial file reports exactly the acknowledged bytes"
+    );
+    assert!(!transfers.cancel("cancel-upload-1").expect("late cancel"));
+
+    connections
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+    fixture.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn interrupted_transfers_report_partial_state_and_can_be_retried() {
+    let tree = fixture_tree();
+    let fixture = FixtureServer::start(tree.root.clone(), vec![tree.denied.clone()]).await;
+    let connections = manager();
+    connect(&connections, &fixture).await;
+    let (transfers, _sink) = transfer_manager(Arc::clone(&connections));
+    let root = root_string(&tree.root);
+    let local_source = tree._directory.path().join("interrupted-source.bin");
+    let content = test_content(220_000);
+    fs::write(&local_source, &content).expect("interrupted source");
+    let remote_target = root_string(&tree.root.join("interrupted-target.bin"));
+    fixture.fail_upload_after(100_000);
+
+    let failed = transfers
+        .upload(upload_request(
+            "interrupted-upload-1",
+            &root,
+            &local_source,
+            &remote_target,
+            false,
+        ))
+        .await
+        .expect("interrupted upload returns a result");
+    assert_eq!(failed.status, FileTransferStatus::Failed);
+    assert!(failed.may_be_incomplete);
+    assert!(failed.error.is_some());
+    assert!(!tree.root.join("interrupted-target.bin").exists());
+    assert_eq!(failed.partial_paths.len(), 1);
+    let partial = PathBuf::from(&failed.partial_paths[0]);
+    let partial_bytes = fs::metadata(&partial).expect("partial upload").len();
+    assert!(partial_bytes > 0);
+    assert!(partial_bytes <= 100_000);
+    assert!(partial_bytes >= failed.bytes_transferred);
+    assert!(partial_bytes < content.len() as u64);
+
+    fixture.clear_faults();
+    let retried = transfers
+        .upload(upload_request(
+            "interrupted-upload-2",
+            &root,
+            &local_source,
+            &remote_target,
+            false,
+        ))
+        .await
+        .expect("retry after interruption");
+    assert_eq!(retried.status, FileTransferStatus::Completed);
+    assert_eq!(
+        fs::read(tree.root.join("interrupted-target.bin")).expect("retried upload"),
+        content,
+        "a safe retry writes complete contents and replaces no partial destination"
+    );
+
+    let remote_source = root_string(&tree.root.join("interrupted-target.bin"));
+    let local_destination = tree._directory.path().join("interrupted-download.bin");
+    fixture.fail_download_after(50_000);
+    let failed = transfers
+        .download(download_request(
+            "interrupted-download-1",
+            &root,
+            &remote_source,
+            &local_destination,
+            false,
+        ))
+        .await
+        .expect("interrupted download returns a result");
+    assert_eq!(failed.status, FileTransferStatus::Failed);
+    assert!(failed.may_be_incomplete);
+    assert!(!local_destination.exists());
+    assert_eq!(failed.partial_paths.len(), 1);
+    let partial = PathBuf::from(&failed.partial_paths[0]);
+    let partial_bytes = fs::metadata(&partial).expect("partial download").len();
+    assert!(partial_bytes > 0);
+    assert!(partial_bytes <= 50_000);
+    assert_eq!(partial_bytes, failed.bytes_transferred);
+    assert!(partial_bytes < content.len() as u64);
+
+    fixture.clear_faults();
+    let retried = transfers
+        .download(download_request(
+            "interrupted-download-2",
+            &root,
+            &remote_source,
+            &local_destination,
+            false,
+        ))
+        .await
+        .expect("retry download");
+    assert_eq!(retried.status, FileTransferStatus::Completed);
+    assert_eq!(
+        fs::read(&local_destination).expect("retried download"),
+        content
+    );
+
+    connections
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+    fixture.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn create_rename_and_delete_require_confirmation_and_are_verified() {
+    let tree = fixture_tree();
+    let fixture = FixtureServer::start(tree.root.clone(), vec![tree.denied.clone()]).await;
+    let connections = manager();
+    connect(&connections, &fixture).await;
+    let root = root_string(&tree.root);
+
+    let created = create_remote_folder(&connections, "fixture-server", &root, &root, "created")
+        .await
+        .expect("create folder");
+    assert_eq!(created.action, RemoteMutationAction::CreateFolder);
+    assert!(created.verified);
+    assert!(tree.root.join("created").is_dir());
+    let target = created.target_path.as_deref().expect("created target");
+    assert_eq!(target, root_string(&tree.root.join("created")));
+
+    let error = create_remote_folder(&connections, "fixture-server", &root, &root, "created")
+        .await
+        .expect_err("creating a duplicate folder must conflict");
+    assert_eq!(error.code, ErrorCode::Conflict);
+
+    let original = root_string(&tree.root.join("readme.txt"));
+    let error = rename_remote_entry(
+        &connections,
+        "fixture-server",
+        &root,
+        &original,
+        "renamed.txt",
+        false,
+    )
+    .await
+    .expect_err("rename must require confirmation");
+    assert_eq!(error.code, ErrorCode::Validation);
+    assert!(tree.root.join("readme.txt").exists());
+
+    let renamed = rename_remote_entry(
+        &connections,
+        "fixture-server",
+        &root,
+        &original,
+        "renamed.txt",
+        true,
+    )
+    .await
+    .expect("rename with confirmation");
+    assert_eq!(renamed.action, RemoteMutationAction::Rename);
+    assert!(renamed.verified);
+    assert!(!tree.root.join("readme.txt").exists());
+    assert_eq!(
+        fs::read(tree.root.join("renamed.txt")).expect("renamed file"),
+        b"hello world\n"
+    );
+
+    let error = delete_remote_entry(
+        &connections,
+        "fixture-server",
+        &root,
+        &root_string(&tree.root.join("created")),
+        false,
+        true,
+    )
+    .await
+    .expect_err("delete must require confirmation");
+    assert_eq!(error.code, ErrorCode::Validation);
+    assert!(tree.root.join("created").exists());
+
+    let error = delete_remote_entry(
+        &connections,
+        "fixture-server",
+        &root,
+        &root_string(&tree.root.join("created")),
+        true,
+        false,
+    )
+    .await
+    .expect_err("directory delete must require recursive confirmation");
+    assert_eq!(error.code, ErrorCode::Validation);
+
+    let deleted = delete_remote_entry(
+        &connections,
+        "fixture-server",
+        &root,
+        &root_string(&tree.root.join("created")),
+        true,
+        true,
+    )
+    .await
+    .expect("delete directory with confirmation");
+    assert_eq!(deleted.action, RemoteMutationAction::Delete);
+    assert!(deleted.verified);
+    assert!(!tree.root.join("created").exists());
+
+    let deleted_file = delete_remote_entry(
+        &connections,
+        "fixture-server",
+        &root,
+        &root_string(&tree.root.join("renamed.txt")),
+        true,
+        false,
+    )
+    .await
+    .expect("delete file with confirmation");
+    assert!(deleted_file.verified);
+    assert!(!tree.root.join("renamed.txt").exists());
+
+    connections
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+    fixture.wait_until_idle().await;
+}
+
+#[tokio::test]
+async fn rejects_traversal_paths_before_any_transfer_or_mutation_request() {
+    let tree = fixture_tree();
+    let fixture = FixtureServer::start(tree.root.clone(), vec![tree.denied.clone()]).await;
+    let connections = manager();
+    connect(&connections, &fixture).await;
+    let (transfers, _sink) = transfer_manager(Arc::clone(&connections));
+    let root = root_string(&tree.root);
+    let local_source = tree._directory.path().join("traversal-source.txt");
+    fs::write(&local_source, b"content").expect("traversal source");
+
+    for remote_path in [format!("{root}/../escape.txt"), "/etc/passwd".to_string()] {
+        let error = transfers
+            .upload(upload_request(
+                "traversal-upload",
+                &root,
+                &local_source,
+                &remote_path,
+                false,
+            ))
+            .await
+            .expect_err("traversal upload must be rejected");
+        assert_eq!(error.code, ErrorCode::Validation, "{remote_path}");
+    }
+
+    for remote_path in [format!("{root}/../secret.txt"), "/etc/passwd".to_string()] {
+        let error = transfers
+            .download(download_request(
+                "traversal-download",
+                &root,
+                &remote_path,
+                &tree._directory.path().join("traversal-download.txt"),
+                false,
+            ))
+            .await
+            .expect_err("traversal download must be rejected");
+        assert_eq!(error.code, ErrorCode::Validation, "{remote_path}");
+    }
+
+    let error = transfers
+        .download(download_request(
+            "local-traversal",
+            &root,
+            &root_string(&tree.root.join("readme.txt")),
+            Path::new("/tmp/../etc/serverdesk-traversal"),
+            false,
+        ))
+        .await
+        .expect_err("local parent segment must be rejected");
+    assert_eq!(error.code, ErrorCode::Validation);
+
+    let error = create_remote_folder(
+        &connections,
+        "fixture-server",
+        &root,
+        &format!("{root}/../outside"),
+        "escape",
+    )
+    .await
+    .expect_err("traversal parent must be rejected");
+    assert_eq!(error.code, ErrorCode::Validation);
+
+    let error = rename_remote_entry(
+        &connections,
+        "fixture-server",
+        &root,
+        "/etc/passwd",
+        "passwd",
+        true,
+    )
+    .await
+    .expect_err("traversal rename must be rejected");
+    assert_eq!(error.code, ErrorCode::Validation);
+
+    let error = delete_remote_entry(
+        &connections,
+        "fixture-server",
+        &root,
+        "/etc/passwd",
+        true,
+        false,
+    )
+    .await
+    .expect_err("traversal delete must be rejected");
+    assert_eq!(error.code, ErrorCode::Validation);
+
+    assert!(
+        fixture.subsystems().is_empty(),
+        "all traversal checks must run before opening an SFTP channel"
+    );
+
+    connections
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+    fixture.wait_until_idle().await;
 }
