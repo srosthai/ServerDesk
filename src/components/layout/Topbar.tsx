@@ -1,14 +1,17 @@
 import { useEffect } from "react";
 import { useLocation } from "react-router-dom";
-import { ListIcon } from "@phosphor-icons/react";
+import { ListIcon, SidebarSimpleIcon } from "@phosphor-icons/react";
 import { allNavItems, navGroups } from "@/app/navigation";
 import { StatusBadge } from "@/components/ui/status-badge";
+import { useActiveServer } from "@/hooks/useActiveServer";
 
 type TopbarProps = {
+  sidebarCollapsed: boolean;
   onOpenNavigation: () => void;
+  onToggleSidebar: () => void;
 };
 
-function Topbar({ onOpenNavigation }: TopbarProps) {
+function Topbar({ sidebarCollapsed, onOpenNavigation, onToggleSidebar }: TopbarProps) {
   const location = useLocation();
   const current = allNavItems.find(
     (item) =>
@@ -17,6 +20,8 @@ function Topbar({ onOpenNavigation }: TopbarProps) {
   const currentGroup = navGroups.find((group) =>
     group.items.some((item) => item.to === current?.to),
   );
+  const { activeServer, connection } = useActiveServer();
+  const connectionState = connection?.state ?? "disconnected";
 
   useEffect(() => {
     document.title = current ? `${current.label} · ServerDesk` : "ServerDesk";
@@ -33,6 +38,15 @@ function Topbar({ onOpenNavigation }: TopbarProps) {
         >
           <ListIcon className="size-4" aria-hidden="true" />
         </button>
+        <button
+          type="button"
+          onClick={onToggleSidebar}
+          aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+          aria-pressed={sidebarCollapsed}
+          className="hidden rounded-md p-1.5 text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 md:inline-flex"
+        >
+          <SidebarSimpleIcon className="size-4" aria-hidden="true" />
+        </button>
         <div className="min-w-0">
           <div className="truncate text-[12px] font-medium text-foreground">
             {current?.label ?? "ServerDesk"}
@@ -43,8 +57,16 @@ function Topbar({ onOpenNavigation }: TopbarProps) {
         </div>
       </div>
 
-      <div className="flex shrink-0 items-center gap-2">
-        <StatusBadge state="disconnected" label="No server" />
+      <div className="flex min-w-0 shrink-0 items-center gap-2">
+        {activeServer ? (
+          <span className="hidden max-w-40 truncate text-[11px] font-medium text-muted-foreground sm:inline">
+            {activeServer.name}
+          </span>
+        ) : null}
+        <StatusBadge
+          state={activeServer ? connectionState : "disconnected"}
+          label={activeServer ? undefined : "No server"}
+        />
       </div>
     </header>
   );
