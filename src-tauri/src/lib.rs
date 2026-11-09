@@ -69,6 +69,7 @@ pub fn run() {
             commands::projects::scan_remote_projects,
             commands::projects::run_project_artisan_action,
             commands::projects::delete_project,
+            commands::queue::get_queue_supervisor_status,
             commands::logs::list_log_sources,
             commands::logs::read_log_tail,
             commands::known_hosts::list_known_hosts,
