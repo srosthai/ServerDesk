@@ -1,5 +1,6 @@
 use serverdesk_lib::storage::{
     AuthType, Database, NewOperationRecord, NewPortForward, NewProject, NewSavedCommand, NewServer,
+    OperationCategory, OperationResult,
 };
 
 fn server_input(name: &str) -> NewServer {
@@ -20,7 +21,7 @@ fn server_input(name: &str) -> NewServer {
 fn initializes_schema_at_current_version() {
     let database = Database::in_memory().expect("in-memory database");
 
-    assert_eq!(database.schema_version().expect("schema version"), 3);
+    assert_eq!(database.schema_version().expect("schema version"), 4);
     assert!(database.list_servers().expect("server list").is_empty());
 }
 
@@ -213,8 +214,12 @@ fn saved_commands_history_and_preferences_round_trip() {
         .record_operation(&NewOperationRecord {
             server_id: None,
             project_id: None,
+            category: OperationCategory::Command,
             operation: "hostname".to_string(),
             safe_summary: "Read hostname".to_string(),
+            path: None,
+            output_summary: Some("fixture-host".to_string()),
+            result: OperationResult::Success,
             exit_code: Some(0),
             started_at: 1_700_000_000,
             duration_ms: 120,
@@ -223,6 +228,8 @@ fn saved_commands_history_and_preferences_round_trip() {
     let operations = database.list_operations(10).expect("list operations");
     assert_eq!(operations.len(), 1);
     assert_eq!(operations[0].exit_code, Some(0));
+    assert_eq!(operations[0].category, OperationCategory::Command);
+    assert_eq!(operations[0].result, OperationResult::Success);
     database
         .clear_operation_history()
         .expect("clear operation history");
