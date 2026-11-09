@@ -17,7 +17,9 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "check": "npm run typecheck && npm run lint && npm run format:check && npm run build",
+    "check": "npm run check:versions && npm run typecheck && npm run lint && npm run format:check && npm run build",
+    "check:versions": "node scripts/check-versions.mjs",
+    "check:release-tag": "node scripts/check-versions.mjs --tag",
     "test": "vitest run",
     "test:watch": "vitest"
   },
