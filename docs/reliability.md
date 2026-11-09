@@ -1,7 +1,7 @@
 # Reliability model
 
-This document records the issue #33 reliability audit: what was already in
-place, which gaps were fixed, and which limitations remain accepted. The typed
+This document records the reliability audit: what was already in place, which
+gaps were fixed, and which limitations remain accepted. The typed
 `AppError`/`ErrorCode` taxonomy and the existing design system are unchanged.
 
 ## Error categories

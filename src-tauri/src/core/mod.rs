@@ -1,5 +1,6 @@
 pub mod artisan;
 pub mod command;
+pub mod credential_index;
 pub mod credentials;
 pub mod error;
 pub mod files;
@@ -9,6 +10,7 @@ pub mod logs;
 pub mod monitoring;
 pub mod preferences;
 pub mod projects;
+pub mod purge;
 pub mod queue;
 pub mod redaction;
 pub mod remote;

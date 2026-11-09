@@ -1,6 +1,6 @@
 # Security model
 
-This document records the issue #32 audit of every remote execution path, the
+This document records the security audit of every remote execution path, the
 fixes that were applied, and the risks that remain accepted. ServerDesk is a
 local-first desktop application: the local UI is trusted, while the SSH server
 and everything it returns are untrusted.
