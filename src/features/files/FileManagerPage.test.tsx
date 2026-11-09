@@ -531,6 +531,26 @@ describe("FileManagerPage", () => {
     );
   });
 
+  it("does not claim a successful mutation when the remote re-read cannot verify it", async () => {
+    vi.mocked(browseRemoteFiles).mockResolvedValue(listing());
+    vi.mocked(deleteRemoteEntry).mockResolvedValue(
+      mutationResult({
+        verified: false,
+        verificationDetail: "The delete completed but the path still exists.",
+      }),
+    );
+    renderPage();
+
+    const user = await openRoot();
+    await screen.findByText("readme.txt");
+    await user.click(screen.getByRole("button", { name: "Delete readme.txt" }));
+    await user.click(await screen.findByRole("button", { name: "Delete file" }));
+
+    expect(await screen.findByText("Delete not verified")).toBeInTheDocument();
+    expect(screen.queryByText("Entry deleted")).not.toBeInTheDocument();
+    expect(screen.getByText("The delete completed but the path still exists.")).toBeInTheDocument();
+  });
+
   it("renames an entry only after the confirmation dialog is submitted", async () => {
     vi.mocked(browseRemoteFiles).mockResolvedValue(listing());
     vi.mocked(renameRemoteEntry).mockResolvedValue(
