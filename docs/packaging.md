@@ -170,7 +170,7 @@ spctl --assess --type execute --verbose=4 "ServerDesk.app"
 xcrun stapler validate "ServerDesk_0.1.0_universal.dmg"
 ```
 
-Without the secrets, the release workflow still builds an unsigned universal DMG. It is suitable for internal testing only and must not be presented as a normal end-user download.
+Without the secrets, the release workflow still builds an unsigned universal DMG. It is suitable for internal testing only and must not be presented as a normal end-user download. The workflow unsets empty signing variables before calling Tauri so a missing certificate is not treated as an empty-import request.
 
 Windows Authenticode signing is not configured. Unsigned NSIS installers trigger SmartScreen warnings. Add a signing command and certificate secrets before calling the Windows artifact production-ready.
 
