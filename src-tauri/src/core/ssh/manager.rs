@@ -35,6 +35,7 @@ struct ManagerInner {
 pub struct ConnectionManager {
     transport: Arc<dyn SshTransport>,
     events: Arc<dyn ConnectionEventSink>,
+    listeners: Mutex<Vec<Arc<dyn ConnectionEventSink>>>,
     timeouts: ConnectionTimeouts,
     inner: Mutex<ManagerInner>,
     next_generation: AtomicU64,
@@ -49,9 +50,30 @@ impl ConnectionManager {
         Self {
             transport,
             events,
+            listeners: Mutex::new(Vec::new()),
             timeouts,
             inner: Mutex::new(ManagerInner::default()),
             next_generation: AtomicU64::new(0),
+        }
+    }
+
+    /// Registers an additional observer for connection state changes.
+    ///
+    /// Subscribers must not block: they run while the manager is publishing a
+    /// transition. The tunnel manager uses this to release listeners when a
+    /// server session is lost or replaced.
+    pub fn subscribe(&self, sink: Arc<dyn ConnectionEventSink>) {
+        if let Ok(mut listeners) = self.listeners.lock() {
+            listeners.push(sink);
+        }
+    }
+
+    fn emit_event(&self, snapshot: &ConnectionSnapshot) {
+        self.events.emit(snapshot);
+        if let Ok(listeners) = self.listeners.lock() {
+            for listener in listeners.iter() {
+                listener.emit(snapshot);
+            }
         }
     }
 
@@ -135,7 +157,7 @@ impl ConnectionManager {
                 None,
             )
         };
-        self.events.emit(&snapshot);
+        self.emit_event(&snapshot);
         Ok(snapshot)
     }
 
@@ -182,7 +204,7 @@ impl ConnectionManager {
                         None,
                     )
                 };
-                self.events.emit(&snapshot);
+                self.emit_event(&snapshot);
                 return Ok(snapshot);
             }
 
@@ -207,7 +229,7 @@ impl ConnectionManager {
             }
             transition(&mut inner, &server_id, next_state, None, None)
         };
-        self.events.emit(&snapshot);
+        self.emit_event(&snapshot);
 
         let connect_result =
             tokio::time::timeout(self.timeouts.connect, self.transport.connect(&request)).await;
@@ -368,7 +390,7 @@ impl ConnectionManager {
                                 tokio::time::timeout(self.timeouts.close, session.close()).await;
                             return Err(cancelled());
                         };
-                        self.events.emit(&snapshot);
+                        self.emit_event(&snapshot);
                         Ok(snapshot)
                     }
                 }
@@ -390,7 +412,7 @@ impl ConnectionManager {
             );
             (snapshot, session)
         };
-        self.events.emit(&snapshot);
+        self.emit_event(&snapshot);
 
         if let Some(session) = session {
             let _ = tokio::time::timeout(self.timeouts.close, session.close()).await;
@@ -427,7 +449,7 @@ impl ConnectionManager {
         };
 
         for snapshot in &snapshots {
-            self.events.emit(snapshot);
+            self.emit_event(snapshot);
         }
 
         for (_, entry) in sessions {
@@ -655,11 +677,11 @@ impl ConnectionManager {
             inner.inflight.remove(server_id);
             transition(&mut inner, server_id, state, Some(error), host_key)
         };
-        self.events.emit(&snapshot);
+        self.emit_event(&snapshot);
         Ok(())
     }
 
-    fn session(&self, server_id: &str) -> Result<Arc<dyn SshSession>, AppError> {
+    pub(crate) fn session(&self, server_id: &str) -> Result<Arc<dyn SshSession>, AppError> {
         let inner = self.lock()?;
         inner
             .sessions
@@ -726,7 +748,7 @@ impl ConnectionManager {
                 None,
             );
             drop(inner);
-            self.events.emit(&snapshot);
+            self.emit_event(&snapshot);
             session
         };
 
