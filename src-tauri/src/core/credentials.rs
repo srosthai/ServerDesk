@@ -159,7 +159,7 @@ pub fn validate_reference(reference: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn validate_secret(secret: &str) -> Result<(), AppError> {
+pub(crate) fn validate_secret(secret: &str) -> Result<(), AppError> {
     if secret.is_empty() {
         return Err(AppError::validation("Secret cannot be empty."));
     }
@@ -177,8 +177,26 @@ fn entry(reference: &str) -> Result<Entry, AppError> {
 fn map_keyring_error(error: KeyringError) -> AppError {
     match error {
         KeyringError::NoEntry => AppError::not_found("Credential not found."),
-        other => AppError::credential("The OS credential store is unavailable.")
-            .with_details(other.to_string()),
+        KeyringError::NoStorageAccess(details) => AppError::credential_locked(
+            "The OS credential store is locked or inaccessible. Unlock it and try again.",
+        )
+        .with_details(details.to_string()),
+        KeyringError::BadEncoding(_) => AppError::credential_invalid(
+            "The saved credential is not valid UTF-8. Save the credential again.",
+        ),
+        KeyringError::TooLong(field, limit) => AppError::credential_invalid(format!(
+            "The OS credential store rejected the credential because {field} exceeds the {limit} character limit."
+        )),
+        KeyringError::Invalid(field, reason) => AppError::credential_invalid(format!(
+            "The OS credential store rejected the credential because {field} is invalid: {reason}"
+        )),
+        KeyringError::Ambiguous(_) => AppError::credential_invalid(
+            "More than one saved credential matches this reference. Remove the duplicate entries and try again.",
+        ),
+        other => AppError::credential_unavailable(
+            "The OS credential store is unavailable. Start or unlock a credential provider and try again.",
+        )
+        .with_details(other.to_string()),
     }
 }
 
@@ -332,5 +350,37 @@ mod tests {
         let oversized = "x".repeat(MAX_SECRET_BYTES + 1);
 
         assert!(store.set_secret("serverdesk:ssh:test", &oversized).is_err());
+    }
+
+    #[test]
+    fn maps_keyring_failures_to_typed_errors() {
+        let locked = map_keyring_error(KeyringError::NoStorageAccess(Box::new(
+            std::io::Error::other("keychain is locked"),
+        )));
+        let unavailable = map_keyring_error(KeyringError::PlatformFailure(Box::new(
+            std::io::Error::other("no secret service"),
+        )));
+        let invalid_encoding = map_keyring_error(KeyringError::BadEncoding(vec![0xff]));
+        let too_long = map_keyring_error(KeyringError::TooLong("reference".to_string(), 256));
+        let invalid = map_keyring_error(KeyringError::Invalid(
+            "reference".to_string(),
+            "bad".to_string(),
+        ));
+
+        assert_eq!(locked.code, crate::core::ErrorCode::CredentialLocked);
+        assert_eq!(
+            unavailable.code,
+            crate::core::ErrorCode::CredentialUnavailable
+        );
+        assert_eq!(
+            invalid_encoding.code,
+            crate::core::ErrorCode::CredentialInvalid
+        );
+        assert_eq!(too_long.code, crate::core::ErrorCode::CredentialInvalid);
+        assert_eq!(invalid.code, crate::core::ErrorCode::CredentialInvalid);
+        assert_eq!(
+            map_keyring_error(KeyringError::NoEntry).code,
+            crate::core::ErrorCode::NotFound
+        );
     }
 }

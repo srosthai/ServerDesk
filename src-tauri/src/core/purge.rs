@@ -47,6 +47,7 @@ pub fn purge_local_data(
         {
             references.insert(reference);
         }
+        references.extend(database.list_database_connection_credential_refs()?);
     }
     references.extend(read_index(&index_path)?);
 
@@ -89,7 +90,7 @@ mod tests {
     use super::*;
     use crate::{
         core::{AppError, credentials::MemoryCredentialStore},
-        storage::{AuthType, NewServer},
+        storage::{AuthType, DatabaseEngine, NewDatabaseConnection, NewServer},
     };
 
     fn server(reference: Option<&str>) -> NewServer {
@@ -136,6 +137,54 @@ mod tests {
         assert!(!directory.path().exists());
         assert!(credentials.get_secret("serverdesk:ssh:database").is_err());
         assert!(credentials.get_secret("serverdesk:ssh:orphan").is_err());
+    }
+
+    #[test]
+    fn removes_database_connection_credentials_even_without_an_index_entry() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = Database::open(directory.path().join(DATABASE_FILE_NAME)).expect("database");
+        let server = database
+            .create_server(&server(Some("serverdesk:ssh:database")))
+            .expect("saved server");
+        database
+            .create_database_connection(&NewDatabaseConnection {
+                server_id: server.id,
+                name: "Primary".to_string(),
+                engine: DatabaseEngine::Postgresql,
+                host: "127.0.0.1".to_string(),
+                port: 5432,
+                socket: None,
+                database_name: Some("app".to_string()),
+                username: "app".to_string(),
+                credential_ref: Some(
+                    "serverdesk:db:00000000-0000-4000-8000-000000000001".to_string(),
+                ),
+                read_only: true,
+                ssl_mode: Some("require".to_string()),
+            })
+            .expect("saved database connection");
+        drop(database);
+
+        let credentials = MemoryCredentialStore::default();
+        credentials
+            .set_secret("serverdesk:ssh:database", "ssh-secret")
+            .expect("ssh secret");
+        credentials
+            .set_secret(
+                "serverdesk:db:00000000-0000-4000-8000-000000000001",
+                "database-secret",
+            )
+            .expect("database secret");
+
+        let report = purge_local_data(directory.path(), &credentials).expect("purge");
+
+        assert_eq!(report.credential_count, 2);
+        assert!(credentials.get_secret("serverdesk:ssh:database").is_err());
+        assert!(
+            credentials
+                .get_secret("serverdesk:db:00000000-0000-4000-8000-000000000001")
+                .is_err()
+        );
     }
 
     #[test]

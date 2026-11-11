@@ -2,6 +2,7 @@ pub mod artisan;
 pub mod command;
 pub mod credential_index;
 pub mod credentials;
+pub mod database_credentials;
 pub mod error;
 pub mod files;
 pub mod history;
