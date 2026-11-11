@@ -65,6 +65,23 @@ const presentations: Record<ErrorCode, ConnectionErrorPresentation> = {
     title: "Credential unavailable",
     action: "Re-enter the password or private key, then test the connection again.",
   },
+  credential_unavailable: {
+    title: "Credential store unavailable",
+    action:
+      "Start or unlock your operating system credential provider, then save the credential again.",
+  },
+  credential_locked: {
+    title: "Credential store locked",
+    action: "Unlock your operating system credential store, then try again.",
+  },
+  credential_missing: {
+    title: "Saved credential missing",
+    action: "Re-enter the saved password or private key and save it again.",
+  },
+  credential_invalid: {
+    title: "Saved credential invalid",
+    action: "Re-enter the saved password or private key, save it again, and retry.",
+  },
   internal: {
     title: "Unexpected connection error",
     action: "Try again. If the problem continues, restart ServerDesk.",

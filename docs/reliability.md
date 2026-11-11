@@ -2,30 +2,35 @@
 
 This document records the reliability audit: what was already in place, which
 gaps were fixed, and which limitations remain accepted. The typed
-`AppError`/`ErrorCode` taxonomy and the existing design system are unchanged.
+`AppError`/`ErrorCode` taxonomy remains stable; database credential operations
+add specific `credential_*` codes for credential-store failures.
 
 ## Error categories
 
 Every failure crosses the Tauri boundary as one structured error with a stable
 `code`, a user-facing message, and optional bounded details.
 
-| Code             | Meaning                                                                 |
-| ---------------- | ----------------------------------------------------------------------- |
-| `authentication` | The SSH server rejected the username, password, or key.                 |
-| `host_key`       | The host key is unknown, changed, or failed a trusted-key comparison.   |
-| `timeout`        | A connection attempt, command, or request exceeded its time bound.      |
-| `dns`            | The hostname could not be resolved.                                     |
-| `network`        | The socket or SSH session was lost while an operation was running.      |
-| `permission`     | The SSH account or SFTP server denied the operation.                    |
-| `remote`         | The remote command or SFTP request failed after it was sent.            |
-| `cancelled`      | A user-requested cancellation stopped the operation.                    |
-| `connection`     | No authenticated session exists for the requested operation.            |
-| `conflict`       | An overwrite, duplicate destination, or existing path blocked the work. |
-| `validation`     | Local validation rejected the request before any remote operation.      |
-| `not_found`      | A saved profile, project, credential, or remote path does not exist.    |
-| `credential`     | A saved credential or private key could not be loaded or decrypted.     |
-| `storage`        | The local database or filesystem operation failed.                      |
-| `internal`       | A local invariant failed; no remote retry is attempted automatically.   |
+| Code                     | Meaning                                                                 |
+| ------------------------ | ----------------------------------------------------------------------- |
+| `authentication`         | The SSH server rejected the username, password, or key.                 |
+| `host_key`               | The host key is unknown, changed, or failed a trusted-key comparison.   |
+| `timeout`                | A connection attempt, command, or request exceeded its time bound.      |
+| `dns`                    | The hostname could not be resolved.                                     |
+| `network`                | The socket or SSH session was lost while an operation was running.      |
+| `permission`             | The SSH account or SFTP server denied the operation.                    |
+| `remote`                 | The remote command or SFTP request failed after it was sent.            |
+| `cancelled`              | A user-requested cancellation stopped the operation.                    |
+| `connection`             | No authenticated session exists for the requested operation.            |
+| `conflict`               | An overwrite, duplicate destination, or existing path blocked the work. |
+| `validation`             | Local validation rejected the request before any remote operation.      |
+| `not_found`              | A saved profile, project, credential, or remote path does not exist.    |
+| `credential`             | A saved credential or private key could not be loaded or decrypted.     |
+| `credential_unavailable` | The OS credential store could not be reached.                           |
+| `credential_locked`      | The OS credential store is locked or access was denied.                 |
+| `credential_missing`     | The saved database credential no longer exists in the credential store. |
+| `credential_invalid`     | The credential store returned data that cannot be used.                 |
+| `storage`                | The local database or filesystem operation failed.                      |
+| `internal`               | A local invariant failed; no remote retry is attempted automatically.   |
 
 A command running without a managed session now returns `connection`, not
 `not_found`, so the UI does not describe network loss as a missing profile. A

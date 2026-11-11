@@ -14,6 +14,10 @@ describe("describeConnectionError", () => {
       ["remote", "Remote check failed"],
       ["cancelled", "Connection cancelled"],
       ["credential", "Credential unavailable"],
+      ["credential_unavailable", "Credential store unavailable"],
+      ["credential_locked", "Credential store locked"],
+      ["credential_missing", "Saved credential missing"],
+      ["credential_invalid", "Saved credential invalid"],
     ];
 
     for (const [code, title] of cases) {

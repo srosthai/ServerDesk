@@ -301,7 +301,8 @@ impl FromStr for DatabaseEngine {
 /// Saved connection profile for a database on a ServerDesk server.
 ///
 /// The profile contains only non-secret metadata. `credential_ref` points at a
-/// password in the operating system credential store.
+/// password in the operating system credential store using the opaque
+/// `serverdesk:db:<uuid>` namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatabaseConnection {
     pub id: String,
