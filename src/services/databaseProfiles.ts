@@ -16,6 +16,7 @@ export const databaseProfileCommands = {
   update: "update_database_profile",
   delete: "delete_database_profile",
   test: "test_database_profile",
+  testDraft: "test_database_profile_draft",
   connect: "connect_database_profile",
   reconnect: "reconnect_database_profile",
   disconnect: "disconnect_database_profile",
@@ -56,6 +57,22 @@ export function deleteDatabaseProfile(id: string): Promise<void> {
 
 export function testDatabaseProfile(id: string): Promise<DatabaseTestResult> {
   return invoke<DatabaseTestResult>(databaseProfileCommands.test, { id });
+}
+
+/**
+ * Tests unsaved form values without persisting them.
+ *
+ * `profileId` lets the backend reuse the saved password when the password
+ * field is left blank on edit. The password itself is never returned.
+ */
+export function testDatabaseProfileDraft(
+  input: DatabaseProfileInput,
+  profileId?: string | null,
+): Promise<DatabaseTestResult> {
+  return invoke<DatabaseTestResult>(databaseProfileCommands.testDraft, {
+    input,
+    profileId: profileId ?? null,
+  });
 }
 
 export function connectDatabaseProfile(id: string): Promise<DatabaseConnectionSnapshot> {
