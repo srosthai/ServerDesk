@@ -16,32 +16,43 @@ import {
   TableIcon,
   TreeStructureIcon,
   WrenchIcon,
+  WarningCircleIcon,
 } from "@phosphor-icons/react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
 import { ErrorState, LoadingState } from "@/components/ui/states";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { DatabaseConnectionList, EngineBadge } from "@/features/databases/DatabaseConnectionList";
+import { DatabaseProfileDialog } from "@/features/databases/DatabaseProfileDialog";
+import {
+  DATABASE_ENGINE_LABELS,
+  databaseConnectionStateLabel,
+  formatDatabaseEndpoint,
+  formatLatency,
+} from "@/features/databases/databaseProfileForm";
 import { useActiveServer } from "@/hooks/useActiveServer";
-import { cn } from "@/lib/utils";
 import { isTauriRuntime } from "@/lib/tauri";
+import { cn } from "@/lib/utils";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { useDatabaseProfileStore } from "@/stores/databaseProfileStore";
 import { useServerStore } from "@/stores/serverStore";
-import type { ConnectionState, ServerProfile } from "@/types/contracts";
+import type {
+  ConnectionState,
+  DatabaseConnectionSnapshot,
+  DatabaseConnectionState,
+  DatabaseProfile,
+  DatabaseTestResult,
+  DatabaseTunnelSnapshot,
+  ServerProfile,
+} from "@/types/contracts";
 
-type WorkspaceState = "loading" | "error" | "empty" | "disconnected" | "ready";
+type WorkspaceState = "loading" | "error" | "empty" | "no-server" | "ready";
 
 type DatabaseTab = {
   value: string;
@@ -82,7 +93,7 @@ const databaseTabs: DatabaseTab[] = [
     icon: CodeIcon,
     emptyTitle: "The SQL workspace is empty",
     emptyDescription:
-      "Query tabs, execution plans, and results will appear here once a database connection is available.",
+      "Query tabs, execution plans, and results will appear here once a database connection is active.",
   },
   {
     value: "indexes",
@@ -102,35 +113,19 @@ const databaseTabs: DatabaseTab[] = [
   },
 ];
 
-const plannedConnectionSteps = [
-  {
-    title: "Choose a saved server profile",
-    description: "Reuse the existing SSH session and credential handling from ServerDesk.",
-  },
-  {
-    title: "Select an engine and endpoint",
-    description: "Pick MySQL or PostgreSQL and the database host and port on the server.",
-  },
-  {
-    title: "Provide database credentials",
-    description: "Credentials stay in the operating system keyring, never in SQLite or logs.",
-  },
-  {
-    title: "Open an SSH local-forward tunnel",
-    description: "The database port stays bound to the loopback interface through the SSH session.",
-  },
-];
+const EMPTY_PROFILES: DatabaseProfile[] = [];
+const EMPTY_SNAPSHOTS: Record<string, DatabaseConnectionSnapshot> = {};
+const EMPTY_TEST_RESULTS: Record<string, DatabaseTestResult> = {};
+const EMPTY_BUSY: Record<string, boolean> = {};
 
 function workspaceStateFor({
   serverStatus,
   serverCount,
   activeServer,
-  connectionState,
 }: {
   serverStatus: string;
   serverCount: number;
   activeServer: ServerProfile | null;
-  connectionState: ConnectionState;
 }): WorkspaceState {
   if (serverStatus === "loading" && serverCount === 0) {
     return "loading";
@@ -141,58 +136,59 @@ function workspaceStateFor({
   if (serverCount === 0) {
     return "empty";
   }
-  if (!activeServer || connectionState !== "connected") {
-    return "disconnected";
+  if (!activeServer) {
+    return "no-server";
   }
   return "ready";
 }
 
-function disconnectedCopy(
-  activeServer: ServerProfile | null,
-  connectionState: ConnectionState,
-): { title: string; description: string } {
-  if (!activeServer) {
-    return {
-      title: "No active server selected",
-      description:
-        "Choose an active server profile before opening its database workspace. Server selection is shared with the rest of ServerDesk.",
-    };
-  }
-
-  switch (connectionState) {
+function sshStateLabel(state: ConnectionState): string {
+  switch (state) {
+    case "connected":
+      return "SSH connected";
     case "connecting":
-      return {
-        title: "Connecting to the server",
-        description: `The database workspace opens after the SSH session to ${activeServer.name} reaches Connected.`,
-      };
+      return "SSH connecting";
     case "reconnecting":
-      return {
-        title: "Reconnecting to the server",
-        description: `ServerDesk is restoring the SSH session to ${activeServer.name}. The workspace stays closed until the session is healthy again.`,
-      };
+      return "SSH reconnecting";
     case "host-key-verification":
-      return {
-        title: "Host key verification required",
-        description: `Verify the host key for ${activeServer.name} before the database workspace can use its SSH session.`,
-      };
+      return "SSH host key";
     case "error":
-      return {
-        title: "SSH connection failed",
-        description: `The SSH session to ${activeServer.name} reported an error. Reconnect the server before opening its database workspace.`,
-      };
+      return "SSH error";
     default:
-      return {
-        title: "Database workspace is disconnected",
-        description: `Connect ${activeServer.name} over SSH to explore database objects. The workspace never opens a database port outside the SSH session.`,
-      };
+      return "SSH disconnected";
   }
 }
 
-function statusMessage(
-  state: WorkspaceState,
-  activeServer: ServerProfile | null,
-  connectionState: ConnectionState,
-): string {
+function tunnelSummary(tunnel: DatabaseTunnelSnapshot | undefined): string {
+  if (!tunnel) {
+    return "No tunnel";
+  }
+  switch (tunnel.state) {
+    case "active":
+      return tunnel.localPort ? `Tunnel ${tunnel.localHost}:${tunnel.localPort}` : "Tunnel active";
+    case "opening":
+      return "Tunnel opening";
+    default:
+      return "Tunnel closed";
+  }
+}
+
+function statusMessage({
+  state,
+  activeServer,
+  sshConnected,
+  profiles,
+  notice,
+}: {
+  state: WorkspaceState;
+  activeServer: ServerProfile | null;
+  sshConnected: boolean;
+  profiles: DatabaseProfile[];
+  notice: string | null;
+}): string {
+  if (notice) {
+    return notice;
+  }
   switch (state) {
     case "loading":
       return "Loading saved server profiles...";
@@ -200,24 +196,19 @@ function statusMessage(
       return "Server profiles could not be loaded.";
     case "empty":
       return "No server selected. Add or select a server profile.";
-    case "ready":
-      return "Workspace ready. No database connections configured.";
+    case "no-server":
+      return "No active server selected.";
     default:
       if (!activeServer) {
         return "No active server selected.";
       }
-      switch (connectionState) {
-        case "connecting":
-          return `Connecting to ${activeServer.name} over SSH...`;
-        case "reconnecting":
-          return `Reconnecting to ${activeServer.name}...`;
-        case "host-key-verification":
-          return `Host key verification required for ${activeServer.name}.`;
-        case "error":
-          return `SSH connection error for ${activeServer.name}.`;
-        default:
-          return `SSH disconnected from ${activeServer.name}.`;
+      if (!sshConnected) {
+        return `SSH disconnected from ${activeServer.name}. Profiles can be edited; connect the server to open tunnels.`;
       }
+      if (profiles.length === 0) {
+        return "Workspace ready. No database connections configured.";
+      }
+      return `${profiles.length} saved connection${profiles.length === 1 ? "" : "s"} on ${activeServer.name}.`;
   }
 }
 
@@ -239,19 +230,27 @@ function StatusDot({ state }: { state: WorkspaceState }) {
   );
 }
 
+function profileStateColor(state: DatabaseConnectionState): string {
+  switch (state) {
+    case "connected":
+      return "bg-success";
+    case "error":
+      return "bg-destructive";
+    case "connecting":
+    case "reconnecting":
+      return "animate-pulse bg-warning";
+    default:
+      return "bg-muted-foreground/50";
+  }
+}
+
 function WorkspaceStatePanel({
   state,
-  activeServer,
-  connectionState,
   error,
-  tabLabel,
   onRetry,
 }: {
   state: Exclude<WorkspaceState, "ready">;
-  activeServer: ServerProfile | null;
-  connectionState: ConnectionState;
   error: string | null;
-  tabLabel: string;
   onRetry: () => void;
 }) {
   if (state === "loading") {
@@ -295,13 +294,11 @@ function WorkspaceStatePanel({
     );
   }
 
-  const copy = disconnectedCopy(activeServer, connectionState);
-
   return (
     <EmptyState
       icon={<PlugsIcon className="size-4" aria-hidden="true" />}
-      title={copy.title}
-      description={`${tabLabel} is unavailable. ${copy.description}`}
+      title="No active server selected"
+      description="Choose an active server profile before creating database connections. Server selection is shared with the rest of ServerDesk."
       action={
         <Button asChild variant="secondary" size="sm">
           <Link to="/servers">Open servers</Link>
@@ -314,12 +311,16 @@ function WorkspaceStatePanel({
 function DatabaseWorkspaceTopBar({
   activeServer,
   connectionState,
+  selectedProfile,
+  selectedState,
   refreshing,
   onRefresh,
   onAddConnection,
 }: {
   activeServer: ServerProfile | null;
   connectionState: ConnectionState;
+  selectedProfile: DatabaseProfile | null;
+  selectedState: DatabaseConnectionState;
   refreshing: boolean;
   onRefresh: () => void;
   onAddConnection: () => void;
@@ -334,24 +335,42 @@ function DatabaseWorkspaceTopBar({
           <h2 className="text-[13px] font-semibold tracking-[-0.01em] text-foreground">
             Database workspace
           </h2>
-          <p className="text-[10px] text-muted-foreground">MySQL and PostgreSQL over SSH</p>
+          <p className="text-[10px] text-muted-foreground">
+            MySQL and PostgreSQL over loopback SSH tunnels
+          </p>
         </div>
         <StatusBadge
           state={activeServer ? connectionState : "disconnected"}
-          label={activeServer ? undefined : "No server"}
+          label={activeServer ? sshStateLabel(connectionState) : "No server"}
         />
-        <Badge variant="outline">Engine not selected</Badge>
+        {selectedProfile ? (
+          <>
+            <EngineBadge engine={selectedProfile.engine} />
+            <StatusBadge
+              state={selectedState}
+              label={databaseConnectionStateLabel(selectedState)}
+            />
+          </>
+        ) : (
+          <Badge variant="outline">No connection selected</Badge>
+        )}
       </div>
 
       <div className="flex min-w-0 flex-wrap items-center gap-2">
         <div className="hidden min-w-0 text-right sm:block">
-          <p className="max-w-48 truncate text-[11px] font-medium text-foreground">
-            {activeServer?.name ?? "No server selected"}
+          <p className="max-w-56 truncate text-[11px] font-medium text-foreground">
+            {selectedProfile?.name ?? activeServer?.name ?? "No server selected"}
           </p>
-          <p className="max-w-56 truncate font-mono text-[10px] text-muted-foreground">
-            {activeServer
-              ? `${activeServer.username}@${activeServer.host}:${activeServer.port}`
-              : "Choose or add a server profile"}
+          <p className="max-w-64 truncate font-mono text-[10px] text-muted-foreground">
+            {selectedProfile
+              ? formatDatabaseEndpoint(
+                  selectedProfile.host,
+                  selectedProfile.port,
+                  selectedProfile.socket,
+                )
+              : activeServer
+                ? `${activeServer.username}@${activeServer.host}:${activeServer.port}`
+                : "Choose or add a server profile"}
           </p>
         </div>
         <Button
@@ -359,16 +378,16 @@ function DatabaseWorkspaceTopBar({
           size="sm"
           onClick={onRefresh}
           disabled={refreshing}
-          aria-label="Refresh connection status"
+          aria-label="Refresh database connections"
         >
           {refreshing ? (
             <CircleNotchIcon className="size-3.5 animate-spin" aria-hidden="true" />
           ) : (
             <ArrowClockwiseIcon className="size-3.5" aria-hidden="true" />
           )}
-          {refreshing ? "Refreshing..." : "Refresh status"}
+          {refreshing ? "Refreshing..." : "Refresh"}
         </Button>
-        <Button size="sm" onClick={onAddConnection}>
+        <Button size="sm" onClick={onAddConnection} disabled={!isTauriRuntime()}>
           <PlusIcon className="size-3.5" aria-hidden="true" />
           Add connection
         </Button>
@@ -380,13 +399,41 @@ function DatabaseWorkspaceTopBar({
 function DatabaseExplorerRail({
   activeServer,
   connectionState,
-  workspaceState,
+  profiles,
+  profileStatus,
+  snapshots,
+  selectedProfileId,
+  onSelect,
+  onAddConnection,
+  onRetry,
 }: {
   activeServer: ServerProfile | null;
   connectionState: ConnectionState;
-  workspaceState: WorkspaceState;
+  profiles: DatabaseProfile[];
+  profileStatus: "idle" | "loading" | "ready" | "error";
+  snapshots: Record<string, DatabaseConnectionSnapshot>;
+  selectedProfileId: string | null;
+  onSelect: (profileId: string) => void;
+  onAddConnection: () => void;
+  onRetry: () => void;
 }) {
-  const connected = workspaceState === "ready";
+  const [query, setQuery] = useState("");
+  const normalizedQuery = query.trim().toLowerCase();
+  const filtered = profiles.filter((profile) => {
+    if (!normalizedQuery) {
+      return true;
+    }
+    return [
+      profile.name,
+      DATABASE_ENGINE_LABELS[profile.engine],
+      profile.host,
+      String(profile.port),
+      profile.databaseName ?? "",
+    ]
+      .join(" ")
+      .toLowerCase()
+      .includes(normalizedQuery);
+  });
 
   return (
     <aside
@@ -399,10 +446,22 @@ function DatabaseExplorerRail({
             <TreeStructureIcon className="size-3.5" aria-hidden="true" />
             Explorer
           </h2>
-          <Badge variant="outline">0 objects</Badge>
+          <div className="flex items-center gap-1">
+            <Badge variant="outline">{profiles.length}</Badge>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={onAddConnection}
+              disabled={!isTauriRuntime()}
+              aria-label="Add database connection"
+              title="Add database connection"
+            >
+              <PlusIcon className="size-3.5" aria-hidden="true" />
+            </Button>
+          </div>
         </div>
-        <label htmlFor="database-object-search" className="sr-only">
-          Search database objects
+        <label htmlFor="database-connection-search" className="sr-only">
+          Search database connections
         </label>
         <div className="relative mt-2">
           <MagnifyingGlassIcon
@@ -410,19 +469,14 @@ function DatabaseExplorerRail({
             aria-hidden="true"
           />
           <Input
-            id="database-object-search"
+            id="database-connection-search"
             type="search"
-            disabled
-            placeholder="Search objects"
-            aria-describedby="database-object-search-help"
+            value={query}
+            onChange={(event) => setQuery(event.currentTarget.value)}
+            placeholder="Search connections"
             className="h-8 pl-8 text-[12px]"
           />
         </div>
-        <p id="database-object-search-help" className="mt-1.5 text-[10px] text-muted-foreground">
-          {connected
-            ? "Search becomes available after a connection profile exists."
-            : "Connect the active server to search database objects."}
-        </p>
       </div>
 
       <div className="border-b border-border px-3 py-3">
@@ -447,38 +501,103 @@ function DatabaseExplorerRail({
         <StatusBadge
           className="mt-2"
           state={activeServer ? connectionState : "disconnected"}
-          label={activeServer ? undefined : "No server"}
+          label={activeServer ? sshStateLabel(connectionState) : "No server"}
         />
       </div>
 
-      <div className="min-h-40 flex-1 px-3 py-3">
+      <div className="min-h-40 flex-1 overflow-y-auto px-3 py-3">
         <div className="flex items-center justify-between gap-2">
           <h3 className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
             Connections
           </h3>
-          <Badge variant="outline">0</Badge>
+          {profiles.length > 0 ? (
+            <span className="text-[10px] text-muted-foreground">{filtered.length} shown</span>
+          ) : null}
         </div>
-        <div className="mt-2 flex items-start gap-2 rounded-md border border-dashed border-border px-2.5 py-3">
-          <PlugsIcon
-            className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
-            aria-hidden="true"
-          />
-          <div className="min-w-0">
-            <p className="text-[11px] font-medium text-foreground">
-              {connected ? "No saved connections" : "Explorer unavailable"}
-            </p>
-            <p className="mt-0.5 text-[10px] leading-4 text-muted-foreground">
-              {connected
-                ? "Connection profiles will appear here. Add one from the workspace toolbar."
-                : "Connect the active server to load its database connections."}
-            </p>
+
+        {profileStatus === "loading" || (profileStatus === "idle" && activeServer) ? (
+          <div className="mt-2.5">
+            <LoadingState rows={3} />
           </div>
-        </div>
+        ) : null}
+
+        {profileStatus === "error" ? (
+          <div className="mt-2 rounded-md border border-destructive/30 bg-destructive/8 px-2.5 py-2">
+            <p className="text-[11px] font-medium text-destructive">Could not load connections</p>
+            <Button variant="ghost" size="sm" className="mt-1 h-7 px-1.5" onClick={onRetry}>
+              Try again
+            </Button>
+          </div>
+        ) : null}
+
+        {profileStatus === "ready" && profiles.length === 0 ? (
+          <div className="mt-2 flex items-start gap-2 rounded-md border border-dashed border-border px-2.5 py-3">
+            <PlugsIcon
+              className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
+              aria-hidden="true"
+            />
+            <div className="min-w-0">
+              <p className="text-[11px] font-medium text-foreground">No saved connections</p>
+              <p className="mt-0.5 text-[10px] leading-4 text-muted-foreground">
+                Add a profile from the workspace toolbar.
+              </p>
+            </div>
+          </div>
+        ) : null}
+
+        {profileStatus === "ready" && profiles.length > 0 && filtered.length === 0 ? (
+          <p className="mt-2 rounded-md border border-dashed border-border px-2.5 py-3 text-[10px] leading-4 text-muted-foreground">
+            No connections match this search.
+          </p>
+        ) : null}
+
+        {filtered.length > 0 ? (
+          <ul className="mt-2 space-y-1">
+            {filtered.map((profile) => {
+              const snapshot = snapshots[profile.id];
+              const state = snapshot?.state ?? "disconnected";
+              const selected = profile.id === selectedProfileId;
+
+              return (
+                <li key={profile.id}>
+                  <button
+                    type="button"
+                    onClick={() => onSelect(profile.id)}
+                    aria-pressed={selected}
+                    className={cn(
+                      "w-full rounded-sm border px-2 py-1.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/40",
+                      selected
+                        ? "border-primary/40 bg-card text-foreground"
+                        : "border-transparent text-muted-foreground hover:border-border hover:bg-card/60 hover:text-foreground",
+                    )}
+                  >
+                    <span className="flex min-w-0 items-center gap-1.5">
+                      <span
+                        aria-hidden="true"
+                        className={cn("size-1.5 shrink-0 rounded-full", profileStateColor(state))}
+                      />
+                      <span className="truncate text-[11px] font-medium">{profile.name}</span>
+                    </span>
+                    <span className="mt-0.5 flex min-w-0 items-center gap-1 pl-3 text-[10px] text-muted-foreground">
+                      <span className="shrink-0">{DATABASE_ENGINE_LABELS[profile.engine]}</span>
+                      <span aria-hidden="true">·</span>
+                      <span className="truncate font-mono">
+                        {formatDatabaseEndpoint(profile.host, profile.port, profile.socket)}
+                      </span>
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        ) : null}
       </div>
 
-      <p className="border-t border-border px-3 py-2 text-[10px] text-muted-foreground">
-        SSH tunnel · No database listener
-      </p>
+      <div className="border-t border-border px-3 py-2">
+        <p className="text-[10px] text-muted-foreground">
+          Object tree arrives with the explorer. Tunnels use 127.0.0.1 only.
+        </p>
+      </div>
     </aside>
   );
 }
@@ -486,14 +605,26 @@ function DatabaseExplorerRail({
 function DatabaseWorkspaceStatusBar({
   state,
   activeServer,
-  connectionState,
+  sshConnected,
+  profiles,
+  selectedProfile,
+  selectedSnapshot,
+  selectedTestResult,
   notice,
 }: {
   state: WorkspaceState;
   activeServer: ServerProfile | null;
-  connectionState: ConnectionState;
+  sshConnected: boolean;
+  profiles: DatabaseProfile[];
+  selectedProfile: DatabaseProfile | null;
+  selectedSnapshot: DatabaseConnectionSnapshot | undefined;
+  selectedTestResult: DatabaseTestResult | undefined;
   notice: string | null;
 }) {
+  const selectedState = selectedSnapshot?.state ?? "disconnected";
+  const version = selectedSnapshot?.version?.version ?? selectedTestResult?.version.version;
+  const activeDatabase = selectedSnapshot?.databaseName ?? selectedProfile?.databaseName ?? null;
+
   return (
     <div
       aria-label="Database workspace status"
@@ -506,85 +637,36 @@ function DatabaseWorkspaceStatusBar({
       >
         <StatusDot state={state} />
         <span className="truncate">
-          {notice ?? statusMessage(state, activeServer, connectionState)}
+          {statusMessage({ state, activeServer, sshConnected, profiles, notice })}
         </span>
       </p>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-muted-foreground">
-        <span>0 open connections</span>
-        <span aria-hidden="true">·</span>
-        <span>0 running queries</span>
-        <span aria-hidden="true">·</span>
-        <span>SSH tunnel idle</span>
+        {selectedProfile ? (
+          <>
+            <span className="inline-flex items-center gap-1">
+              <span
+                aria-hidden="true"
+                className={cn("size-1.5 rounded-full", profileStateColor(selectedState))}
+              />
+              {databaseConnectionStateLabel(selectedState)}
+            </span>
+            <span aria-hidden="true">·</span>
+            <span>{tunnelSummary(selectedSnapshot?.tunnel)}</span>
+            <span aria-hidden="true">·</span>
+            <span>
+              {selectedProfile.engine === "mysql" ? "MySQL" : "PostgreSQL"}{" "}
+              {version ?? "version unknown"}
+            </span>
+            <span aria-hidden="true">·</span>
+            <span>Latency {formatLatency(selectedTestResult?.latencyMs)}</span>
+            <span aria-hidden="true">·</span>
+            <span>DB {activeDatabase ?? "none"}</span>
+          </>
+        ) : (
+          <span>No connection selected</span>
+        )}
       </div>
     </div>
-  );
-}
-
-function AddConnectionDialog({
-  open,
-  onOpenChange,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-}) {
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-xl">
-        <DialogHeader>
-          <DialogTitle>Add database connection</DialogTitle>
-          <DialogDescription>
-            Connection profiles arrive with the Database Manager backend. This placeholder shows the
-            planned flow only; nothing is saved and no connection is opened.
-          </DialogDescription>
-        </DialogHeader>
-
-        <div>
-          <h3 className="text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
-            Planned connection flow
-          </h3>
-          <ol className="mt-2.5 space-y-2.5">
-            {plannedConnectionSteps.map((step, index) => (
-              <li key={step.title} className="flex gap-2.5">
-                <span
-                  aria-hidden="true"
-                  className="mt-0.5 grid size-5 shrink-0 place-items-center rounded-full border border-border bg-muted/50 font-mono text-[10px] text-muted-foreground"
-                >
-                  {index + 1}
-                </span>
-                <div className="min-w-0">
-                  <p className="text-[12px] font-medium text-foreground">{step.title}</p>
-                  <p className="mt-0.5 text-[11px] leading-5 text-muted-foreground">
-                    {step.description}
-                  </p>
-                </div>
-              </li>
-            ))}
-          </ol>
-        </div>
-
-        <Alert variant="info">
-          <InfoIcon className="mt-0.5 size-4 shrink-0 text-info" aria-hidden="true" />
-          <div>
-            <AlertTitle>Placeholder only</AlertTitle>
-            <AlertDescription>
-              No database driver is loaded and no tunnel or connection will be opened. ServerDesk
-              continues to use only the existing SSH session.
-            </AlertDescription>
-          </div>
-        </Alert>
-
-        <DialogFooter>
-          <Button variant="secondary" onClick={() => onOpenChange(false)}>
-            Back to workspace
-          </Button>
-          <Button asChild>
-            <Link to="/servers" onClick={() => onOpenChange(false)}>
-              Open servers
-            </Link>
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   );
 }
 
@@ -596,16 +678,48 @@ function DatabaseManagerPage() {
   const refreshConnectionStates = useConnectionStore((state) => state.refreshStates);
   const { activeServer, connection } = useActiveServer();
   const connectionState = connection?.state ?? "disconnected";
-  const [addConnectionOpen, setAddConnectionOpen] = useState(false);
+  const sshConnected = connectionState === "connected";
+  const activeServerId = activeServer?.id ?? "";
+
+  const profiles = useDatabaseProfileStore(
+    (state) => state.profiles[activeServerId] ?? EMPTY_PROFILES,
+  );
+  const profileStatus = useDatabaseProfileStore((state) => state.status[activeServerId] ?? "idle");
+  const snapshots = useDatabaseProfileStore((state) => state.snapshots);
+  const testResults = useDatabaseProfileStore((state) => state.testResults);
+  const busy = useDatabaseProfileStore((state) => state.busy);
+  const databaseError = useDatabaseProfileStore((state) => state.error);
+  const fetchProfiles = useDatabaseProfileStore((state) => state.fetchProfiles);
+  const connectProfile = useDatabaseProfileStore((state) => state.connectProfile);
+  const reconnectProfile = useDatabaseProfileStore((state) => state.reconnectProfile);
+  const disconnectProfile = useDatabaseProfileStore((state) => state.disconnectProfile);
+  const testProfile = useDatabaseProfileStore((state) => state.testProfile);
+  const deleteProfile = useDatabaseProfileStore((state) => state.deleteProfile);
+  const refreshConnectionState = useDatabaseProfileStore((state) => state.refreshConnectionState);
+  const clearDatabaseError = useDatabaseProfileStore((state) => state.clearError);
+
   const [refreshing, setRefreshing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [requestedProfileId, setRequestedProfileId] = useState<string | null>(null);
+  const [dialog, setDialog] = useState<
+    { mode: "create" } | { mode: "edit"; profile: DatabaseProfile } | null
+  >(null);
+  const [deleteTarget, setDeleteTarget] = useState<DatabaseProfile | null>(null);
+  const [deletePending, setDeletePending] = useState(false);
 
   const workspaceState = workspaceStateFor({
     serverStatus,
     serverCount: servers.length,
     activeServer,
-    connectionState,
   });
+  const selectedProfile =
+    profiles.find((profile) => profile.id === requestedProfileId) ?? profiles[0] ?? null;
+  const selectedProfileId = selectedProfile?.id ?? null;
+  const selectedSnapshot = selectedProfile ? snapshots[selectedProfile.id] : undefined;
+  const selectedTestResult = selectedProfile ? testResults[selectedProfile.id] : undefined;
+  const profilesRecord = profiles.length > 0 ? snapshots : EMPTY_SNAPSHOTS;
+  const testResultsRecord = profiles.length > 0 ? testResults : EMPTY_TEST_RESULTS;
+  const busyRecord = profiles.length > 0 ? busy : EMPTY_BUSY;
 
   useEffect(() => {
     if (serverStatus === "idle") {
@@ -619,13 +733,33 @@ function DatabaseManagerPage() {
     }
   }, [serverStatus, servers, refreshConnectionStates]);
 
-  async function handleRefreshStatus() {
-    if (!isTauriRuntime()) {
-      setNotice("Live SSH status requires the desktop build. No connection was opened.");
+  useEffect(() => {
+    if (activeServer && profileStatus === "idle") {
+      void fetchProfiles(activeServer.id);
+    }
+  }, [activeServer, profileStatus, fetchProfiles]);
+
+  useEffect(() => {
+    if (profiles.length === 0) {
       return;
     }
-    if (!activeServer) {
-      setNotice("Select an active server before refreshing connection status.");
+    if (isTauriRuntime()) {
+      void Promise.all(profiles.map((profile) => refreshConnectionState(profile.id)));
+    }
+  }, [profiles, refreshConnectionState]);
+
+  function openCreateDialog() {
+    setDialog({ mode: "create" });
+  }
+
+  function openEditDialog(profile: DatabaseProfile) {
+    setRequestedProfileId(profile.id);
+    setDialog({ mode: "edit", profile });
+  }
+
+  async function handleRefresh() {
+    if (!isTauriRuntime()) {
+      setNotice("Live connections require the desktop build. No connection was opened.");
       return;
     }
 
@@ -633,22 +767,81 @@ function DatabaseManagerPage() {
     setNotice(null);
     try {
       await refreshConnectionStates(servers.map((server) => server.id));
+      if (activeServer) {
+        await fetchProfiles(activeServer.id);
+        const currentProfiles = useDatabaseProfileStore.getState().profiles[activeServer.id] ?? [];
+        await Promise.all(currentProfiles.map((profile) => refreshConnectionState(profile.id)));
+      }
       const checkedAt = new Date().toLocaleTimeString([], {
         hour: "2-digit",
         minute: "2-digit",
         second: "2-digit",
       });
-      setNotice(`Connection status refreshed at ${checkedAt}.`);
+      setNotice(`Database connection state refreshed at ${checkedAt}.`);
     } finally {
       setRefreshing(false);
     }
   }
 
+  async function handleConnect(profile: DatabaseProfile) {
+    setNotice(null);
+    const connected = await connectProfile(profile.id);
+    if (connected) {
+      setRequestedProfileId(profile.id);
+      setNotice(`Connected to ${profile.name} through the SSH tunnel.`);
+    }
+  }
+
+  async function handleReconnect(profile: DatabaseProfile) {
+    setNotice(null);
+    const connected = await reconnectProfile(profile.id);
+    if (connected) {
+      setNotice(`Reconnected ${profile.name} through the SSH tunnel.`);
+    }
+  }
+
+  async function handleDisconnect(profile: DatabaseProfile) {
+    setNotice(null);
+    const disconnected = await disconnectProfile(profile.id);
+    if (disconnected) {
+      setNotice(`Disconnected ${profile.name}. The loopback tunnel was closed.`);
+    }
+  }
+
+  async function handleTest(profile: DatabaseProfile) {
+    setNotice(null);
+    const result = await testProfile(profile.id);
+    if (result) {
+      setNotice(
+        `${profile.name} responded in ${formatLatency(result.latencyMs)} (${result.version.version}).`,
+      );
+    }
+  }
+
+  async function handleDelete() {
+    if (!deleteTarget) {
+      return;
+    }
+
+    setDeletePending(true);
+    const deleted = await deleteProfile(deleteTarget.id);
+    setDeletePending(false);
+
+    if (deleted) {
+      setNotice(`Deleted ${deleteTarget.name}. The remote database was not changed.`);
+      setDeleteTarget(null);
+    }
+  }
+
+  const deleteServer = deleteTarget
+    ? (servers.find((server) => server.id === deleteTarget.serverId) ?? null)
+    : null;
+
   return (
     <div className="space-y-5">
       <PageHeader
         title="Databases"
-        description="A database administration workspace for MySQL and PostgreSQL on your servers. This release adds the workspace shell only: no database drivers are loaded and no connections are opened."
+        description="Manage MySQL and PostgreSQL connection profiles on your servers. Every session uses a loopback SSH tunnel and keeps passwords in the OS credential store."
         actions={
           <Button asChild variant="secondary" size="sm">
             <Link to="/servers">Open servers</Link>
@@ -662,10 +855,55 @@ function DatabaseManagerPage() {
           <div>
             <AlertTitle>Web preview</AlertTitle>
             <AlertDescription>
-              The database workspace uses saved server profiles and live SSH state in the desktop
-              build. This preview shows the layout and placeholders only.
+              Database profiles, connection tests, and tunnels are available in the desktop build.
+              This preview shows the layout only.
             </AlertDescription>
           </div>
+        </Alert>
+      ) : null}
+
+      {serverError && servers.length > 0 ? (
+        <Alert variant="destructive">
+          <WarningCircleIcon
+            className="mt-0.5 size-4 shrink-0 text-destructive"
+            aria-hidden="true"
+          />
+          <div>
+            <AlertTitle>Server profile action failed</AlertTitle>
+            <AlertDescription>{serverError}</AlertDescription>
+          </div>
+        </Alert>
+      ) : null}
+
+      {databaseError ? (
+        <Alert variant="destructive">
+          <WarningCircleIcon
+            className="mt-0.5 size-4 shrink-0 text-destructive"
+            aria-hidden="true"
+          />
+          <div className="flex-1">
+            <AlertTitle>Database profile action failed</AlertTitle>
+            <AlertDescription>{databaseError}</AlertDescription>
+          </div>
+          <Button variant="ghost" size="sm" onClick={clearDatabaseError}>
+            Dismiss
+          </Button>
+        </Alert>
+      ) : null}
+
+      {workspaceState === "ready" && activeServer && !sshConnected ? (
+        <Alert variant="warning">
+          <WarningCircleIcon className="mt-0.5 size-4 shrink-0 text-warning" aria-hidden="true" />
+          <div className="flex-1">
+            <AlertTitle>SSH session is not connected</AlertTitle>
+            <AlertDescription>
+              Profiles on {activeServer.name} can still be created and edited. Connect the server
+              over SSH before testing or opening a database tunnel.
+            </AlertDescription>
+          </div>
+          <Button asChild variant="secondary" size="sm">
+            <Link to="/servers">Open servers</Link>
+          </Button>
         </Alert>
       ) : null}
 
@@ -676,16 +914,28 @@ function DatabaseManagerPage() {
         <DatabaseWorkspaceTopBar
           activeServer={activeServer}
           connectionState={connectionState}
+          selectedProfile={selectedProfile}
+          selectedState={selectedSnapshot?.state ?? "disconnected"}
           refreshing={refreshing}
-          onRefresh={() => void handleRefreshStatus()}
-          onAddConnection={() => setAddConnectionOpen(true)}
+          onRefresh={() => void handleRefresh()}
+          onAddConnection={openCreateDialog}
         />
 
         <div className="grid min-h-[30rem] lg:grid-cols-[13.5rem_minmax(0,1fr)]">
           <DatabaseExplorerRail
             activeServer={activeServer}
             connectionState={connectionState}
-            workspaceState={workspaceState}
+            profiles={profiles}
+            profileStatus={profileStatus}
+            snapshots={profilesRecord}
+            selectedProfileId={selectedProfileId}
+            onSelect={setRequestedProfileId}
+            onAddConnection={openCreateDialog}
+            onRetry={() => {
+              if (activeServer) {
+                void fetchProfiles(activeServer.id);
+              }
+            }}
           />
 
           <div className="min-w-0">
@@ -708,28 +958,47 @@ function DatabaseManagerPage() {
                 const TabIcon = tab.icon;
                 return (
                   <TabsContent key={tab.value} value={tab.value} className="p-4">
-                    {workspaceState === "ready" ? (
+                    {workspaceState !== "ready" ? (
+                      <WorkspaceStatePanel
+                        state={workspaceState}
+                        error={serverError}
+                        onRetry={() => void fetchServers()}
+                      />
+                    ) : tab.value === "overview" ? (
+                      <DatabaseConnectionList
+                        profiles={profiles}
+                        servers={servers}
+                        snapshots={profilesRecord}
+                        testResults={testResultsRecord}
+                        busy={busyRecord}
+                        selectedProfileId={selectedProfileId}
+                        sshConnected={sshConnected}
+                        onSelect={setRequestedProfileId}
+                        onConnect={(profile) => void handleConnect(profile)}
+                        onReconnect={(profile) => void handleReconnect(profile)}
+                        onDisconnect={(profile) => void handleDisconnect(profile)}
+                        onTest={(profile) => void handleTest(profile)}
+                        onEdit={openEditDialog}
+                        onDelete={setDeleteTarget}
+                        onAdd={openCreateDialog}
+                      />
+                    ) : (
                       <EmptyState
                         icon={<TabIcon className="size-4" aria-hidden="true" />}
                         title={tab.emptyTitle}
-                        description={tab.emptyDescription}
+                        description={
+                          selectedProfile
+                            ? `${selectedProfile.name} is selected. ${tab.emptyDescription}`
+                            : `${tab.emptyDescription} Add a connection profile to begin.`
+                        }
                         action={
-                          tab.value === "overview" ? (
-                            <Button size="sm" onClick={() => setAddConnectionOpen(true)}>
+                          profiles.length === 0 ? (
+                            <Button size="sm" onClick={openCreateDialog}>
                               <PlusIcon className="size-3.5" aria-hidden="true" />
-                              Add your first connection
+                              Add connection
                             </Button>
                           ) : undefined
                         }
-                      />
-                    ) : (
-                      <WorkspaceStatePanel
-                        state={workspaceState}
-                        activeServer={activeServer}
-                        connectionState={connectionState}
-                        error={serverError}
-                        tabLabel={tab.label}
-                        onRetry={() => void fetchServers()}
                       />
                     )}
                   </TabsContent>
@@ -742,17 +1011,83 @@ function DatabaseManagerPage() {
         <DatabaseWorkspaceStatusBar
           state={workspaceState}
           activeServer={activeServer}
-          connectionState={connectionState}
+          sshConnected={sshConnected}
+          profiles={profiles}
+          selectedProfile={selectedProfile}
+          selectedSnapshot={selectedSnapshot}
+          selectedTestResult={selectedTestResult}
           notice={notice}
         />
       </section>
 
       <p className="text-[10px] text-muted-foreground">
-        This workspace is a shell. ServerDesk does not load database drivers, open database ports,
-        or create tunnels yet. The Add connection flow is a placeholder and saves nothing.
+        Database listeners are bound to 127.0.0.1 inside the existing SSH session. Passwords are
+        written to the OS credential store and are never rendered after saving.
       </p>
 
-      <AddConnectionDialog open={addConnectionOpen} onOpenChange={setAddConnectionOpen} />
+      {dialog ? (
+        <DatabaseProfileDialog
+          key={dialog.mode === "edit" ? dialog.profile.id : `new-${activeServerId}`}
+          servers={servers}
+          activeServerId={activeServer?.id ?? null}
+          profile={dialog.mode === "edit" ? dialog.profile : null}
+          onOpenChange={(open) => {
+            if (!open) {
+              setDialog(null);
+            }
+          }}
+          onSaved={(saved) => {
+            setRequestedProfileId(saved.id);
+            const savedServer = servers.find((server) => server.id === saved.serverId);
+            setNotice(
+              savedServer && savedServer.id !== activeServerId
+                ? `Saved ${saved.name} for ${savedServer.name}. Select that server to open it.`
+                : `Saved ${saved.name}.`,
+            );
+          }}
+        />
+      ) : null}
+
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !deletePending) {
+            setDeleteTarget(null);
+          }
+        }}
+        title={`Delete ${deleteTarget?.name ?? "database connection"}?`}
+        description="The saved profile and its database password will be removed. The remote database and server are not changed."
+        confirmLabel="Delete connection"
+        details={
+          deleteTarget
+            ? [
+                { label: "Profile", value: deleteTarget.name },
+                {
+                  label: "Server",
+                  value: deleteServer
+                    ? `${deleteServer.name} (${deleteServer.host})`
+                    : deleteTarget.serverId,
+                },
+                {
+                  label: "Engine",
+                  value: DATABASE_ENGINE_LABELS[deleteTarget.engine],
+                },
+                {
+                  label: "Endpoint",
+                  value: formatDatabaseEndpoint(
+                    deleteTarget.host,
+                    deleteTarget.port,
+                    deleteTarget.socket,
+                  ),
+                },
+              ]
+            : undefined
+        }
+        warningTitle="This removes the saved profile."
+        warningDescription="The database password is deleted from the OS credential store. Existing server data is untouched."
+        onConfirm={() => void handleDelete()}
+        pending={deletePending}
+      />
     </div>
   );
 }
