@@ -14,6 +14,7 @@ pub mod pagination;
 pub mod postgres;
 pub mod service;
 pub mod traits;
+pub mod validation;
 
 pub use capabilities::{
     CapabilityFlags, CapabilitySnapshot, DatabaseAction, DatabaseCapabilities, DatabaseVersion,
@@ -28,6 +29,7 @@ pub use mysql::MysqlDatabaseAdapter;
 pub use pagination::{
     Bounded, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, MAX_PAGE_OFFSET, Page, PageRequest,
 };
+pub use postgres::PostgresDatabaseAdapter;
 pub use service::{DEFAULT_DATABASE_CONNECT_TIMEOUT, DatabaseConnectionRegistry};
 pub use traits::{
     ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter, DatabaseConnectRequest,

@@ -19,7 +19,7 @@ use crate::{
 
 use super::{
     CapabilitySnapshot, DatabaseAdapter, DatabaseConnectRequest, DatabaseConnectionInfo,
-    DatabasePassword, DatabasePing, MysqlDatabaseAdapter,
+    DatabasePassword, DatabasePing, MysqlDatabaseAdapter, PostgresDatabaseAdapter,
 };
 
 /// Default bound for opening a database session through its tunnel.
@@ -191,9 +191,7 @@ impl DatabaseConnectionRegistry {
 fn adapter_for(engine: DatabaseEngine) -> Result<Box<dyn DatabaseAdapter>, AppError> {
     match engine {
         DatabaseEngine::Mysql => Ok(Box::new(MysqlDatabaseAdapter::new())),
-        DatabaseEngine::Postgresql => Err(AppError::capability(
-            "PostgreSQL connectivity is not available in this release.",
-        )),
+        DatabaseEngine::Postgresql => Ok(Box::new(PostgresDatabaseAdapter::new())),
     }
 }
 
@@ -202,17 +200,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mysql_profiles_select_the_mysql_adapter() {
-        let adapter = adapter_for(DatabaseEngine::Mysql).expect("mysql adapter");
-        assert_eq!(adapter.engine(), DatabaseEngine::Mysql);
-    }
+    fn saved_profiles_select_the_engine_adapter() {
+        let mysql = adapter_for(DatabaseEngine::Mysql).expect("mysql adapter");
+        assert_eq!(mysql.engine(), DatabaseEngine::Mysql);
+        assert_eq!(mysql.dialect().engine(), DatabaseEngine::Mysql);
 
-    #[test]
-    fn postgres_profiles_fail_with_a_capability_error_until_the_adapter_lands() {
-        let error = match adapter_for(DatabaseEngine::Postgresql) {
-            Ok(_) => panic!("postgres adapter must not be available yet"),
-            Err(error) => error,
-        };
-        assert_eq!(error.code, crate::core::ErrorCode::Capability);
+        let postgres = adapter_for(DatabaseEngine::Postgresql).expect("postgres adapter");
+        assert_eq!(postgres.engine(), DatabaseEngine::Postgresql);
+        assert_eq!(postgres.dialect().engine(), DatabaseEngine::Postgresql);
+        assert_eq!(
+            postgres.capabilities().snapshot().engine,
+            DatabaseEngine::Postgresql
+        );
     }
 }
