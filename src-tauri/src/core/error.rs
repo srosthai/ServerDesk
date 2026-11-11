@@ -21,6 +21,10 @@ pub enum ErrorCode {
     NotFound,
     Storage,
     Credential,
+    CredentialUnavailable,
+    CredentialLocked,
+    CredentialMissing,
+    CredentialInvalid,
     Internal,
 }
 
@@ -96,6 +100,22 @@ impl AppError {
 
     pub fn credential(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Credential, message)
+    }
+
+    pub fn credential_unavailable(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::CredentialUnavailable, message)
+    }
+
+    pub fn credential_locked(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::CredentialLocked, message)
+    }
+
+    pub fn credential_missing(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::CredentialMissing, message)
+    }
+
+    pub fn credential_invalid(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::CredentialInvalid, message)
     }
 
     pub fn internal(message: impl Into<String>) -> Self {

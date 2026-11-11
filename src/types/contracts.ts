@@ -13,6 +13,10 @@ export type ErrorCode =
   | "not_found"
   | "storage"
   | "credential"
+  | "credential_unavailable"
+  | "credential_locked"
+  | "credential_missing"
+  | "credential_invalid"
   | "internal";
 
 export type CommandError = {

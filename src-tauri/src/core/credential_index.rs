@@ -67,6 +67,10 @@ impl CredentialIndex {
         Ok(self.lock()?.iter().cloned().collect())
     }
 
+    pub fn contains(&self, reference: &str) -> Result<bool, AppError> {
+        Ok(self.lock()?.contains(reference))
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, BTreeSet<String>>, AppError> {
         self.references
             .lock()

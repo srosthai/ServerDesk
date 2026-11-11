@@ -90,6 +90,23 @@ impl Database {
         })
     }
 
+    /// Lists every saved database credential reference for `--purge-data`.
+    ///
+    /// The credential index normally contains these references too, but reading
+    /// the database closes the gap if the index was lost or is malformed.
+    pub fn list_database_connection_credential_refs(&self) -> Result<Vec<String>, StorageError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT credential_ref FROM database_connections \
+                 WHERE credential_ref IS NOT NULL ORDER BY credential_ref",
+            )?;
+            let references = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<String>, _>>()?;
+            Ok(references)
+        })
+    }
+
     pub fn update_database_connection(
         &self,
         id: &str,

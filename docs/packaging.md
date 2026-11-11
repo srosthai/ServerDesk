@@ -67,17 +67,17 @@ ServerDesk appends the bundle identifier to the operating system data directory:
 The directory contains:
 
 - `serverdesk.sqlite3` and SQLite sidecar files: server metadata, preferences, projects, history, and credential references. On Unix the database files are restricted to the owning user (`0600`).
-- `credential-references.json`: the references created by this installation, used only so an uninstall can find orphaned keyring entries. It contains references such as `serverdesk:ssh:<uuid>`, never passwords or private keys.
+- `credential-references.json`: the references created by this installation, used only so an uninstall can find orphaned keyring entries. It contains references such as `serverdesk:ssh:<uuid>` and `serverdesk:db:<uuid>`, never passwords or private keys.
 
 Secrets live in the operating system credential store:
 
-| Platform | Credential store                                                | Entry identity                                                                  |
-| -------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| Linux    | Secret Service (GNOME Keyring, KWallet, or compatible provider) | service `com.serverdesk.app`, account `serverdesk:ssh:<uuid>`                   |
-| macOS    | Keychain                                                        | generic password, service `com.serverdesk.app`, account `serverdesk:ssh:<uuid>` |
-| Windows  | Credential Manager                                              | generic credential target `<reference>.com.serverdesk.app`                      |
+| Platform | Credential store                                                | Entry identity                                                                                            |
+| -------- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| Linux    | Secret Service (GNOME Keyring, KWallet, or compatible provider) | service `com.serverdesk.app`, account `serverdesk:ssh:<uuid>` or `serverdesk:db:<uuid>`                   |
+| macOS    | Keychain                                                        | generic password, service `com.serverdesk.app`, account `serverdesk:ssh:<uuid>` or `serverdesk:db:<uuid>` |
+| Windows  | Credential Manager                                              | generic credential target `<reference>.com.serverdesk.app`                                                |
 
-SQLite stores only the reference. A desktop Linux session therefore needs a running Secret Service provider; a headless or locked-down session without one prevents saving or reading SSH credentials. That is an OS-session limitation, not a database limitation.
+SQLite stores only the reference. A desktop Linux session therefore needs a running Secret Service provider; a headless or locked-down session without one prevents saving or reading SSH or database credentials. That is an OS-session limitation, not a database limitation.
 
 ## Building locally
 
