@@ -12,6 +12,7 @@ pub mod fake;
 pub mod mysql;
 pub mod pagination;
 pub mod postgres;
+pub mod service;
 pub mod traits;
 
 pub use capabilities::{
@@ -23,9 +24,11 @@ pub use dialect::{
 };
 pub use errors::{DatabaseError, DatabaseErrorKind};
 pub use fake::FakeDatabaseAdapter;
+pub use mysql::MysqlDatabaseAdapter;
 pub use pagination::{
     Bounded, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, MAX_PAGE_OFFSET, Page, PageRequest,
 };
+pub use service::{DEFAULT_DATABASE_CONNECT_TIMEOUT, DatabaseConnectionRegistry};
 pub use traits::{
     ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter, DatabaseConnectRequest,
     DatabaseConnectionInfo, DatabasePassword, DatabasePing, DatabaseSummary, DatabaseVersionInfo,

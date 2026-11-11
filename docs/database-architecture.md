@@ -5,9 +5,11 @@ Engine-specific SQL, metadata queries, version checks, and driver errors stay
 inside the adapter layer. Tauri commands and React consume typed metadata,
 capability documents, stable error kinds, and bounded pages only.
 
-This slice adds the shared foundation. It does not add a live MySQL or
-PostgreSQL driver yet; the fake adapter and capability command prove the
-contract without a database, tunnel, or network connection.
+This slice adds the shared foundation and the live MySQL adapter. The MySQL
+adapter connects through a loopback tunnel endpoint with SQLx, enforces
+read-only sessions, discovers the server version, and derives capability flags
+from it. PostgreSQL still uses the fake adapter and capability contract until
+its driver lands; the fake adapter remains available for deterministic tests.
 
 ## Boundaries
 
@@ -43,6 +45,7 @@ src-tauri/src/database/
   fake.rs           in-memory adapter for tests and demos
   mysql/
     mod.rs          MySQL dialect
+    adapter.rs      live SQLx MySQL adapter and error mapping
     capabilities.rs MySQL version gates
     sql.rs          MySQL-only metadata SQL
   postgres/
@@ -74,6 +77,40 @@ capabilities, so commands do not branch on MySQL versus PostgreSQL SQL.
 mode, timeout, and a `DatabasePassword` whose debug output is always
 `<redacted>`. Adapters convert driver, tunnel, authentication, permission,
 timeout, query, capability, and cancellation failures into `DatabaseError`.
+
+## MySQL adapter
+
+`database::mysql::MysqlDatabaseAdapter` uses SQLx with the Tokio runtime and
+rustls. It accepts only `127.0.0.1` or `::1` endpoints because the application
+never opens a database port outside the SSH tunnel; `DatabaseConnectionRegistry`
+feeds it the loopback host and ephemeral port from `TunnelManager`.
+
+The adapter:
+
+- opens one authenticated connection within the profile's connect timeout;
+- applies `SET SESSION TRANSACTION READ ONLY` before reporting a read-only
+  connect as successful, so a write fails instead of silently running;
+- reads `VERSION()` once at connect and builds the capability document from
+  that exact server version (including MariaDB vendor suffixes);
+- supports `preferred`, `disabled`, `required`, `verify-ca`, and
+  `verify-identity` SSL modes;
+- maps authentication codes (1045, 1698, and related), permission codes (1044,
+  1142, 1143, 1227, 1290, 1370, 1792, 1836), timeouts, protocol failures, and
+  connection failures to the shared error kinds;
+- bounds connect, ping, version, and metadata operations with timeouts;
+- keeps credentials out of debug output, serialized errors, and logs.
+
+Driver diagnostics deliberately contain only the MySQL error number and
+SQLSTATE. The server message is not forwarded because it can echo account
+names, SQL text, or connection details. A wrong password therefore produces a
+`database_auth` error, an unreachable loopback endpoint produces `connection`,
+and neither includes the password or a connection string.
+
+`DatabaseConnectionRegistry` owns live adapters by profile id and coordinates
+connect, ping, disconnect, capability lookup, and shutdown with the tunnel.
+Tauri commands for this lifecycle are added by the connection-contract issue;
+the registry is registered as managed state so those commands can use it
+without duplicating driver or tunnel logic.
 
 ## Capability model
 
@@ -233,17 +270,61 @@ Run the focused suites with:
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml database::
 cargo test --manifest-path src-tauri/Cargo.toml --test database_adapter
+cargo test --manifest-path src-tauri/Cargo.toml --test database_mysql
 ```
+
+### Live MySQL/MariaDB fixture
+
+The live tests are opt-in and target a loopback-only container. They are
+skipped when the fixture variables are absent, so CI does not need a database.
+Use Podman or Docker:
+
+```bash
+podman run --rm -d --name serverdesk-mysql-test \
+  -e MARIADB_ROOT_PASSWORD=rootpass \
+  -e MARIADB_DATABASE=app \
+  -e MARIADB_USER=app \
+  -e MARIADB_PASSWORD=apppass \
+  -p 127.0.0.1::3306 docker.io/library/mariadb:11.4
+
+podman port serverdesk-mysql-test    # note the 127.0.0.1:<port> mapping
+
+SERVERDESK_TEST_MYSQL_HOST=127.0.0.1 \
+SERVERDESK_TEST_MYSQL_PORT=<port> \
+SERVERDESK_TEST_MYSQL_DATABASE=app \
+SERVERDESK_TEST_MYSQL_USER=app \
+SERVERDESK_TEST_MYSQL_PASSWORD=apppass \
+  cargo test --manifest-path src-tauri/Cargo.toml \
+    --lib database::mysql::adapter::tests::live -- --nocapture
+
+SERVERDESK_TEST_MYSQL_HOST=127.0.0.1 \
+SERVERDESK_TEST_MYSQL_PORT=<port> \
+SERVERDESK_TEST_MYSQL_DATABASE=app \
+SERVERDESK_TEST_MYSQL_USER=app \
+SERVERDESK_TEST_MYSQL_PASSWORD=apppass \
+  cargo test --manifest-path src-tauri/Cargo.toml \
+    --test database_mysql -- --nocapture
+```
+
+The fixture tests cover connect, ping, version, capability flags, read-only
+write rejection, writable probe-table metadata, typed authentication failure,
+and the unavailable-host path. They bind no public port; the container mapping
+is explicit `127.0.0.1`. The live path has been exercised against both
+MariaDB 11.4 and MySQL 8.4 containers.
 
 ## Current limitations
 
-- No live MySQL or PostgreSQL driver is wired; `connect` exists only in the
-  fake adapter and future engine adapters.
-- Real metadata mapping, type mapping, transactions, query cancellation, and
-  streaming are follow-up work.
+- PostgreSQL has no live driver yet; it still uses the fake adapter and
+  capability contract.
+- MySQL metadata methods cover databases, schemas, tables, columns, indexes,
+  and constraints, but large-catalog paging, object counts, and richer column
+  detail remain follow-up work.
+- MySQL index and constraint rows are grouped after the metadata query, so a
+  table with an unusually large number of index columns is not independently
+  paged inside one call.
+- Real query execution, transactions, cancellation, streaming, and row editing
+  are follow-up work.
 - Capability checks are only as accurate as the server version string. An
   unknown version disables version-dependent actions rather than guessing.
-- Engine SQL constants describe the intended MySQL/PostgreSQL metadata shape
-  and are covered by module tests, not by a live database in this slice.
 - The capability command accepts an engine and raw version; the connection
   flow will replace this with capabilities observed after a real connect.
