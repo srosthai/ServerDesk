@@ -62,6 +62,7 @@ User guide:
 - [SSH account and scoped sudo](docs/ssh-setup.md)
 - [Host key verification and recovery](docs/host-keys.md)
 - [Features](docs/features.md)
+- [Database adapter architecture](docs/database-architecture.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Security and privacy](docs/security.md)
 

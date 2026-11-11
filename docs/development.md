@@ -145,6 +145,7 @@ live in `src-tauri/tests/`:
 | `queue_supervisor.rs`   | Read-only Supervisor and queue worker detection                                               |
 | `logs.rs`               | Bounded tails, allowlists, rotation, permissions, redaction                                   |
 | `history.rs`            | Sanitized history, filters, retention, clear behavior                                         |
+| `database_adapter.rs`   | Shared adapter trait, fake adapter, capability gating, bounded pages                          |
 | `storage.rs`            | Migrations, SQLite constraints, credential references, file modes                             |
 | `security.rs`           | Injection attempts, secret scanning, redaction regression coverage                            |
 
@@ -201,6 +202,10 @@ the input field.
   implementation.
 - `src-tauri/src/core/ssh/` owns the connection manager, `russh` transport,
   host-key checks, private-key loading, and terminal channels.
+- `src-tauri/src/database/` contains the shared MySQL/PostgreSQL adapter
+  contract, capability model, identifier quoting, value binding, pagination,
+  and error taxonomy. Engine SQL stays in `mysql/sql.rs` and `postgres/sql.rs`
+  and is never returned by a command. See [database-architecture.md](database-architecture.md).
 - `src-tauri/src/storage/` owns SQLite access, migrations, and record types.
   Schema files live in `migrations/` and are embedded at compile time.
 - `src-tauri/tests/` contains the integration suites listed above.
@@ -279,6 +284,7 @@ User and administrator guides live in `docs/`:
 - [ssh-setup.md](ssh-setup.md)
 - [host-keys.md](host-keys.md)
 - [features.md](features.md)
+- [database-architecture.md](database-architecture.md)
 - [troubleshooting.md](troubleshooting.md)
 - [security.md](security.md)
 - [packaging.md](packaging.md)

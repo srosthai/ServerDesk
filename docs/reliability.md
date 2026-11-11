@@ -19,6 +19,10 @@ Every failure crosses the Tauri boundary as one structured error with a stable
 | `network`                | The socket or SSH session was lost while an operation was running.      |
 | `permission`             | The SSH account or SFTP server denied the operation.                    |
 | `remote`                 | The remote command or SFTP request failed after it was sent.            |
+| `tunnel`                 | The database SSH tunnel or local listener failed.                       |
+| `database_auth`          | The database rejected the account, password, or auth method.            |
+| `query`                  | The database engine rejected SQL or a metadata request.                 |
+| `capability`             | The selected engine/version does not support the action.                |
 | `cancelled`              | A user-requested cancellation stopped the operation.                    |
 | `connection`             | No authenticated session exists for the requested operation.            |
 | `conflict`               | An overwrite, duplicate destination, or existing path blocked the work. |
@@ -94,6 +98,21 @@ transfer identifier and a new partial path; no transfer is resumed silently.
   drops the listener and probe channel before returning the error.
 - Forwarded bytes are never logged, and tunnel events contain only profile,
   endpoint, state, and local port metadata.
+
+## Database adapter boundary
+
+- MySQL and PostgreSQL share one `DatabaseAdapter` trait and typed metadata
+  contract; commands do not branch on engine SQL.
+- Capability checks are repeated before execution. Unsupported actions return
+  `capability` instead of reaching the engine.
+- Identifier quoting and positional value binding are centralized. Values are
+  never concatenated into SQL; identifiers reject empty, dotted, control, NUL,
+  and oversized input.
+- Metadata results are paginated with a 500-row maximum and a deep-offset cap.
+- Engine-specific SQL stays in `database/mysql/sql.rs` and
+  `database/postgres/sql.rs`; it is never serialized to React.
+- No live driver is connected in this foundation slice. The fake adapter covers
+  the shared interface and error paths in tests.
 
 ## Transfer completeness
 

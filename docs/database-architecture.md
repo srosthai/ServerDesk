@@ -1,0 +1,249 @@
+# Database adapter architecture
+
+The Database Manager shares one adapter contract between MySQL and PostgreSQL.
+Engine-specific SQL, metadata queries, version checks, and driver errors stay
+inside the adapter layer. Tauri commands and React consume typed metadata,
+capability documents, stable error kinds, and bounded pages only.
+
+This slice adds the shared foundation. It does not add a live MySQL or
+PostgreSQL driver yet; the fake adapter and capability command prove the
+contract without a database, tunnel, or network connection.
+
+## Boundaries
+
+```text
+React
+  -> src/services (typed Tauri calls; no SQL)
+  -> src-tauri/src/commands/database (validation, state lookup, serialization)
+  -> src-tauri/src/database/traits.rs (DatabaseAdapter)
+  -> mysql/ or postgres/ adapter implementation (engine SQL and driver mapping)
+```
+
+Commands must not import `database::mysql::sql` or `database::postgres::sql`.
+React never receives SQL text, engine identifiers, driver diagnostics, or
+credentials. Capability responses contain action names and boolean flags only.
+
+## Module layout
+
+The structure follows the Database Manager plan's adapter split:
+
+```text
+src-tauri/src/commands/database/
+  mod.rs            command boundary
+  capabilities.rs   engine/version capability document
+  tunnels.rs        existing loopback SSH tunnel commands
+
+src-tauri/src/database/
+  mod.rs            public re-exports and dialect/capability factories
+  traits.rs         DatabaseAdapter and typed metadata
+  capabilities.rs   action model, flags, version parsing
+  dialect.rs        identifier validation/quoting and value binding
+  errors.rs         shared database error taxonomy
+  pagination.rs     bounded results and page requests
+  fake.rs           in-memory adapter for tests and demos
+  mysql/
+    mod.rs          MySQL dialect
+    capabilities.rs MySQL version gates
+    sql.rs          MySQL-only metadata SQL
+  postgres/
+    mod.rs          PostgreSQL dialect
+    capabilities.rs PostgreSQL version gates
+    sql.rs          PostgreSQL-only metadata SQL
+```
+
+The existing tunnel implementation remains in `src-tauri/src/core/ssh/tunnel.rs`
+and is reused by the command layer. Future command modules from the plan
+(`connections`, `databases`, `schemas`, `tables`, `columns`, `indexes`,
+`constraints`, `rows`, `queries`, `transfers`) add thin typed wrappers over the
+same adapter contract.
+
+## Adapter contract
+
+`DatabaseAdapter` covers:
+
+- `connect`, `ping`, `version`, and `close`;
+- database and schema listing;
+- table, column, index, and constraint metadata;
+- capability checks through `require_capability`;
+- connection checks through `require_connection`.
+
+All metadata methods return `Page<T>`. The adapter owns the engine dialect and
+capabilities, so commands do not branch on MySQL versus PostgreSQL SQL.
+
+`DatabaseConnectRequest` carries the endpoint, username, read-only flag, SSL
+mode, timeout, and a `DatabasePassword` whose debug output is always
+`<redacted>`. Adapters convert driver, tunnel, authentication, permission,
+timeout, query, capability, and cancellation failures into `DatabaseError`.
+
+## Capability model
+
+`DatabaseCapabilities` combines:
+
+- the selected `DatabaseEngine`;
+- an optional parsed `DatabaseVersion`;
+- `CapabilityFlags` for schemas, sequences, materialized views, routines,
+  triggers, roles, sessions, transactions, savepoints, cancellation, explain,
+  check constraints, generated columns, identity columns, column reordering,
+  database rename, index rename, and query timeouts;
+- the `DatabaseAction` list derived from those flags.
+
+`CapabilitySnapshot` is the only document sent to React. It contains the
+engine, version string, flags, and supported action names. `ensure(action)`
+returns a `capability` error before execution when the UI or a caller tries an
+unsupported action.
+
+Unknown versions keep baseline actions enabled and disable version-dependent
+actions. A server must report a usable version before role management,
+materialized-view tooling, generated columns, or identity columns become
+available.
+
+### Actions by engine and version
+
+Version ranges below are minimums. "Both" means the action is available for
+the engine's baseline and every newer supported version.
+
+| Action                      | MySQL                              | PostgreSQL    |
+| --------------------------- | ---------------------------------- | ------------- |
+| `browse_databases`          | Both                               | Both          |
+| `browse_schemas`            | Both (schema is a database)        | Both          |
+| `browse_tables`             | Both                               | Both          |
+| `browse_columns`            | Both                               | Both          |
+| `browse_indexes`            | Both                               | Both          |
+| `browse_constraints`        | Both                               | Both          |
+| `browse_views`              | Both                               | Both          |
+| `browse_materialized_views` | Not supported                      | 9.3+          |
+| `browse_sequences`          | Not supported                      | Both          |
+| `browse_routines`           | Both                               | Both          |
+| `browse_triggers`           | Both                               | Both          |
+| `browse_roles`              | 8.0+                               | Both          |
+| `browse_sessions`           | Both                               | 9.2+          |
+| `show_object_size`          | Both                               | Both          |
+| `create_database`           | Both                               | Both          |
+| `rename_database`           | Not supported                      | Both          |
+| `drop_database`             | Both                               | Both          |
+| `create_schema`             | Both (schema is a database)        | Both          |
+| `drop_schema`               | Both (schema is a database)        | Both          |
+| `create_table`              | Both                               | Both          |
+| `rename_table`              | Both                               | Both          |
+| `truncate_table`            | Both                               | Both          |
+| `drop_table`                | Both                               | Both          |
+| `add_column`                | Both                               | Both          |
+| `edit_column`               | Both                               | Both          |
+| `rename_column`             | Both                               | Both          |
+| `drop_column`               | Both                               | Both          |
+| `reorder_columns`           | Both                               | Not supported |
+| `create_generated_column`   | 5.7.6+                             | 12+           |
+| `create_identity_column`    | Not supported (use AUTO_INCREMENT) | 10+           |
+| `create_index`              | Both                               | Both          |
+| `rename_index`              | 5.7+                               | 9.2+          |
+| `drop_index`                | Both                               | Both          |
+| `create_check_constraint`   | 8.0.16+                            | Both          |
+| `create_view`               | Both                               | Both          |
+| `create_routine`            | Both                               | Both          |
+| `create_trigger`            | Both                               | Both          |
+| `refresh_materialized_view` | Not supported                      | 9.3+          |
+| `manage_roles`              | 8.0+                               | Both          |
+| `kill_session`              | Both                               | 9.2+          |
+| `cancel_query`              | Both                               | Both          |
+| `explain_query`             | Both                               | Both          |
+| `run_query`                 | Both                               | Both          |
+| `insert_row`                | Both                               | Both          |
+| `edit_row`                  | Both                               | Both          |
+| `delete_row`                | Both                               | Both          |
+
+Additional version-dependent flags:
+
+| Flag                 | MySQL   | PostgreSQL |
+| -------------------- | ------- | ---------- |
+| `query_timeout`      | 5.7.4+  | Both       |
+| `check_constraints`  | 8.0.16+ | Both       |
+| `generated_columns`  | 5.7.6+  | 12+        |
+| `identity_columns`   | Never   | 10+        |
+| `materialized_views` | Never   | 9.3+       |
+| `roles`              | 8.0+    | Both       |
+| `sessions`           | Both    | 9.2+       |
+| `index_rename`       | 5.7+    | 9.2+       |
+| `database_rename`    | Never   | Both       |
+| `column_reorder`     | Both    | Never      |
+
+Cancellation, forced session termination, and role changes are still
+permission-sensitive. A capability flag says the engine can perform the action;
+it does not claim the signed-in database account has the required privilege.
+
+## Identifiers and values
+
+`Identifier` rejects empty values, NUL, control characters, dotted segments, and
+names longer than 63 bytes (the stricter PostgreSQL limit). Qualified names
+must be built from one to three validated segments.
+
+`IdentifierQuoter` owns engine quoting:
+
+- MySQL uses backticks and doubles embedded backticks.
+- PostgreSQL uses double quotes and doubles embedded double quotes.
+
+`ValueParameterizer` owns placeholders:
+
+- MySQL emits `?`.
+- PostgreSQL emits `$1`, `$2`, and so on.
+
+`ParameterizedQuery` keeps SQL text and `SqlValue` parameters separate. A value
+is never interpolated into SQL. Range checks reject zero and oversized parameter
+positions. Engine SQL modules only append trusted fixed fragments and identifiers
+through these interfaces.
+
+## Bounded results
+
+`PageRequest` clamps the limit to 1–500 rows and the offset to 1,000,000.
+`try_new` rejects out-of-range internal requests. `Bounded<T>` truncates to its
+limit and reports `truncated`; `Page<T>` reports `has_more` from truncation or
+an exact total. Adapters must page metadata and data instead of loading an
+entire table by default.
+
+## Error taxonomy
+
+| Code            | Meaning                                             | Typical action                       |
+| --------------- | --------------------------------------------------- | ------------------------------------ |
+| `tunnel`        | SSH tunnel or loopback listener failed              | Reconnect SSH, check endpoint        |
+| `database_auth` | Database rejected the account or password           | Check username, password, account    |
+| `timeout`       | Connect, query, metadata, or cancellation timed out | Check server load and timeout bound  |
+| `permission`    | Database account lacks the required privilege       | Grant the specific privilege         |
+| `query`         | Engine rejected SQL or a metadata request           | Review the statement and diagnostics |
+| `capability`    | Engine/version does not support the action          | Disable or choose another action     |
+| `cancelled`     | User cancelled the operation                        | Retry when ready                     |
+| `validation`    | Local input failed before reaching the engine       | Correct the request                  |
+| `connection`    | No live database connection exists                  | Connect before retrying              |
+| `internal`      | Local invariant failed                              | Restart or report the problem        |
+
+Commands convert `DatabaseError` to `AppError`. `tunnel`, `database_auth`,
+`query`, and `capability` are new stable app error codes; `timeout`,
+`permission`, and `cancelled` reuse the existing codes. Error messages and
+details are bounded and pass through the central redactor before crossing the
+Tauri boundary.
+
+## Fake adapter
+
+`FakeDatabaseAdapter` implements the full trait with deterministic fixture
+metadata for MySQL and PostgreSQL. It records connect, ping, and close calls,
+can inject a typed connect failure, and returns bounded pages. Tests use it as a
+trait object to prove that commands can depend on `DatabaseAdapter` alone
+without a real database.
+
+Run the focused suites with:
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml database::
+cargo test --manifest-path src-tauri/Cargo.toml --test database_adapter
+```
+
+## Current limitations
+
+- No live MySQL or PostgreSQL driver is wired; `connect` exists only in the
+  fake adapter and future engine adapters.
+- Real metadata mapping, type mapping, transactions, query cancellation, and
+  streaming are follow-up work.
+- Capability checks are only as accurate as the server version string. An
+  unknown version disables version-dependent actions rather than guessing.
+- Engine SQL constants describe the intended MySQL/PostgreSQL metadata shape
+  and are covered by module tests, not by a live database in this slice.
+- The capability command accepts an engine and raw version; the connection
+  flow will replace this with capabilities observed after a real connect.
