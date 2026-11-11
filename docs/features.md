@@ -38,6 +38,12 @@ An existing upload or download destination requires explicit confirmation. The b
 
 Listings are capped at 2,000 entries, 15 seconds, and 2,000 transfer operations for recursive directory plans. `cargo test --manifest-path src-tauri/Cargo.toml --test files` starts an in-process `russh` server with an SFTP subsystem and a local fixture tree. It verifies exact upload and download contents, recursive directories, overwrite conflicts, upload and download cancellation with preserved partial data, simulated interruptions and safe retry, rejected duplicate destinations, post-rename size verification with rollback, typed mutation confirmations and partial-delete disclosure, traversal rejection before channel creation, symlink escape detection and blocking, permission and missing-path errors, disconnection, and the entry cap.
 
+## Database Manager workspace
+
+The Databases page adds the Database Manager workspace shell without database-driver, tunnel, or connection code. Its navigation item and `/databases` route reuse the collapsible sidebar, active-server state, SSH connection state, AMOLED theme, shared tabs, dialogs, badges, and empty-state components.
+
+The shell has a top bar with the active server, SSH state, engine placeholder, refresh feedback, and an Add connection entry point; a database explorer rail with disabled object search and connection placeholders; tabs for Overview, Structure, Data, SQL, Indexes, and Operations; and a bottom status area for connection and query activity. Loading, server-profile error, no-server, disconnected, and empty workspace states are explicit. The Add connection flow is a placeholder dialog: it lists the planned steps, saves nothing, loads no driver, and opens no tunnel. The workspace fits the 1280 px default window without horizontal overflow, its tabs support arrow-key navigation, and the explorer rail stacks above the tab area below the desktop breakpoint.
+
 ## Remote commands
 
 The Overview page provides the first end-to-end vertical slice: add a profile, connect, verify the host key, authenticate, run fixed `hostname` and `uptime` commands, inspect real stdout, stderr, the exit code, and the connection state, then disconnect and release the session. The Rust command path accepts a closed `RemoteCommand` enum and maps it to fixed command templates, so user text is never concatenated into a shell command. A non-zero exit status is returned as a structured result rather than lost as a transport error.
