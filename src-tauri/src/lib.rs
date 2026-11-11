@@ -14,11 +14,15 @@ use crate::{
         ssh::{ConnectionManager, ConnectionTimeouts, RusshTransport, TunnelManager},
         terminal::TerminalManager,
     },
+    database::DatabaseConnectionRegistry,
 };
 
 async fn release_connections(app: &tauri::AppHandle) {
     if let Some(transfers) = app.try_state::<Arc<FileTransferManager>>() {
         transfers.cancel_all();
+    }
+    if let Some(databases) = app.try_state::<DatabaseConnectionRegistry>() {
+        databases.close_all().await;
     }
     if let Some(tunnels) = app.try_state::<Arc<TunnelManager>>() {
         tunnels.close_all().await;
@@ -121,6 +125,7 @@ pub fn run() {
                 ConnectionTimeouts::default(),
             ));
             let tunnels = TunnelManager::new(Arc::clone(&connections));
+            app.manage(DatabaseConnectionRegistry::new(Arc::clone(&tunnels)));
             app.manage(Arc::clone(&connections));
             app.manage(tunnels);
             app.manage(Arc::new(FileTransferManager::new(

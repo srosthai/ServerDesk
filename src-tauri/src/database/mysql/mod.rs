@@ -13,8 +13,11 @@ use super::{
     errors::DatabaseError,
 };
 
+pub mod adapter;
 pub mod capabilities;
 pub mod sql;
+
+pub use adapter::MysqlDatabaseAdapter;
 
 /// MySQL identifier quoting and positional parameter syntax.
 #[derive(Debug, Clone, Copy, Default)]
