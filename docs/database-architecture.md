@@ -5,11 +5,10 @@ Engine-specific SQL, metadata queries, version checks, and driver errors stay
 inside the adapter layer. Tauri commands and React consume typed metadata,
 capability documents, stable error kinds, and bounded pages only.
 
-This slice adds the shared foundation and the live MySQL adapter. The MySQL
-adapter connects through a loopback tunnel endpoint with SQLx, enforces
-read-only sessions, discovers the server version, and derives capability flags
-from it. PostgreSQL still uses the fake adapter and capability contract until
-its driver lands; the fake adapter remains available for deterministic tests.
+This slice adds the shared foundation and live SQLx adapters for both MySQL and
+PostgreSQL. Both adapters connect through a loopback tunnel endpoint, enforce
+read-only sessions, discover the server version, and derive capability flags
+from it. The fake adapter remains available for deterministic tests and demos.
 
 ## Boundaries
 
@@ -42,6 +41,7 @@ src-tauri/src/database/
   dialect.rs        identifier validation/quoting and value binding
   errors.rs         shared database error taxonomy
   pagination.rs     bounded results and page requests
+  validation.rs     loopback endpoint and request validation
   fake.rs           in-memory adapter for tests and demos
   mysql/
     mod.rs          MySQL dialect
@@ -50,6 +50,7 @@ src-tauri/src/database/
     sql.rs          MySQL-only metadata SQL
   postgres/
     mod.rs          PostgreSQL dialect
+    adapter.rs      live SQLx PostgreSQL adapter and error mapping
     capabilities.rs PostgreSQL version gates
     sql.rs          PostgreSQL-only metadata SQL
 ```
@@ -106,11 +107,45 @@ names, SQL text, or connection details. A wrong password therefore produces a
 `database_auth` error, an unreachable loopback endpoint produces `connection`,
 and neither includes the password or a connection string.
 
+## PostgreSQL adapter
+
+`database::postgres::PostgresDatabaseAdapter` uses the same SQLx runtime,
+rustls configuration, and loopback-only request validation as the MySQL
+adapter. It opens one authenticated connection to the tunnel endpoint, reads
+`version()` and `current_database()` once, and builds the capability document
+from that exact server version.
+
+The adapter:
+
+- applies `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` before
+  reporting a read-only connect as successful, so writes to non-temporary
+  objects fail with SQLSTATE `25006` mapped to `permission`;
+- supports `prefer`/`preferred`, `disabled`, `allow`, `required`, `verify-ca`,
+  and `verify-full` SSL modes;
+- maps authentication SQLSTATEs (`28P01`, `28000`), permission SQLSTATEs
+  (`42501`, `25006`), timeouts (`57014`, `55P03`), connection failures
+  (`3D000`, `57P03`, `53300`, class `08`), and unsupported features (`0A000`)
+  to the shared error kinds;
+- bounds connect, ping, version, and metadata operations with timeouts;
+- keeps credentials out of debug output, serialized errors, and logs.
+
+PostgreSQL stores databases as separate catalogs, so one connection can only
+browse schemas, tables, columns, indexes, and constraints in the connected
+database. A `MetadataScope` or `TableRef` that names another database returns a
+`validation` error before any SQL runs. Table metadata carries both the current
+database and the schema, and schema filters flow through every metadata query.
+The capability document exposes both `browse_databases` and `browse_schemas`;
+`database` is always populated after a successful connect.
+
+Driver diagnostics contain only the PostgreSQL SQLSTATE. Server messages are
+deliberately omitted because they can echo account names, SQL text, connection
+details, or values from the statement.
+
 `DatabaseConnectionRegistry` owns live adapters by profile id and coordinates
-connect, ping, disconnect, capability lookup, and shutdown with the tunnel.
-Tauri commands for this lifecycle are added by the connection-contract issue;
-the registry is registered as managed state so those commands can use it
-without duplicating driver or tunnel logic.
+connect, ping, disconnect, capability lookup, and shutdown with the tunnel for
+both engines. Tauri commands for this lifecycle are added by the
+connection-contract issue; the registry is registered as managed state so those
+commands can use it without duplicating driver or tunnel logic.
 
 ## Capability model
 
@@ -271,6 +306,7 @@ Run the focused suites with:
 cargo test --manifest-path src-tauri/Cargo.toml database::
 cargo test --manifest-path src-tauri/Cargo.toml --test database_adapter
 cargo test --manifest-path src-tauri/Cargo.toml --test database_mysql
+cargo test --manifest-path src-tauri/Cargo.toml --test database_postgres
 ```
 
 ### Live MySQL/MariaDB fixture
@@ -312,10 +348,51 @@ and the unavailable-host path. They bind no public port; the container mapping
 is explicit `127.0.0.1`. The live path has been exercised against both
 MariaDB 11.4 and MySQL 8.4 containers.
 
+### Live PostgreSQL fixture
+
+The PostgreSQL live tests use the same opt-in pattern and a loopback-only
+container:
+
+```bash
+podman run --rm -d --name serverdesk-postgres-test \
+  -e POSTGRES_PASSWORD=apppass \
+  -e POSTGRES_USER=app \
+  -e POSTGRES_DB=app \
+  -p 127.0.0.1::5432 docker.io/library/postgres:18
+
+podman port serverdesk-postgres-test   # note the 127.0.0.1:<port> mapping
+
+SERVERDESK_TEST_POSTGRES_HOST=127.0.0.1 \
+SERVERDESK_TEST_POSTGRES_PORT=<port> \
+SERVERDESK_TEST_POSTGRES_DATABASE=app \
+SERVERDESK_TEST_POSTGRES_USER=app \
+SERVERDESK_TEST_POSTGRES_PASSWORD=apppass \
+  cargo test --manifest-path src-tauri/Cargo.toml \
+    --lib database::postgres::adapter::tests::live -- --nocapture
+
+SERVERDESK_TEST_POSTGRES_HOST=127.0.0.1 \
+SERVERDESK_TEST_POSTGRES_PORT=<port> \
+SERVERDESK_TEST_POSTGRES_DATABASE=app \
+SERVERDESK_TEST_POSTGRES_USER=app \
+SERVERDESK_TEST_POSTGRES_PASSWORD=apppass \
+  cargo test --manifest-path src-tauri/Cargo.toml \
+    --test database_postgres -- --nocapture
+```
+
+The fixture tests cover connect, ping, version, capability flags, database and
+schema listing, schema-scoped table metadata, cross-database rejection,
+read-only write rejection, identity/generated column detection, index and
+constraint metadata, typed authentication failure, and the unavailable-host
+path. They bind no public port. The live path has been exercised against a
+PostgreSQL 18 container.
+
 ## Current limitations
 
-- PostgreSQL has no live driver yet; it still uses the fake adapter and
-  capability contract.
+- One PostgreSQL connection browses only its connected database catalog.
+  Switching databases requires reconnecting with the target database selected;
+  cross-database `MetadataScope` and `TableRef` values return `validation`.
+- PostgreSQL table metadata does not yet populate estimated row counts, table
+  sizes, or materialized-view entries through the shared contract.
 - MySQL metadata methods cover databases, schemas, tables, columns, indexes,
   and constraints, but large-catalog paging, object counts, and richer column
   detail remain follow-up work.

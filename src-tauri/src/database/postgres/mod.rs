@@ -12,8 +12,11 @@ use super::{
     errors::DatabaseError,
 };
 
+pub mod adapter;
 pub mod capabilities;
 pub mod sql;
+
+pub use adapter::PostgresDatabaseAdapter;
 
 /// PostgreSQL identifier quoting and positional parameter syntax.
 #[derive(Debug, Clone, Copy, Default)]
@@ -53,6 +56,10 @@ mod tests {
         assert!(sql::LIST_TABLES.contains("$1"));
         assert!(!sql::LIST_TABLES.contains('?'));
         assert!(!sql::LIST_TABLES.contains("mysql"));
+        assert!(sql::LIST_DATABASES.contains("pg_database"));
+        assert!(sql::LIST_SCHEMAS.contains("pg_namespace"));
+        assert!(sql::SET_READ_ONLY.contains("READ ONLY"));
+        assert!(sql::SERVER_INFO.contains("current_database"));
     }
 
     #[test]
