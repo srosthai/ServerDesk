@@ -85,7 +85,7 @@ jobs:
             dbus-run-session -- xvfb-run -a ./src-tauri/target/release/serverdesk
           database="$smoke_dir/com.serverdesk.app/serverdesk.sqlite3"
           test -f "$database"
-          test "$(sqlite3 "$database" 'PRAGMA user_version;')" = "4"
+          test "$(sqlite3 "$database" 'PRAGMA user_version;')" = "5"
 
       - name: Upload Linux packages
         uses: actions/upload-artifact@v4
