@@ -153,6 +153,67 @@ pub async fn test_database_profile(
     connections.test(&profile, password).await
 }
 
+/// Tests the values currently in the create/edit dialog without saving them.
+///
+/// The password comes from the request when it is being replaced, or from the
+/// saved credential when an existing profile is tested with an empty password
+/// field. The transient tunnel and adapter are closed before returning, so a
+/// failed test leaves the saved profile untouched.
+#[tauri::command]
+pub async fn test_database_profile_draft(
+    database: State<'_, Database>,
+    credentials: State<'_, Arc<dyn CredentialStore>>,
+    credential_index: State<'_, CredentialIndex>,
+    connections: State<'_, DatabaseConnectionRegistry>,
+    input: DatabaseProfileInput,
+    profile_id: Option<String>,
+) -> Result<DatabaseTestResult, AppError> {
+    let validated = input.validate()?;
+    if database.get_server(&validated.server_id)?.is_none() {
+        return Err(AppError::not_found("Server profile not found."));
+    }
+
+    let password = match input.password.as_deref() {
+        Some(password) if !password.is_empty() => DatabasePassword::new(password.to_string()),
+        _ => match profile_id.as_deref() {
+            Some(id) => {
+                let profile = load_profile(database.inner(), id)?;
+                saved_password(
+                    credentials.inner().as_ref(),
+                    credential_index.inner(),
+                    &profile,
+                )?
+            }
+            None => {
+                return Err(AppError::credential_missing(
+                    "Enter the database password before testing this profile.",
+                ));
+            }
+        },
+    };
+
+    let id = profile_id.unwrap_or_else(|| "draft".to_string());
+    let profile = DatabaseConnection {
+        id,
+        server_id: validated.server_id,
+        name: validated.name,
+        engine: validated.engine,
+        host: validated.host,
+        port: validated.port,
+        socket: validated.socket,
+        database_name: validated.database_name,
+        username: validated.username,
+        credential_ref: None,
+        read_only: validated.read_only,
+        ssl_mode: validated.ssl_mode.map(|mode| mode.as_str().to_string()),
+        created_at: 0,
+        updated_at: 0,
+        last_used_at: None,
+    };
+
+    connections.test(&profile, password).await
+}
+
 #[tauri::command]
 pub async fn connect_database_profile(
     database: State<'_, Database>,

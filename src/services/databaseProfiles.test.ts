@@ -18,6 +18,7 @@ import {
   openDatabaseTunnel,
   reconnectDatabaseProfile,
   testDatabaseProfile,
+  testDatabaseProfileDraft,
   updateDatabaseProfile,
 } from "@/services/databaseProfiles";
 import type {
@@ -224,6 +225,22 @@ describe("database profile service contract", () => {
     expect(invoke).toHaveBeenNthCalledWith(5, databaseTunnelCommands.list);
   });
 
+  it("tests draft form values without saving them", async () => {
+    vi.mocked(invoke).mockResolvedValue(testResult);
+
+    await expect(testDatabaseProfileDraft(input, "profile-1")).resolves.toEqual(testResult);
+    expect(invoke).toHaveBeenCalledWith(databaseProfileCommands.testDraft, {
+      input,
+      profileId: "profile-1",
+    });
+
+    await expect(testDatabaseProfileDraft(input)).resolves.toEqual(testResult);
+    expect(invoke).toHaveBeenLastCalledWith(databaseProfileCommands.testDraft, {
+      input,
+      profileId: null,
+    });
+  });
+
   it("preserves typed command errors for display", async () => {
     const error = {
       code: "conflict" as const,
@@ -242,6 +259,7 @@ describe("database profile service contract", () => {
       "update_database_profile",
       "delete_database_profile",
       "test_database_profile",
+      "test_database_profile_draft",
       "connect_database_profile",
       "reconnect_database_profile",
       "disconnect_database_profile",
