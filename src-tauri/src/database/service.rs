@@ -9,10 +9,13 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use tokio::sync::Mutex;
 
+use uuid::Uuid;
+
 use crate::{
     core::{
         AppError,
-        ssh::{TunnelManager, TunnelRequest},
+        database_profiles::DatabaseTestResult,
+        ssh::{TunnelManager, TunnelRequest, TunnelSnapshot},
     },
     storage::{DatabaseConnection, DatabaseEngine},
 };
@@ -75,26 +78,15 @@ impl DatabaseConnectionRegistry {
                 socket: profile.socket.clone(),
             })
             .await?;
-        let Some(local_port) = tunnel.local_port else {
-            let _ = self.tunnels.close(&profile.id).await;
-            return Err(AppError::internal(
-                "The database tunnel did not publish a loopback port.",
-            ));
+        let request = match connect_request(profile, &tunnel, password, self.connect_timeout) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = self.tunnels.close(&profile.id).await;
+                return Err(error);
+            }
         };
 
         let mut adapter = adapter;
-        let request = DatabaseConnectRequest {
-            host: tunnel.local_host,
-            port: local_port,
-            socket: profile.socket.clone(),
-            database: profile.database_name.clone(),
-            username: profile.username.clone(),
-            password,
-            read_only: profile.read_only,
-            ssl_mode: profile.ssl_mode.clone(),
-            connect_timeout: self.connect_timeout,
-        };
-
         match adapter.connect(request).await {
             Ok(info) => {
                 self.connections.lock().await.insert(
@@ -126,6 +118,52 @@ impl DatabaseConnectionRegistry {
 
         let tunnel_result = self.tunnels.close(profile_id).await;
         adapter_result.and(tunnel_result)
+    }
+
+    /// Probes one saved profile through a transient tunnel and adapter.
+    ///
+    /// The test never changes the active session for `profile.id`: it uses a
+    /// separate tunnel key and closes both resources before returning. The
+    /// returned document contains only version, capabilities, read-only state,
+    /// and latency.
+    pub async fn test(
+        &self,
+        profile: &DatabaseConnection,
+        password: DatabasePassword,
+    ) -> Result<DatabaseTestResult, AppError> {
+        let adapter = adapter_for(profile.engine)?;
+        let tunnel_profile_id = format!("database-test:{}", Uuid::new_v4());
+        let tunnel = self
+            .tunnels
+            .open(TunnelRequest {
+                profile_id: tunnel_profile_id.clone(),
+                server_id: profile.server_id.clone(),
+                remote_host: profile.host.clone(),
+                remote_port: profile.port,
+                socket: profile.socket.clone(),
+            })
+            .await?;
+
+        let request = match connect_request(profile, &tunnel, password, self.connect_timeout) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = self.tunnels.close(&tunnel_profile_id).await;
+                return Err(error);
+            }
+        };
+
+        let mut adapter = adapter;
+        let result = match adapter.connect(request).await {
+            Ok(info) => match adapter.ping().await {
+                Ok(ping) => Ok(DatabaseTestResult::new(profile, info, ping.latency_ms)),
+                Err(error) => Err(error.into()),
+            },
+            Err(error) => Err(error.into()),
+        };
+
+        let _ = adapter.close().await;
+        let _ = self.tunnels.close(&tunnel_profile_id).await;
+        result
     }
 
     /// Pings the live adapter without exposing driver details.
@@ -186,6 +224,29 @@ impl DatabaseConnectionRegistry {
             .map(|session| Arc::clone(&session.adapter))
             .ok_or_else(|| AppError::connection("The database connection is not active."))
     }
+}
+
+fn connect_request(
+    profile: &DatabaseConnection,
+    tunnel: &TunnelSnapshot,
+    password: DatabasePassword,
+    connect_timeout: Duration,
+) -> Result<DatabaseConnectRequest, AppError> {
+    let local_port = tunnel.local_port.ok_or_else(|| {
+        AppError::internal("The database tunnel did not publish a loopback port.")
+    })?;
+
+    Ok(DatabaseConnectRequest {
+        host: tunnel.local_host.clone(),
+        port: local_port,
+        socket: profile.socket.clone(),
+        database: profile.database_name.clone(),
+        username: profile.username.clone(),
+        password,
+        read_only: profile.read_only,
+        ssl_mode: profile.ssl_mode.clone(),
+        connect_timeout,
+    })
 }
 
 fn adapter_for(engine: DatabaseEngine) -> Result<Box<dyn DatabaseAdapter>, AppError> {
