@@ -8,6 +8,7 @@ ServerDesk is a local-first desktop application for managing Linux VPS servers o
 - A live server overview with system identity, CPU load, memory, disk, and network samples.
 - Multiple interactive terminal tabs per server.
 - A remote file browser with verified upload, download, rename, and delete operations.
+- A Database Manager workspace shell with `/databases` navigation and explicit empty states; database drivers and connections are not part of this release.
 - Systemd service discovery with verified start, stop, and restart actions.
 - Laravel project detection, fixed Artisan actions, and a read-only queue and Supervisor view.
 - Bounded log tails and a local, sanitized operation history.
