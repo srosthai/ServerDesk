@@ -36,12 +36,11 @@ use crate::database::{
         DatabaseConnectionInfo, DatabasePing, DatabaseSummary, DatabaseVersionInfo, IndexSummary,
         MetadataScope, SchemaSummary, TableKind, TableRef, TableSummary,
     },
+    validation::validate_connect_request,
 };
 
 const CONNECTION_LOST_MESSAGE: &str = "The database connection is no longer available.";
 const DRIVER_FAILURE_MESSAGE: &str = "The database operation failed.";
-const LOOPBACK_VALIDATION_MESSAGE: &str =
-    "Database connections must target the loopback endpoint published by the SSH tunnel.";
 
 /// SQLx-backed adapter for one MySQL or MariaDB profile.
 pub struct MysqlDatabaseAdapter {
@@ -588,60 +587,6 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
 
         Ok(Page::from_items(constraints, page, None))
     }
-}
-
-/// Validates a request before SQLx sees any secret material.
-pub fn validate_connect_request(request: &DatabaseConnectRequest) -> Result<(), DatabaseError> {
-    let host = request.host.trim();
-    if host.is_empty() {
-        return Err(DatabaseError::validation("A database host is required."));
-    }
-    if request.host.as_str() != host
-        || host.chars().any(char::is_control)
-        || host.chars().any(char::is_whitespace)
-    {
-        return Err(DatabaseError::validation("The database host is not valid."));
-    }
-    if !is_loopback_host(host) {
-        return Err(DatabaseError::validation(LOOPBACK_VALIDATION_MESSAGE));
-    }
-    if request.port == 0 {
-        return Err(DatabaseError::validation(
-            "A database port must be between 1 and 65535.",
-        ));
-    }
-
-    let username = request.username.trim();
-    if username.is_empty() {
-        return Err(DatabaseError::validation(
-            "A database username is required.",
-        ));
-    }
-    if username.chars().any(char::is_control) {
-        return Err(DatabaseError::validation(
-            "The database username is not valid.",
-        ));
-    }
-
-    if request
-        .database
-        .as_deref()
-        .is_some_and(|database| database.chars().any(char::is_control))
-    {
-        return Err(DatabaseError::validation("The database name is not valid."));
-    }
-
-    if request.connect_timeout.is_zero() {
-        return Err(DatabaseError::validation(
-            "A database connect timeout is required.",
-        ));
-    }
-
-    Ok(())
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "::1")
 }
 
 fn ssl_mode(request: &DatabaseConnectRequest) -> Result<MySqlSslMode, DatabaseError> {

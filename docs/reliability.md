@@ -111,8 +111,13 @@ transfer identifier and a new partial path; no transfer is resumed silently.
 - Metadata results are paginated with a 500-row maximum and a deep-offset cap.
 - Engine-specific SQL stays in `database/mysql/sql.rs` and
   `database/postgres/sql.rs`; it is never serialized to React.
-- No live driver is connected in this foundation slice. The fake adapter covers
-  the shared interface and error paths in tests.
+- Both live adapters accept only loopback tunnel endpoints, enforce read-only
+  sessions before reporting a successful connect, and map driver failures to
+  bounded typed errors without forwarding raw driver messages containing
+  credentials or connection strings.
+- PostgreSQL metadata is scoped to the connected catalog; cross-database
+  scopes return `validation` before SQL runs. The fake adapter still covers the
+  shared interface and error paths in tests without a database.
 
 ## Transfer completeness
 
