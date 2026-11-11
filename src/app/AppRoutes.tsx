@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { PageHeader } from "@/components/ui/page-header";
 import { OverviewPage } from "@/features/dashboard/OverviewPage";
+import { DatabaseManagerPage } from "@/features/databases/DatabaseManagerPage";
 import { FileManagerPage } from "@/features/files/FileManagerPage";
 import { HistoryPage } from "@/features/history/HistoryPage";
 import { LogsPage } from "@/features/logs/LogsPage";
@@ -42,6 +43,7 @@ function AppRoutes() {
         <Route path="projects" element={<ProjectsPage />} />
         <Route path="monitoring" element={<MonitoringPage />} />
         <Route path="services" element={<ServicesPage />} />
+        <Route path="databases" element={<DatabaseManagerPage />} />
         <Route path="files" element={<FileManagerPage />} />
         <Route path="terminal" element={<TerminalPage />} />
         <Route path="logs" element={<LogsPage />} />

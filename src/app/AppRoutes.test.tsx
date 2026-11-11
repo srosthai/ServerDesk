@@ -93,4 +93,24 @@ describe("application shell", () => {
     expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
     expect(screen.getAllByText("Web preview").length).toBeGreaterThan(0);
   });
+
+  it("navigates to the database workspace and marks it active", async () => {
+    useServerStore.setState({ servers: [server], status: "ready", error: null });
+    useConnectionStore.setState({
+      connections: {
+        [server.id]: { serverId: server.id, state: "connected", changedAt: 1 },
+      },
+      busy: {},
+      error: null,
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const databasesLink = screen.getByRole("link", { name: "Databases" });
+    await user.click(databasesLink);
+
+    expect(await screen.findByRole("heading", { name: "Databases" })).toBeInTheDocument();
+    expect(databasesLink).toHaveAttribute("aria-current", "page");
+    expect(await screen.findByText("No database connections yet")).toBeInTheDocument();
+  });
 });
