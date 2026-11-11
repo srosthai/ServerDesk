@@ -25,8 +25,8 @@ locations are listed in [packaging.md](packaging.md#local-data-and-credentials).
 
 ### Credentials and the keychain
 
-SSH passwords and private keys, including key passphrases, are stored in the
-operating system credential store through the `keyring` crate:
+SSH passwords, private keys (including key passphrases), and database passwords
+are stored in the operating system credential store through the `keyring` crate:
 
 | Platform | Credential store                                                |
 | -------- | --------------------------------------------------------------- |
@@ -35,16 +35,21 @@ operating system credential store through the `keyring` crate:
 | Windows  | Credential Manager                                              |
 
 Entries use the service `com.serverdesk.app` and an account reference such as
-`serverdesk:ssh:<uuid>`. A desktop Linux session needs a running, unlocked
-Secret Service provider; a headless session without one cannot save or read
-credentials. The security of the credential store is the security boundary for
-secrets at rest. Malware or another process running as the same OS user can use
-the unlocked store.
+`serverdesk:ssh:<uuid>` for SSH or `serverdesk:db:<uuid>` for database passwords.
+Database profiles store only that opaque reference; database passwords are
+never written to SQLite, command errors, or logs. A desktop Linux session needs
+a running, unlocked Secret Service provider; a headless session without one
+cannot save or read credentials. The security of the credential store is the
+security boundary for secrets at rest. Malware or another process running as
+the same OS user can use the unlocked store.
 
 Private keys are wrapped in a versioned JSON envelope inside the credential
 entry. Debug output for key material and passphrases is redacted. Deleting a
-server profile deletes its credential and trusted host-key records. Package
-uninstallers and the documented macOS/AppImage cleanup run `--purge-data`, which
+server profile deletes its credential and trusted host-key records. Deleting a
+database profile removes its credential before the profile row, and a locked or
+unavailable credential store blocks the deletion so an orphaned secret cannot
+be left behind. Package uninstallers and the documented macOS/AppImage cleanup
+run `--purge-data`, which reads both the database and the credential index and
 removes every credential known to the installation before deleting the local
 database.
 
@@ -71,6 +76,8 @@ is treated as untrusted input and is redacted on a best-effort basis.
 - Deleting a server profile removes the profile, its credential reference, its
   trusted host keys, and its linked project records. Operation history keeps its
   sanitized rows but clears the server reference.
+- Deleting a database profile removes its saved password from the OS credential
+  store before removing the profile row and credential index entry.
 - Clearing operation history deletes the local history rows after confirmation.
 - Uninstalling with `--purge-data` removes credentials and the application-data
   directory. The exact platform behavior and retry path are in
