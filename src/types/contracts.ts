@@ -227,6 +227,169 @@ export type ServiceActionResult = {
   connectionState: ConnectionState;
 };
 
+export type DatabaseEngine = "mysql" | "postgresql";
+
+export type DatabaseSslMode =
+  "disabled" | "preferred" | "required" | "verify-ca" | "verify-identity";
+
+export type DatabaseProfile = {
+  id: string;
+  serverId: string;
+  name: string;
+  engine: DatabaseEngine;
+  host: string;
+  port: number;
+  socket: string | null;
+  databaseName: string | null;
+  username: string;
+  hasCredential: boolean;
+  readOnly: boolean;
+  sslMode: DatabaseSslMode | null;
+  createdAt: number;
+  updatedAt: number;
+  lastUsedAt: number | null;
+};
+
+export type DatabaseProfileInput = {
+  serverId: string;
+  name: string;
+  engine: DatabaseEngine;
+  host: string;
+  port: number;
+  socket?: string | null;
+  databaseName?: string | null;
+  username: string;
+  readOnly: boolean;
+  sslMode?: DatabaseSslMode | null;
+  /** Omit or set null to keep the saved password on update. */
+  password?: string | null;
+};
+
+export type DatabaseAction =
+  | "browse_databases"
+  | "browse_schemas"
+  | "browse_tables"
+  | "browse_columns"
+  | "browse_indexes"
+  | "browse_constraints"
+  | "browse_views"
+  | "browse_materialized_views"
+  | "browse_sequences"
+  | "browse_routines"
+  | "browse_triggers"
+  | "browse_roles"
+  | "browse_sessions"
+  | "show_object_size"
+  | "create_database"
+  | "rename_database"
+  | "drop_database"
+  | "create_schema"
+  | "drop_schema"
+  | "create_table"
+  | "rename_table"
+  | "truncate_table"
+  | "drop_table"
+  | "add_column"
+  | "edit_column"
+  | "rename_column"
+  | "drop_column"
+  | "reorder_columns"
+  | "create_index"
+  | "rename_index"
+  | "drop_index"
+  | "create_check_constraint"
+  | "create_view"
+  | "create_routine"
+  | "create_trigger"
+  | "manage_roles"
+  | "kill_session"
+  | "cancel_query"
+  | "explain_query"
+  | "run_query"
+  | "create_generated_column"
+  | "create_identity_column"
+  | "refresh_materialized_view"
+  | "insert_row"
+  | "edit_row"
+  | "delete_row";
+
+export type CapabilityFlags = {
+  schemas: boolean;
+  sequences: boolean;
+  materializedViews: boolean;
+  routines: boolean;
+  triggers: boolean;
+  roles: boolean;
+  sessions: boolean;
+  transactions: boolean;
+  savepoints: boolean;
+  cancelQuery: boolean;
+  explain: boolean;
+  checkConstraints: boolean;
+  generatedColumns: boolean;
+  identityColumns: boolean;
+  columnReorder: boolean;
+  databaseRename: boolean;
+  indexRename: boolean;
+  queryTimeout: boolean;
+};
+
+export type DatabaseCapabilities = {
+  engine: DatabaseEngine;
+  version: string | null;
+  flags: CapabilityFlags;
+  actions: DatabaseAction[];
+};
+
+export type DatabaseVersionInfo = {
+  version: string;
+  raw: string;
+};
+
+export type DatabaseTunnelState = "opening" | "active" | "closed";
+
+export type DatabaseTunnelSnapshot = {
+  profileId: string;
+  serverId: string;
+  state: DatabaseTunnelState;
+  localHost: string;
+  localPort?: number;
+  remoteHost: string;
+  remotePort: number;
+  socket?: string;
+  openedAt: number;
+};
+
+export type DatabaseConnectionState =
+  "disconnected" | "connecting" | "reconnecting" | "connected" | "error";
+
+export type DatabaseConnectionSnapshot = {
+  profileId: string;
+  serverId: string;
+  name: string;
+  engine: DatabaseEngine;
+  state: DatabaseConnectionState;
+  readOnly: boolean;
+  databaseName: string | null;
+  version?: DatabaseVersionInfo;
+  capabilities?: DatabaseCapabilities;
+  tunnel?: DatabaseTunnelSnapshot;
+  error?: CommandError;
+  changedAt: number;
+};
+
+export type DatabaseTestResult = {
+  profileId: string;
+  serverId: string;
+  engine: DatabaseEngine;
+  version: DatabaseVersionInfo;
+  databaseName: string | null;
+  readOnly: boolean;
+  capabilities: DatabaseCapabilities;
+  latencyMs: number;
+  testedAt: number;
+};
+
 export type ProjectType = "laravel";
 
 export type OperationCategory = "command" | "service" | "artisan" | "sftp" | "queue";

@@ -32,7 +32,8 @@ The structure follows the Database Manager plan's adapter split:
 src-tauri/src/commands/database/
   mod.rs            command boundary
   capabilities.rs   engine/version capability document
-  tunnels.rs        existing loopback SSH tunnel commands
+  profiles.rs       saved profile CRUD, test, connect, reconnect, disconnect
+  tunnels.rs        loopback SSH tunnel inspection commands
 
 src-tauri/src/database/
   mod.rs            public re-exports and dialect/capability factories
@@ -142,10 +143,39 @@ deliberately omitted because they can echo account names, SQL text, connection
 details, or values from the statement.
 
 `DatabaseConnectionRegistry` owns live adapters by profile id and coordinates
-connect, ping, disconnect, capability lookup, and shutdown with the tunnel for
-both engines. Tauri commands for this lifecycle are added by the
-connection-contract issue; the registry is registered as managed state so those
-commands can use it without duplicating driver or tunnel logic.
+connect, ping, test, disconnect, capability lookup, and shutdown with the tunnel
+for both engines. A test uses a transient tunnel key and adapter, so it never
+disturbs the active session for the same profile.
+
+## Connection command contract
+
+`src-tauri/src/commands/database/profiles.rs` owns the profile command surface:
+
+| Command                         | Purpose                                                      |
+| ------------------------------- | ------------------------------------------------------------ |
+| `list_database_profiles`        | List saved profiles for one server                           |
+| `get_database_profile`          | Read one profile                                             |
+| `create_database_profile`       | Validate, create the saved password, persist metadata        |
+| `update_database_profile`       | Validate, replace or create the password, persist metadata   |
+| `delete_database_profile`       | Close the session/tunnel, delete credential, delete metadata |
+| `test_database_profile`         | Probe through a transient tunnel and adapter                 |
+| `connect_database_profile`      | Connect through the profile's SSH tunnel                     |
+| `reconnect_database_profile`    | Close and reconnect deterministically                        |
+| `disconnect_database_profile`   | Close the adapter and tunnel                                 |
+| `get_database_connection_state` | Read a typed connection snapshot                             |
+
+DTOs are camelCase. `DatabaseProfile` exposes `hasCredential` rather than the
+opaque credential reference, and neither the reference nor a password is ever
+serialized. `DatabaseConnectionSnapshot` exposes the engine, server version,
+read-only mode, capabilities, tunnel snapshot, and a structured `AppError`.
+Input validation rejects unsafe hosts, zero ports, relative or control-character
+socket paths, empty or oversized names, malformed usernames, unknown engines,
+and unknown SSL modes. Names are unique per server, case-insensitively, and
+duplicates return the `conflict` error code.
+
+`src/services/databaseProfiles.ts` is the only React module that invokes these
+commands. `src/stores/databaseProfileStore.ts` owns profile lists, loading and
+error state, connection snapshots, per-profile busy flags, and test results.
 
 ## Capability model
 
@@ -403,5 +433,8 @@ PostgreSQL 18 container.
   are follow-up work.
 - Capability checks are only as accurate as the server version string. An
   unknown version disables version-dependent actions rather than guessing.
-- The capability command accepts an engine and raw version; the connection
-  flow will replace this with capabilities observed after a real connect.
+- The standalone capability command accepts an engine and raw version for
+  profiles that are not connected yet. Connected snapshots carry capabilities
+  observed from the live server instead.
+- Profile commands validate and persist metadata, but profile UI is tracked
+  separately in issue #164.

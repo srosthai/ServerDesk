@@ -5,9 +5,6 @@ use tauri::State;
 use crate::{
     core::{
         AppError,
-        credential_index::CredentialIndex,
-        credentials::CredentialStore,
-        database_credentials::DatabaseCredentialService,
         ssh::{TunnelManager, TunnelRequest, TunnelSnapshot},
     },
     storage::Database,
@@ -55,19 +52,4 @@ pub fn list_database_tunnels(
     tunnels: State<'_, Arc<TunnelManager>>,
 ) -> Result<Vec<TunnelSnapshot>, AppError> {
     tunnels.list()
-}
-
-/// Deletes a database profile after closing its tunnel and saved password.
-#[tauri::command]
-pub async fn delete_database_connection(
-    database: State<'_, Database>,
-    credentials: State<'_, Arc<dyn CredentialStore>>,
-    credential_index: State<'_, CredentialIndex>,
-    tunnels: State<'_, Arc<TunnelManager>>,
-    id: String,
-) -> Result<(), AppError> {
-    tunnels.close(&id).await?;
-    let service =
-        DatabaseCredentialService::new(credentials.inner().as_ref(), credential_index.inner());
-    service.delete_profile(database.inner(), &id)
 }

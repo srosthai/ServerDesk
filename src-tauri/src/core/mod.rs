@@ -3,6 +3,7 @@ pub mod command;
 pub mod credential_index;
 pub mod credentials;
 pub mod database_credentials;
+pub mod database_profiles;
 pub mod error;
 pub mod files;
 pub mod history;
