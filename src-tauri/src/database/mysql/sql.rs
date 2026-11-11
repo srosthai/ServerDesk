@@ -1,0 +1,74 @@
+//! Fixed MySQL metadata SQL.
+//!
+//! These statements are driver building blocks, not a command contract.
+//! Dynamic values use `?` placeholders and identifiers are quoted by
+//! [`super::MysqlDialect`]. The SQL strings are public so engine modules and
+//! their tests can inspect them; Tauri commands and React never receive them.
+
+pub const PING: &str = "SELECT 1";
+pub const SERVER_VERSION: &str = "SELECT VERSION()";
+
+pub const LIST_DATABASES: &str = "SELECT SCHEMA_NAME AS name, DEFAULT_CHARACTER_SET_NAME AS \
+    encoding, DEFAULT_COLLATION_NAME AS collation FROM information_schema.SCHEMATA \
+    ORDER BY SCHEMA_NAME";
+
+pub const LIST_SCHEMAS: &str = "SELECT SCHEMA_NAME AS name FROM information_schema.SCHEMATA \
+    ORDER BY SCHEMA_NAME";
+
+pub const LIST_TABLES: &str = "SELECT TABLE_SCHEMA AS database_name, TABLE_NAME AS name, \
+    TABLE_TYPE AS table_type, TABLE_ROWS AS estimated_rows, \
+    COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0) AS size_bytes \
+    FROM information_schema.TABLES \
+    WHERE (? IS NULL OR TABLE_SCHEMA = ?) \
+    ORDER BY TABLE_SCHEMA, TABLE_NAME";
+
+pub const LIST_VIEWS: &str = "SELECT TABLE_SCHEMA AS database_name, TABLE_NAME AS name \
+    FROM information_schema.VIEWS \
+    WHERE (? IS NULL OR TABLE_SCHEMA = ?) \
+    ORDER BY TABLE_SCHEMA, TABLE_NAME";
+
+pub const LIST_COLUMNS: &str = "SELECT COLUMN_NAME AS name, COLUMN_TYPE AS data_type, \
+    IS_NULLABLE = 'YES' AS nullable, COLUMN_DEFAULT AS default_value, \
+    ORDINAL_POSITION AS ordinal_position, COLUMN_KEY = 'PRI' AS primary_key, \
+    EXTRA LIKE '%GENERATED%' AS generated, COLUMN_COMMENT AS comment \
+    FROM information_schema.COLUMNS \
+    WHERE (? IS NULL OR TABLE_SCHEMA = ?) \
+    AND (? IS NULL OR TABLE_NAME = ?) \
+    ORDER BY ORDINAL_POSITION";
+
+pub const LIST_INDEXES: &str = "SELECT INDEX_NAME AS name, COLUMN_NAME AS column_name, \
+    NON_UNIQUE = 0 AS unique_index, INDEX_NAME = 'PRIMARY' AS primary_index, \
+    INDEX_TYPE AS method \
+    FROM information_schema.STATISTICS \
+    WHERE (? IS NULL OR TABLE_SCHEMA = ?) \
+    AND (? IS NULL OR TABLE_NAME = ?) \
+    ORDER BY INDEX_NAME, SEQ_IN_INDEX";
+
+pub const LIST_CONSTRAINTS: &str = "SELECT CONSTRAINT_NAME AS name, CONSTRAINT_TYPE AS kind, \
+    TABLE_SCHEMA AS database_name, TABLE_NAME AS table_name \
+    FROM information_schema.TABLE_CONSTRAINTS \
+    WHERE (? IS NULL OR TABLE_SCHEMA = ?) \
+    AND (? IS NULL OR TABLE_NAME = ?) \
+    ORDER BY CONSTRAINT_NAME";
+
+pub const LIST_ROUTINES: &str = "SELECT ROUTINE_SCHEMA AS database_name, ROUTINE_NAME AS name, \
+    ROUTINE_TYPE AS routine_type \
+    FROM information_schema.ROUTINES \
+    WHERE (? IS NULL OR ROUTINE_SCHEMA = ?) \
+    ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME";
+
+pub const LIST_TRIGGERS: &str = "SELECT TRIGGER_SCHEMA AS database_name, TRIGGER_NAME AS name, \
+    EVENT_OBJECT_TABLE AS table_name, EVENT_MANIPULATION AS event, ACTION_TIMING AS timing \
+    FROM information_schema.TRIGGERS \
+    WHERE (? IS NULL OR TRIGGER_SCHEMA = ?) \
+    ORDER BY TRIGGER_SCHEMA, TRIGGER_NAME";
+
+pub const LIST_ROLES: &str = "SELECT DISTINCT FROM_USER AS name FROM mysql.role_edges \
+    ORDER BY FROM_USER";
+
+pub const LIST_SESSIONS: &str = "SELECT ID AS session_id, USER AS user, HOST AS host, \
+    DB AS database_name, COMMAND AS command, TIME AS elapsed_seconds, STATE AS state, \
+    INFO AS query_text FROM information_schema.PROCESSLIST ORDER BY ID";
+
+pub const CANCEL_QUERY: &str = "KILL QUERY ?";
+pub const KILL_SESSION: &str = "KILL ?";

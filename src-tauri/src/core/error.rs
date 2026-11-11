@@ -16,6 +16,10 @@ pub enum ErrorCode {
     Network,
     Permission,
     Remote,
+    Tunnel,
+    DatabaseAuth,
+    Query,
+    Capability,
     Cancelled,
     Conflict,
     NotFound,
@@ -84,6 +88,22 @@ impl AppError {
 
     pub fn remote(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Remote, message)
+    }
+
+    pub fn tunnel(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Tunnel, message)
+    }
+
+    pub fn database_auth(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::DatabaseAuth, message)
+    }
+
+    pub fn query(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Query, message)
+    }
+
+    pub fn capability(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Capability, message)
     }
 
     pub fn cancelled(message: impl Into<String>) -> Self {
