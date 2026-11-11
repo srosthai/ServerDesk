@@ -45,6 +45,25 @@ const presentations: Record<ErrorCode, ConnectionErrorPresentation> = {
     title: "Remote check failed",
     action: "The SSH server rejected the check. Review the server logs and SSH configuration.",
   },
+  tunnel: {
+    title: "Database tunnel failed",
+    action:
+      "Check that the SSH session is connected and the database endpoint is reachable from the server.",
+  },
+  database_auth: {
+    title: "Database authentication failed",
+    action:
+      "Check the database username and password, and confirm the account can connect from the server.",
+  },
+  query: {
+    title: "Database query failed",
+    action: "Review the SQL and database permissions, then run the statement again.",
+  },
+  capability: {
+    title: "Action not supported",
+    action:
+      "The selected database engine or version does not support this action. Choose a supported operation.",
+  },
   cancelled: {
     title: "Connection cancelled",
     action: "Start the connection test again when you are ready.",

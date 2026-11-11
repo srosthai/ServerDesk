@@ -92,6 +92,7 @@ pub fn purge_local_data_cli() -> i32 {
 
 pub mod commands;
 pub mod core;
+pub mod database;
 pub mod storage;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -155,11 +156,12 @@ pub fn run() {
             commands::connections::disconnect_server,
             commands::connections::get_connection_state,
             commands::connections::test_server_connection,
-            commands::database_tunnels::open_database_tunnel,
-            commands::database_tunnels::close_database_tunnel,
-            commands::database_tunnels::get_database_tunnel_state,
-            commands::database_tunnels::list_database_tunnels,
-            commands::database_tunnels::delete_database_connection,
+            commands::database::capabilities::get_database_capabilities,
+            commands::database::tunnels::open_database_tunnel,
+            commands::database::tunnels::close_database_tunnel,
+            commands::database::tunnels::get_database_tunnel_state,
+            commands::database::tunnels::list_database_tunnels,
+            commands::database::tunnels::delete_database_connection,
             commands::remote::run_remote_command,
             commands::history::list_operation_history,
             commands::history::get_operation_history_policy,
