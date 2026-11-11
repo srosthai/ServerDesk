@@ -116,7 +116,7 @@ impl<T> Bounded<T> {
 }
 
 /// One page of results plus the request and optional exact total.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Page<T> {
     pub items: Vec<T>,

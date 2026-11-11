@@ -57,6 +57,13 @@ mod tests {
         assert!(sql::LIST_TABLES.contains('?'));
         assert!(!sql::LIST_TABLES.contains("$1"));
         assert!(!sql::LIST_TABLES.contains("postgres"));
+        assert!(sql::LIST_TABLES.contains("TABLE_TYPE = 'BASE TABLE'"));
+        assert!(sql::LIST_TABLES.contains("LIMIT ? OFFSET ?"));
+        assert!(sql::LIST_VIEWS.contains("information_schema.VIEWS"));
+        assert!(sql::LIST_VIEWS.contains("LIMIT ? OFFSET ?"));
+        assert!(sql::OBJECT_COUNTS.contains("table_count"));
+        assert!(sql::OBJECT_COUNTS.contains("view_count"));
+        assert!(!sql::OBJECT_COUNTS.contains("LIMIT"));
     }
 
     #[test]

@@ -33,7 +33,8 @@ use crate::database::{
     traits::{
         ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter, DatabaseConnectRequest,
         DatabaseConnectionInfo, DatabasePing, DatabaseSummary, DatabaseVersionInfo, IndexSummary,
-        MetadataScope, SchemaSummary, TableKind, TableRef, TableSummary,
+        MetadataScope, MetadataValue, ObjectCounts, ObjectMetadata, SchemaSummary, SequenceSummary,
+        TableKind, TableRef, TableSummary, ViewKind, ViewSummary,
     },
     validation::validate_connect_request,
 };
@@ -355,10 +356,13 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
                 Ok(DatabaseSummary {
                     system: is_system_database(&name),
                     name,
-                    owner: decode(row, "owner")?,
-                    encoding: decode(row, "encoding")?,
-                    collation: decode(row, "collation")?,
-                    size_bytes,
+                    metadata: ObjectMetadata {
+                        owner: decode::<Option<String>>(row, "owner")?.into(),
+                        encoding: decode::<Option<String>>(row, "encoding")?.into(),
+                        collation: decode::<Option<String>>(row, "collation")?.into(),
+                        size_bytes: size_bytes.into(),
+                        ..ObjectMetadata::default()
+                    },
                 })
             })
             .collect::<Result<Vec<_>, DatabaseError>>()?;
@@ -386,8 +390,11 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
             .map(|row| {
                 Ok(SchemaSummary {
                     name: decode(row, "name")?,
-                    owner: decode(row, "owner")?,
                     system: decode(row, "system")?,
+                    metadata: ObjectMetadata {
+                        owner: decode::<Option<String>>(row, "owner")?.into(),
+                        ..ObjectMetadata::default()
+                    },
                 })
             })
             .collect::<Result<Vec<_>, DatabaseError>>()?;
@@ -420,18 +427,161 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
             .iter()
             .map(|row| {
                 let table_type: String = decode(row, "table_type")?;
+                let size_bytes = decode::<Option<i64>>(row, "size_bytes")?
+                    .and_then(|size| u64::try_from(size).ok());
+                let estimated_rows = decode::<Option<i64>>(row, "estimated_rows")?
+                    .and_then(|rows| u64::try_from(rows).ok());
                 Ok(TableSummary {
                     database: Some(decode(row, "database_name")?),
                     schema: Some(decode(row, "schema_name")?),
                     name: decode(row, "name")?,
                     kind: table_kind(&table_type),
-                    estimated_rows: None,
-                    size_bytes: None,
+                    estimated_rows: estimated_rows.into(),
+                    metadata: ObjectMetadata {
+                        owner: decode::<Option<String>>(row, "owner")?.into(),
+                        size_bytes: size_bytes.into(),
+                        engine: decode::<Option<String>>(row, "engine")?.into(),
+                        ..ObjectMetadata::default()
+                    },
                 })
             })
             .collect::<Result<Vec<_>, DatabaseError>>()?;
 
         Ok(Page::from_items(tables, page, None))
+    }
+
+    async fn list_views(
+        &self,
+        scope: &MetadataScope,
+        page: PageRequest,
+    ) -> Result<Page<ViewSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseViews)?;
+        let schema = self.schema_filter(scope)?;
+        let include_materialized = self
+            .capabilities
+            .supports(DatabaseAction::BrowseMaterializedViews);
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::LIST_VIEWS)
+                .bind(schema.as_deref())
+                .bind(i64::from(page.limit) + 1)
+                .bind(i64::try_from(page.offset).unwrap_or(i64::MAX))
+                .bind(include_materialized)
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+
+        let views = rows
+            .iter()
+            .map(|row| {
+                let view_type: String = decode(row, "view_type")?;
+                let size_bytes = decode::<Option<i64>>(row, "size_bytes")?
+                    .and_then(|size| u64::try_from(size).ok());
+                Ok(ViewSummary {
+                    database: Some(decode(row, "database_name")?),
+                    schema: Some(decode(row, "schema_name")?),
+                    name: decode(row, "name")?,
+                    kind: view_kind(&view_type),
+                    metadata: ObjectMetadata {
+                        owner: decode::<Option<String>>(row, "owner")?.into(),
+                        size_bytes: size_bytes.into(),
+                        ..ObjectMetadata::default()
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+
+        Ok(Page::from_items(views, page, None))
+    }
+
+    async fn list_sequences(
+        &self,
+        scope: &MetadataScope,
+        page: PageRequest,
+    ) -> Result<Page<SequenceSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseSequences)?;
+        let schema = self.schema_filter(scope)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::LIST_SEQUENCES)
+                .bind(schema.as_deref())
+                .bind(i64::from(page.limit) + 1)
+                .bind(i64::try_from(page.offset).unwrap_or(i64::MAX))
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+
+        let sequences = rows
+            .iter()
+            .map(|row| {
+                let size_bytes = decode::<Option<i64>>(row, "size_bytes")?
+                    .and_then(|size| u64::try_from(size).ok());
+                Ok(SequenceSummary {
+                    database: Some(decode(row, "database_name")?),
+                    schema: Some(decode(row, "schema_name")?),
+                    name: decode(row, "name")?,
+                    data_type: decode::<Option<String>>(row, "data_type")?.into(),
+                    start_value: decode::<Option<String>>(row, "start_value")?.into(),
+                    increment: decode::<Option<String>>(row, "increment_by")?.into(),
+                    metadata: ObjectMetadata {
+                        owner: decode::<Option<String>>(row, "owner")?.into(),
+                        size_bytes: size_bytes.into(),
+                        ..ObjectMetadata::default()
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+
+        Ok(Page::from_items(sequences, page, None))
+    }
+
+    async fn object_counts(&self, scope: &MetadataScope) -> Result<ObjectCounts, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseTables)?;
+        let schema = self.schema_filter(scope)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let row = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::OBJECT_COUNTS)
+                .bind(schema.as_deref())
+                .fetch_one(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+
+        let count = |column: &str| -> Result<MetadataValue<u64>, DatabaseError> {
+            let value = decode::<i64>(&row, column)?;
+            Ok(u64::try_from(value).map_or(MetadataValue::Unavailable, MetadataValue::available))
+        };
+        let materialized_views = if self
+            .capabilities
+            .supports(DatabaseAction::BrowseMaterializedViews)
+        {
+            count("materialized_view_count")?
+        } else {
+            MetadataValue::Unavailable
+        };
+        let sequences = if self.capabilities.supports(DatabaseAction::BrowseSequences) {
+            count("sequence_count")?
+        } else {
+            MetadataValue::Unavailable
+        };
+
+        Ok(ObjectCounts {
+            tables: count("table_count")?,
+            views: count("view_count")?,
+            materialized_views,
+            sequences,
+        })
     }
 
     async fn list_columns(
@@ -591,6 +741,13 @@ fn table_kind(table_type: &str) -> TableKind {
         "VIEW" | "SYSTEM VIEW" => TableKind::View,
         "FOREIGN" | "FOREIGN TABLE" => TableKind::ForeignTable,
         _ => TableKind::Other,
+    }
+}
+
+fn view_kind(view_type: &str) -> ViewKind {
+    match view_type.to_ascii_uppercase().as_str() {
+        "MATERIALIZED VIEW" => ViewKind::MaterializedView,
+        _ => ViewKind::View,
     }
 }
 
@@ -1021,17 +1178,70 @@ mod tests {
             .await
             .expect("create probe table");
 
+        adapter
+            .execute_for_test(
+                "CREATE OR REPLACE VIEW serverdesk_probe_view AS \
+                 SELECT id, email FROM serverdesk_writable_probe",
+            )
+            .await
+            .expect("create probe view");
+        adapter
+            .execute_for_test(
+                "CREATE SEQUENCE IF NOT EXISTS serverdesk_probe_seq START WITH 7 INCREMENT BY 2",
+            )
+            .await
+            .expect("create probe sequence");
+
         let scope = MetadataScope::new(Some(&fixture.database), Some("public")).expect("scope");
         let tables = adapter
             .list_tables(&scope, PageRequest::new(500, 0))
             .await
             .expect("list tables");
+        let probe = tables
+            .items
+            .iter()
+            .find(|table| table.name == "serverdesk_writable_probe")
+            .expect("probe table metadata");
+        assert!(probe.metadata.owner.is_available());
+        assert!(probe.metadata.size_bytes.is_available());
+        assert!(probe.metadata.engine.is_available());
+        assert!(probe.estimated_rows.is_available());
+
+        let views = adapter
+            .list_views(&scope, PageRequest::new(500, 0))
+            .await
+            .expect("list views");
         assert!(
-            tables
+            views
                 .items
                 .iter()
-                .any(|table| table.name == "serverdesk_writable_probe")
+                .any(|view| view.name == "serverdesk_probe_view")
         );
+
+        let sequences = adapter
+            .list_sequences(&scope, PageRequest::new(500, 0))
+            .await
+            .expect("list sequences");
+        let sequence = sequences
+            .items
+            .iter()
+            .find(|sequence| sequence.name == "serverdesk_probe_seq")
+            .expect("probe sequence metadata");
+        assert_eq!(
+            sequence.start_value,
+            MetadataValue::available("7".to_string())
+        );
+        assert_eq!(
+            sequence.increment,
+            MetadataValue::available("2".to_string())
+        );
+        assert!(sequence.metadata.owner.is_available());
+
+        let counts = adapter.object_counts(&scope).await.expect("object counts");
+        assert!(counts.tables.value().is_some_and(|value| *value >= 1));
+        assert!(counts.views.value().is_some_and(|value| *value >= 1));
+        assert!(counts.sequences.value().is_some_and(|value| *value >= 1));
+        assert!(counts.materialized_views.is_available());
 
         let table = TableRef::new(
             Some(&fixture.database),
@@ -1072,6 +1282,14 @@ mod tests {
                 .any(|constraint| constraint.kind == ConstraintKind::Check)
         );
 
+        adapter
+            .execute_for_test("DROP VIEW serverdesk_probe_view")
+            .await
+            .expect("drop probe view");
+        adapter
+            .execute_for_test("DROP SEQUENCE serverdesk_probe_seq")
+            .await
+            .expect("drop probe sequence");
         adapter
             .execute_for_test("DROP TABLE serverdesk_writable_probe")
             .await
