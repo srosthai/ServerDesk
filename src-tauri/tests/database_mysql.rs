@@ -13,7 +13,7 @@ use std::{
 use serverdesk_lib::{
     database::{
         DatabaseAction, DatabaseAdapter, DatabaseConnectRequest, DatabaseErrorKind,
-        DatabasePassword, MysqlDatabaseAdapter, PageRequest,
+        DatabasePassword, MetadataScope, MetadataValue, MysqlDatabaseAdapter, PageRequest,
     },
     storage::DatabaseEngine,
 };
@@ -106,6 +106,25 @@ async fn live_mysql_connects_pings_reports_version_and_closes() {
             .iter()
             .any(|database| database.name == fixture.database)
     );
+    let database = databases
+        .items
+        .iter()
+        .find(|database| database.name == fixture.database)
+        .expect("fixture database");
+    assert!(database.metadata.encoding.is_available());
+    assert!(database.metadata.collation.is_available());
+    assert!(!database.metadata.owner.is_available());
+
+    let scope = MetadataScope::new(Some(&fixture.database), None).expect("scope");
+    let views = adapter
+        .list_views(&scope, PageRequest::new(50, 0))
+        .await
+        .expect("list views");
+    assert!(views.limit > 0);
+    let counts = adapter.object_counts(&scope).await.expect("object counts");
+    assert!(counts.tables.is_available());
+    assert!(counts.views.is_available());
+    assert_eq!(counts.sequences, MetadataValue::Unavailable);
 
     adapter.close().await.expect("close fixture");
     assert!(!adapter.is_connected());

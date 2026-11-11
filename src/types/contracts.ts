@@ -390,6 +390,98 @@ export type DatabaseTestResult = {
   testedAt: number;
 };
 
+export type DatabaseMetadataValue<T> =
+  { status: "available"; value: T } | { status: "unavailable" };
+
+export type DatabaseObjectMetadata = {
+  owner: DatabaseMetadataValue<string>;
+  encoding: DatabaseMetadataValue<string>;
+  collation: DatabaseMetadataValue<string>;
+  sizeBytes: DatabaseMetadataValue<number>;
+  engine: DatabaseMetadataValue<string>;
+};
+
+export type DatabaseSummary = {
+  name: string;
+  system: boolean;
+} & DatabaseObjectMetadata;
+
+export type DatabaseSchemaSummary = {
+  name: string;
+  system: boolean;
+} & DatabaseObjectMetadata;
+
+export type DatabaseTableKind = "table" | "partitioned_table" | "view" | "foreign_table" | "other";
+
+export type DatabaseViewKind = "view" | "materialized_view";
+
+export type DatabaseTableSummary = {
+  database: string | null;
+  schema: string | null;
+  name: string;
+  kind: DatabaseTableKind;
+  estimatedRows: DatabaseMetadataValue<number>;
+} & DatabaseObjectMetadata;
+
+export type DatabaseViewSummary = {
+  database: string | null;
+  schema: string | null;
+  name: string;
+  kind: DatabaseViewKind;
+} & DatabaseObjectMetadata;
+
+export type DatabaseSequenceSummary = {
+  database: string | null;
+  schema: string | null;
+  name: string;
+  dataType: DatabaseMetadataValue<string>;
+  startValue: DatabaseMetadataValue<string>;
+  increment: DatabaseMetadataValue<string>;
+} & DatabaseObjectMetadata;
+
+export type DatabaseObjectCounts = {
+  tables: DatabaseMetadataValue<number>;
+  views: DatabaseMetadataValue<number>;
+  materializedViews: DatabaseMetadataValue<number>;
+  sequences: DatabaseMetadataValue<number>;
+};
+
+export type DatabasePage<T> = {
+  items: T[];
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+  total?: number;
+};
+
+export type DatabaseDiscoveryScope = {
+  database?: string | null;
+  schema?: string | null;
+};
+
+export type DatabaseDiscoveryPage = {
+  limit?: number;
+  offset?: number;
+};
+
+export type DatabaseExplorerNode =
+  | { kind: "databases" }
+  | { kind: "schemas" }
+  | ({ kind: "tables" } & DatabaseDiscoveryScope)
+  | ({ kind: "views" } & DatabaseDiscoveryScope)
+  | ({ kind: "sequences" } & DatabaseDiscoveryScope)
+  | ({ kind: "objectCounts" } & DatabaseDiscoveryScope);
+
+export type DatabaseExplorerNodeKind = DatabaseExplorerNode["kind"];
+
+export type DatabaseExplorerNodePayload =
+  | { nodeKind: "databases"; payload: DatabasePage<DatabaseSummary> }
+  | { nodeKind: "schemas"; payload: DatabasePage<DatabaseSchemaSummary> }
+  | { nodeKind: "tables"; payload: DatabasePage<DatabaseTableSummary> }
+  | { nodeKind: "views"; payload: DatabasePage<DatabaseViewSummary> }
+  | { nodeKind: "sequences"; payload: DatabasePage<DatabaseSequenceSummary> }
+  | { nodeKind: "objectCounts"; payload: DatabaseObjectCounts };
+
 export type ProjectType = "laravel";
 
 export type OperationCategory = "command" | "service" | "artisan" | "sftp" | "queue";

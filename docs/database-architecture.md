@@ -32,12 +32,14 @@ The structure follows the Database Manager plan's adapter split:
 src-tauri/src/commands/database/
   mod.rs            command boundary
   capabilities.rs   engine/version capability document
+  discovery.rs      lazy explorer-node metadata commands
   profiles.rs       saved profile CRUD, test, connect, reconnect, disconnect
   tunnels.rs        loopback SSH tunnel inspection commands
 
 src-tauri/src/database/
   mod.rs            public re-exports and dialect/capability factories
   traits.rs         DatabaseAdapter and typed metadata
+  discovery.rs      explorer-node request/response and metadata service
   capabilities.rs   action model, flags, version parsing
   dialect.rs        identifier validation/quoting and value binding
   errors.rs         shared database error taxonomy
@@ -68,12 +70,40 @@ same adapter contract.
 
 - `connect`, `ping`, `version`, and `close`;
 - database and schema listing;
-- table, column, index, and constraint metadata;
+- table, view, sequence, column, index, and constraint metadata;
+- bounded object counts for one explorer node;
 - capability checks through `require_capability`;
 - connection checks through `require_connection`.
 
-All metadata methods return `Page<T>`. The adapter owns the engine dialect and
+All list methods return `Page<T>`. The adapter owns the engine dialect and
 capabilities, so commands do not branch on MySQL versus PostgreSQL SQL.
+
+## Metadata availability
+
+Database, schema, table, view, and sequence summaries use `MetadataValue<T>`:
+
+```json
+{ "status": "available", "value": "utf8mb4" }
+{ "status": "unavailable" }
+```
+
+`Unavailable` means the engine has no such concept, the account may not read
+it, or the server version does not expose it. Adapters must not guess a value
+from a missing or null field. Unsupported object counts are unavailable too.
+For example, MySQL reports table and view counts but marks sequences and
+materialized views unavailable.
+
+Database and schema summaries report owner, encoding, collation, size, and
+engine where the engine exposes them. Tables report estimated rows plus owner,
+size, and storage engine/access method. Views report owner, size, and whether
+they are materialized. PostgreSQL sequences report data type, start value, and
+increment. MySQL does not expose sequences; the command returns a typed
+`capability` error and its object count is unavailable.
+
+PostgreSQL size lookups are gated with `has_table_privilege` /
+`has_sequence_privilege`. A restricted account sees the object but receives an
+unavailable size instead of a guessed value or a failed list. Any permission
+error the engine does raise is still mapped to the typed `permission` code.
 
 `DatabaseConnectRequest` carries the endpoint, username, read-only flag, SSL
 mode, timeout, and a `DatabasePassword` whose debug output is always
@@ -176,6 +206,43 @@ duplicates return the `conflict` error code.
 `src/services/databaseProfiles.ts` is the only React module that invokes these
 commands. `src/stores/databaseProfileStore.ts` owns profile lists, loading and
 error state, connection snapshots, per-profile busy flags, and test results.
+
+## Discovery command contract
+
+`src-tauri/src/commands/database/discovery.rs` owns metadata browsing:
+
+| Command                          | Purpose                                           |
+| -------------------------------- | ------------------------------------------------- |
+| `list_database_databases`        | Bounded database list                             |
+| `list_database_schemas`          | Bounded schema list                               |
+| `list_database_tables`           | Bounded base-table list for one scope             |
+| `list_database_views`            | Bounded view/materialized-view list for one scope |
+| `list_database_sequences`        | Bounded sequence list; MySQL returns `capability` |
+| `get_database_object_counts`     | One-row table/view/sequence counts for one scope  |
+| `load_database_explorer_node`    | Lazy load one typed explorer node                 |
+| `refresh_database_explorer_node` | Refresh exactly that node and no siblings         |
+
+Explorer requests are tagged by kind:
+
+```json
+{ "kind": "tables", "database": "app", "schema": "public" }
+```
+
+Responses carry the same tag and one bounded payload:
+
+```json
+{ "nodeKind": "tables", "payload": { "items": [], "limit": 100, "offset": 0, "hasMore": false } }
+```
+
+Database/schema names are validated by the shared `Identifier` rules before an
+adapter runs. Page limits are clamped to the shared bound (default 100, maximum
+500). A single-node refresh is a new request for that node only; the backend
+keeps no explorer cache.
+
+`src/services/databaseDiscovery.ts` is the only React module that invokes these
+commands. `src/stores/databaseExplorerStore.ts` caches one entry per
+profile/node key, tracks loading and typed error state per node, and replaces
+only the refreshed key. The tree UI is tracked separately in issue #166.
 
 ## Capability model
 
@@ -421,11 +488,11 @@ PostgreSQL 18 container.
 - One PostgreSQL connection browses only its connected database catalog.
   Switching databases requires reconnecting with the target database selected;
   cross-database `MetadataScope` and `TableRef` values return `validation`.
-- PostgreSQL table metadata does not yet populate estimated row counts, table
-  sizes, or materialized-view entries through the shared contract.
-- MySQL metadata methods cover databases, schemas, tables, columns, indexes,
-  and constraints, but large-catalog paging, object counts, and richer column
-  detail remain follow-up work.
+- MySQL has no database owner, table owner, sequence, or materialized-view
+  concept. Those fields are explicitly unavailable rather than guessed.
+- MySQL table row counts are engine estimates (`TABLE_ROWS`); they are not exact.
+- PostgreSQL size metadata requires a privilege check and is unavailable to
+  accounts that cannot read the relation.
 - MySQL index and constraint rows are grouped after the metadata query, so a
   table with an unusually large number of index columns is not independently
   paged inside one call.

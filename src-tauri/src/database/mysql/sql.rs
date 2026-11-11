@@ -8,24 +8,52 @@
 pub const PING: &str = "SELECT 1";
 pub const SERVER_VERSION: &str = "SELECT VERSION()";
 
-pub const LIST_DATABASES: &str = "SELECT SCHEMA_NAME AS name, DEFAULT_CHARACTER_SET_NAME AS \
-    encoding, DEFAULT_COLLATION_NAME AS collation FROM information_schema.SCHEMATA \
-    ORDER BY SCHEMA_NAME";
+pub const LIST_DATABASES: &str = "SELECT s.SCHEMA_NAME AS name, \
+    s.DEFAULT_CHARACTER_SET_NAME AS encoding, s.DEFAULT_COLLATION_NAME AS collation, \
+    COALESCE(t.size_bytes, 0) AS size_bytes \
+    FROM information_schema.SCHEMATA s \
+    LEFT JOIN ( \
+        SELECT TABLE_SCHEMA, \
+            CAST(SUM(COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0)) AS UNSIGNED) AS size_bytes \
+        FROM information_schema.TABLES \
+        GROUP BY TABLE_SCHEMA \
+    ) t ON t.TABLE_SCHEMA = s.SCHEMA_NAME \
+    ORDER BY s.SCHEMA_NAME LIMIT ? OFFSET ?";
 
-pub const LIST_SCHEMAS: &str = "SELECT SCHEMA_NAME AS name FROM information_schema.SCHEMATA \
-    ORDER BY SCHEMA_NAME";
+pub const LIST_SCHEMAS: &str = "SELECT s.SCHEMA_NAME AS name, \
+    s.DEFAULT_CHARACTER_SET_NAME AS encoding, s.DEFAULT_COLLATION_NAME AS collation, \
+    COALESCE(t.size_bytes, 0) AS size_bytes \
+    FROM information_schema.SCHEMATA s \
+    LEFT JOIN ( \
+        SELECT TABLE_SCHEMA, \
+            CAST(SUM(COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0)) AS UNSIGNED) AS size_bytes \
+        FROM information_schema.TABLES \
+        GROUP BY TABLE_SCHEMA \
+    ) t ON t.TABLE_SCHEMA = s.SCHEMA_NAME \
+    ORDER BY s.SCHEMA_NAME LIMIT ? OFFSET ?";
 
 pub const LIST_TABLES: &str = "SELECT TABLE_SCHEMA AS database_name, TABLE_NAME AS name, \
     TABLE_TYPE AS table_type, TABLE_ROWS AS estimated_rows, \
-    CAST(COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0) AS UNSIGNED) AS size_bytes \
+    CAST(COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0) AS UNSIGNED) AS size_bytes, \
+    ENGINE AS engine \
     FROM information_schema.TABLES \
-    WHERE (? IS NULL OR TABLE_SCHEMA = ?) \
-    ORDER BY TABLE_SCHEMA, TABLE_NAME";
+    WHERE TABLE_TYPE = 'BASE TABLE' \
+    AND (? IS NULL OR TABLE_SCHEMA = ?) \
+    ORDER BY TABLE_SCHEMA, TABLE_NAME LIMIT ? OFFSET ?";
 
-pub const LIST_VIEWS: &str = "SELECT TABLE_SCHEMA AS database_name, TABLE_NAME AS name \
+pub const LIST_VIEWS: &str = "SELECT TABLE_SCHEMA AS database_name, TABLE_NAME AS name, \
+    DEFINER AS owner \
     FROM information_schema.VIEWS \
     WHERE (? IS NULL OR TABLE_SCHEMA = ?) \
-    ORDER BY TABLE_SCHEMA, TABLE_NAME";
+    ORDER BY TABLE_SCHEMA, TABLE_NAME LIMIT ? OFFSET ?";
+
+pub const OBJECT_COUNTS: &str = "SELECT \
+    CAST(COALESCE(SUM(CASE WHEN TABLE_TYPE = 'BASE TABLE' THEN 1 ELSE 0 END), 0) AS UNSIGNED) \
+        AS table_count, \
+    CAST(COALESCE(SUM(CASE WHEN TABLE_TYPE = 'VIEW' THEN 1 ELSE 0 END), 0) AS UNSIGNED) \
+        AS view_count \
+    FROM information_schema.TABLES \
+    WHERE (? IS NULL OR TABLE_SCHEMA = ?)";
 
 pub const LIST_COLUMNS: &str = "SELECT COLUMN_NAME AS name, COLUMN_TYPE AS data_type, \
     IS_NULLABLE = 'YES' AS nullable, COLUMN_DEFAULT AS default_value, \

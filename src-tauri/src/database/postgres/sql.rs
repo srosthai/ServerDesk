@@ -35,31 +35,92 @@ ORDER BY nspname
 LIMIT $1 OFFSET $2"#;
 
 pub const LIST_TABLES: &str = r#"SELECT current_database() AS database_name,
-    t.table_schema AS schema_name,
-    t.table_name AS name,
-    t.table_type AS table_type
-FROM information_schema.tables AS t
-WHERE ($1::text IS NULL OR t.table_schema = $1)
-  AND t.table_schema NOT IN ('pg_catalog', 'information_schema')
-ORDER BY t.table_schema, t.table_name
+    n.nspname AS schema_name,
+    c.relname AS name,
+    CASE c.relkind
+        WHEN 'r' THEN 'BASE TABLE'
+        WHEN 'p' THEN 'PARTITIONED TABLE'
+        WHEN 'f' THEN 'FOREIGN TABLE'
+        ELSE 'OTHER'
+    END AS table_type,
+    pg_catalog.pg_get_userbyid(c.relowner) AS owner,
+    CASE WHEN pg_catalog.has_table_privilege(c.oid, 'SELECT')
+         THEN pg_catalog.pg_total_relation_size(c.oid)
+    END AS size_bytes,
+    CASE WHEN c.reltuples >= 0 THEN c.reltuples::bigint END AS estimated_rows,
+    am.amname AS engine
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
+WHERE c.relkind IN ('r', 'p', 'f')
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND ($1::text IS NULL OR n.nspname = $1)
+ORDER BY n.nspname, c.relname
 LIMIT $2 OFFSET $3"#;
 
-pub const LIST_VIEWS: &str = "SELECT table_schema AS schema_name, table_name AS name, \
-    view_definition AS definition \
-    FROM information_schema.views \
-    WHERE ($1::text IS NULL OR table_schema = $1) \
-    AND table_schema NOT IN ('pg_catalog', 'information_schema') \
-    ORDER BY table_schema, table_name";
+pub const LIST_VIEWS: &str = r#"SELECT current_database() AS database_name,
+    n.nspname AS schema_name,
+    c.relname AS name,
+    CASE c.relkind WHEN 'm' THEN 'MATERIALIZED VIEW' ELSE 'VIEW' END AS view_type,
+    pg_catalog.pg_get_userbyid(c.relowner) AS owner,
+    CASE WHEN pg_catalog.has_table_privilege(c.oid, 'SELECT')
+         THEN pg_catalog.pg_total_relation_size(c.oid)
+    END AS size_bytes
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE (c.relkind = 'v' OR (c.relkind = 'm' AND $4::boolean))
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND ($1::text IS NULL OR n.nspname = $1)
+ORDER BY n.nspname, c.relname
+LIMIT $2 OFFSET $3"#;
 
 pub const LIST_MATERIALIZED_VIEWS: &str = "SELECT schemaname AS schema_name, \
     matviewname AS name, pg_catalog.pg_get_userbyid(matviewowner) AS owner \
     FROM pg_catalog.pg_matviews ORDER BY schemaname, matviewname";
 
-pub const LIST_SEQUENCES: &str = "SELECT sequence_schema AS schema_name, sequence_name AS name, \
-    data_type AS data_type, start_value AS start_value, increment AS increment_by \
-    FROM information_schema.sequences \
-    WHERE ($1::text IS NULL OR sequence_schema = $1) \
-    ORDER BY sequence_schema, sequence_name";
+pub const LIST_SEQUENCES: &str = r#"SELECT current_database() AS database_name,
+    s.sequence_schema AS schema_name,
+    s.sequence_name AS name,
+    s.data_type AS data_type,
+    s.start_value::text AS start_value,
+    s.increment::text AS increment_by,
+    pg_catalog.pg_get_userbyid(c.relowner) AS owner,
+    CASE WHEN pg_catalog.has_sequence_privilege(c.oid, 'SELECT')
+         THEN pg_catalog.pg_relation_size(c.oid)
+    END AS size_bytes
+FROM information_schema.sequences s
+JOIN pg_catalog.pg_namespace n ON n.nspname = s.sequence_schema
+JOIN pg_catalog.pg_class c
+  ON c.relnamespace = n.oid AND c.relname = s.sequence_name AND c.relkind = 'S'
+WHERE ($1::text IS NULL OR s.sequence_schema = $1)
+ORDER BY s.sequence_schema, s.sequence_name
+LIMIT $2 OFFSET $3"#;
+
+pub const OBJECT_COUNTS: &str = r#"SELECT
+    (SELECT count(*)
+     FROM pg_catalog.pg_class c
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relkind IN ('r', 'p', 'f')
+       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+       AND ($1::text IS NULL OR n.nspname = $1)) AS table_count,
+    (SELECT count(*)
+     FROM pg_catalog.pg_class c
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relkind = 'v'
+       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+       AND ($1::text IS NULL OR n.nspname = $1)) AS view_count,
+    (SELECT count(*)
+     FROM pg_catalog.pg_class c
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relkind = 'm'
+       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+       AND ($1::text IS NULL OR n.nspname = $1)) AS materialized_view_count,
+    (SELECT count(*)
+     FROM pg_catalog.pg_class c
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relkind = 'S'
+       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+       AND ($1::text IS NULL OR n.nspname = $1)) AS sequence_count"#;
 
 pub const LIST_COLUMNS: &str = r#"SELECT a.attname AS name,
     pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,

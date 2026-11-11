@@ -20,7 +20,8 @@ use super::{
     traits::{
         ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter, DatabaseConnectRequest,
         DatabaseConnectionInfo, DatabasePing, DatabaseSummary, DatabaseVersionInfo, IndexSummary,
-        MetadataScope, SchemaSummary, TableKind, TableRef, TableSummary,
+        MetadataScope, MetadataValue, ObjectCounts, ObjectMetadata, SchemaSummary, SequenceSummary,
+        TableKind, TableRef, TableSummary, ViewKind, ViewSummary,
     },
 };
 
@@ -40,6 +41,8 @@ pub struct FakeDatabaseAdapter {
     databases: Vec<DatabaseSummary>,
     schemas: Vec<SchemaSummary>,
     tables: Vec<TableSummary>,
+    views: Vec<ViewSummary>,
+    sequences: Vec<SequenceSummary>,
     columns: Vec<ColumnSummary>,
     indexes: Vec<IndexSummary>,
     constraints: Vec<ConstraintSummary>,
@@ -81,6 +84,8 @@ impl FakeDatabaseAdapter {
             databases: fixtures.databases,
             schemas: fixtures.schemas,
             tables: fixtures.tables,
+            views: fixtures.views,
+            sequences: fixtures.sequences,
             columns: fixtures.columns,
             indexes: fixtures.indexes,
             constraints: fixtures.constraints,
@@ -242,6 +247,107 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
         Ok(Self::paginate(&tables, page))
     }
 
+    async fn list_views(
+        &self,
+        scope: &MetadataScope,
+        page: PageRequest,
+    ) -> Result<Page<ViewSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseViews)?;
+        self.require_connection()?;
+
+        let database = scope.database.as_ref().map(|value| value.as_str());
+        let schema = scope.schema.as_ref().map(|value| value.as_str());
+        let views = self
+            .views
+            .iter()
+            .filter(|view| {
+                database.is_none_or(|value| view.database.as_deref() == Some(value))
+                    && schema.is_none_or(|value| view.schema.as_deref() == Some(value))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        Ok(Self::paginate(&views, page))
+    }
+
+    async fn list_sequences(
+        &self,
+        scope: &MetadataScope,
+        page: PageRequest,
+    ) -> Result<Page<SequenceSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseSequences)?;
+        self.require_connection()?;
+
+        let database = scope.database.as_ref().map(|value| value.as_str());
+        let schema = scope.schema.as_ref().map(|value| value.as_str());
+        let sequences = self
+            .sequences
+            .iter()
+            .filter(|sequence| {
+                database.is_none_or(|value| sequence.database.as_deref() == Some(value))
+                    && schema.is_none_or(|value| sequence.schema.as_deref() == Some(value))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        Ok(Self::paginate(&sequences, page))
+    }
+
+    async fn object_counts(&self, scope: &MetadataScope) -> Result<ObjectCounts, DatabaseError> {
+        self.require_connection()?;
+        let database = scope.database.as_ref().map(|value| value.as_str());
+        let schema = scope.schema.as_ref().map(|value| value.as_str());
+        let matches = |database_name: Option<&str>, schema_name: Option<&str>| {
+            database.is_none_or(|value| database_name == Some(value))
+                && schema.is_none_or(|value| schema_name == Some(value))
+        };
+        let tables = self
+            .tables
+            .iter()
+            .filter(|table| matches(table.database.as_deref(), table.schema.as_deref()))
+            .count() as u64;
+        let views = self
+            .views
+            .iter()
+            .filter(|view| matches(view.database.as_deref(), view.schema.as_deref()))
+            .count() as u64;
+        let materialized_views = if self
+            .capabilities
+            .supports(DatabaseAction::BrowseMaterializedViews)
+        {
+            MetadataValue::available(
+                self.views
+                    .iter()
+                    .filter(|view| {
+                        view.kind == ViewKind::MaterializedView
+                            && matches(view.database.as_deref(), view.schema.as_deref())
+                    })
+                    .count() as u64,
+            )
+        } else {
+            MetadataValue::Unavailable
+        };
+        let sequences = if self.capabilities.supports(DatabaseAction::BrowseSequences) {
+            MetadataValue::available(
+                self.sequences
+                    .iter()
+                    .filter(|sequence| {
+                        matches(sequence.database.as_deref(), sequence.schema.as_deref())
+                    })
+                    .count() as u64,
+            )
+        } else {
+            MetadataValue::Unavailable
+        };
+
+        Ok(ObjectCounts {
+            tables: MetadataValue::available(tables),
+            views: MetadataValue::available(views),
+            materialized_views,
+            sequences,
+        })
+    }
+
     async fn list_columns(
         &self,
         table: &TableRef,
@@ -307,6 +413,8 @@ struct FakeFixtures {
     databases: Vec<DatabaseSummary>,
     schemas: Vec<SchemaSummary>,
     tables: Vec<TableSummary>,
+    views: Vec<ViewSummary>,
+    sequences: Vec<SequenceSummary>,
     columns: Vec<ColumnSummary>,
     indexes: Vec<IndexSummary>,
     constraints: Vec<ConstraintSummary>,
@@ -318,31 +426,45 @@ fn mysql_fixtures() -> FakeFixtures {
         databases: vec![
             DatabaseSummary {
                 name: "app".to_string(),
-                owner: Some("app".to_string()),
-                encoding: Some("utf8mb4".to_string()),
-                collation: Some("utf8mb4_unicode_ci".to_string()),
-                size_bytes: Some(4_096),
                 system: false,
+                metadata: ObjectMetadata {
+                    encoding: MetadataValue::available("utf8mb4".to_string()),
+                    collation: MetadataValue::available("utf8mb4_unicode_ci".to_string()),
+                    size_bytes: MetadataValue::available(4_096),
+                    ..ObjectMetadata::default()
+                },
             },
             DatabaseSummary {
                 name: "sys".to_string(),
-                owner: Some("mysql.sys".to_string()),
-                encoding: Some("utf8mb4".to_string()),
-                collation: Some("utf8mb4_0900_ai_ci".to_string()),
-                size_bytes: Some(1_024),
                 system: true,
+                metadata: ObjectMetadata {
+                    encoding: MetadataValue::available("utf8mb4".to_string()),
+                    collation: MetadataValue::available("utf8mb4_0900_ai_ci".to_string()),
+                    size_bytes: MetadataValue::available(1_024),
+                    ..ObjectMetadata::default()
+                },
             },
         ],
         schemas: vec![
             SchemaSummary {
                 name: "app".to_string(),
-                owner: Some("app".to_string()),
                 system: false,
+                metadata: ObjectMetadata {
+                    encoding: MetadataValue::available("utf8mb4".to_string()),
+                    collation: MetadataValue::available("utf8mb4_unicode_ci".to_string()),
+                    size_bytes: MetadataValue::available(4_096),
+                    ..ObjectMetadata::default()
+                },
             },
             SchemaSummary {
                 name: "sys".to_string(),
-                owner: Some("mysql.sys".to_string()),
                 system: true,
+                metadata: ObjectMetadata {
+                    encoding: MetadataValue::available("utf8mb4".to_string()),
+                    collation: MetadataValue::available("utf8mb4_0900_ai_ci".to_string()),
+                    size_bytes: MetadataValue::available(1_024),
+                    ..ObjectMetadata::default()
+                },
             },
         ],
         tables: vec![
@@ -351,18 +473,37 @@ fn mysql_fixtures() -> FakeFixtures {
                 schema: Some("app".to_string()),
                 name: "users".to_string(),
                 kind: TableKind::Table,
-                estimated_rows: Some(2),
-                size_bytes: Some(16_384),
+                estimated_rows: MetadataValue::available(2),
+                metadata: ObjectMetadata {
+                    size_bytes: MetadataValue::available(16_384),
+                    engine: MetadataValue::available("InnoDB".to_string()),
+                    ..ObjectMetadata::default()
+                },
             },
             TableSummary {
                 database: Some("app".to_string()),
                 schema: Some("app".to_string()),
                 name: "orders".to_string(),
                 kind: TableKind::Table,
-                estimated_rows: Some(0),
-                size_bytes: Some(16_384),
+                estimated_rows: MetadataValue::available(0),
+                metadata: ObjectMetadata {
+                    size_bytes: MetadataValue::available(16_384),
+                    engine: MetadataValue::available("InnoDB".to_string()),
+                    ..ObjectMetadata::default()
+                },
             },
         ],
+        views: vec![ViewSummary {
+            database: Some("app".to_string()),
+            schema: Some("app".to_string()),
+            name: "active_users".to_string(),
+            kind: ViewKind::View,
+            metadata: ObjectMetadata {
+                owner: MetadataValue::available("app@%".to_string()),
+                ..ObjectMetadata::default()
+            },
+        }],
+        sequences: Vec::new(),
         columns: vec![
             ColumnSummary {
                 name: "id".to_string(),
@@ -432,31 +573,43 @@ fn postgres_fixtures() -> FakeFixtures {
         databases: vec![
             DatabaseSummary {
                 name: "app".to_string(),
-                owner: Some("app".to_string()),
-                encoding: Some("UTF8".to_string()),
-                collation: Some("en_US.UTF-8".to_string()),
-                size_bytes: Some(8_192),
                 system: false,
+                metadata: ObjectMetadata {
+                    owner: MetadataValue::available("app".to_string()),
+                    encoding: MetadataValue::available("UTF8".to_string()),
+                    collation: MetadataValue::available("en_US.UTF-8".to_string()),
+                    size_bytes: MetadataValue::available(8_192),
+                    ..ObjectMetadata::default()
+                },
             },
             DatabaseSummary {
                 name: "postgres".to_string(),
-                owner: Some("postgres".to_string()),
-                encoding: Some("UTF8".to_string()),
-                collation: Some("C.UTF-8".to_string()),
-                size_bytes: Some(7_168),
                 system: true,
+                metadata: ObjectMetadata {
+                    owner: MetadataValue::available("postgres".to_string()),
+                    encoding: MetadataValue::available("UTF8".to_string()),
+                    collation: MetadataValue::available("C.UTF-8".to_string()),
+                    size_bytes: MetadataValue::available(7_168),
+                    ..ObjectMetadata::default()
+                },
             },
         ],
         schemas: vec![
             SchemaSummary {
                 name: "public".to_string(),
-                owner: Some("pg_database_owner".to_string()),
                 system: false,
+                metadata: ObjectMetadata {
+                    owner: MetadataValue::available("pg_database_owner".to_string()),
+                    ..ObjectMetadata::default()
+                },
             },
             SchemaSummary {
                 name: "pg_catalog".to_string(),
-                owner: Some("postgres".to_string()),
                 system: true,
+                metadata: ObjectMetadata {
+                    owner: MetadataValue::available("postgres".to_string()),
+                    ..ObjectMetadata::default()
+                },
             },
         ],
         tables: vec![
@@ -465,18 +618,65 @@ fn postgres_fixtures() -> FakeFixtures {
                 schema: Some("public".to_string()),
                 name: "users".to_string(),
                 kind: TableKind::Table,
-                estimated_rows: Some(2),
-                size_bytes: Some(8_192),
+                estimated_rows: MetadataValue::available(2),
+                metadata: ObjectMetadata {
+                    owner: MetadataValue::available("app".to_string()),
+                    size_bytes: MetadataValue::available(8_192),
+                    engine: MetadataValue::available("heap".to_string()),
+                    ..ObjectMetadata::default()
+                },
             },
             TableSummary {
                 database: Some("app".to_string()),
                 schema: Some("public".to_string()),
                 name: "orders".to_string(),
                 kind: TableKind::Table,
-                estimated_rows: Some(0),
-                size_bytes: Some(8_192),
+                estimated_rows: MetadataValue::available(0),
+                metadata: ObjectMetadata {
+                    owner: MetadataValue::available("app".to_string()),
+                    size_bytes: MetadataValue::available(8_192),
+                    engine: MetadataValue::available("heap".to_string()),
+                    ..ObjectMetadata::default()
+                },
             },
         ],
+        views: vec![
+            ViewSummary {
+                database: Some("app".to_string()),
+                schema: Some("public".to_string()),
+                name: "active_users".to_string(),
+                kind: ViewKind::View,
+                metadata: ObjectMetadata {
+                    owner: MetadataValue::available("app".to_string()),
+                    size_bytes: MetadataValue::available(0),
+                    ..ObjectMetadata::default()
+                },
+            },
+            ViewSummary {
+                database: Some("app".to_string()),
+                schema: Some("public".to_string()),
+                name: "daily_totals".to_string(),
+                kind: ViewKind::MaterializedView,
+                metadata: ObjectMetadata {
+                    owner: MetadataValue::available("app".to_string()),
+                    size_bytes: MetadataValue::available(8_192),
+                    ..ObjectMetadata::default()
+                },
+            },
+        ],
+        sequences: vec![SequenceSummary {
+            database: Some("app".to_string()),
+            schema: Some("public".to_string()),
+            name: "users_id_seq".to_string(),
+            data_type: MetadataValue::available("bigint".to_string()),
+            start_value: MetadataValue::available("1".to_string()),
+            increment: MetadataValue::available("1".to_string()),
+            metadata: ObjectMetadata {
+                owner: MetadataValue::available("app".to_string()),
+                size_bytes: MetadataValue::available(8_192),
+                ..ObjectMetadata::default()
+            },
+        }],
         columns: vec![
             ColumnSummary {
                 name: "id".to_string(),
