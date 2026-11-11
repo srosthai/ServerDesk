@@ -207,7 +207,7 @@ test -f "$smoke_dir/com.serverdesk.app/serverdesk.sqlite3"
 sqlite3 "$smoke_dir/com.serverdesk.app/serverdesk.sqlite3" 'PRAGMA user_version;'
 ```
 
-Expected output includes `SERVERDESK_SMOKE_WINDOW_PRESENT=1` and schema version `4`. Use `xvfb-run -a` on a headless Linux host.
+Expected output includes `SERVERDESK_SMOKE_WINDOW_PRESENT=1` and schema version `5`. Use `xvfb-run -a` on a headless Linux host.
 
 ### Package content checks
 
@@ -237,9 +237,9 @@ secret-tool search --all service com.serverdesk.app
 Tested locally on Fedora Linux 44 x86_64:
 
 - DEB, RPM, and AppImage packages build from this repository with Tauri 2.
-- The release binary launches with a clean `XDG_DATA_HOME`, creates `com.serverdesk.app/serverdesk.sqlite3`, reaches database schema version 4, reports the main window as present, and exits with status 0 through the smoke-test hook. The SQLite file is mode `0600`.
-- The RPM package was extracted to a temporary root and its `/usr/bin/serverdesk` binary passed the same smoke test with schema version 4.
-- The AppImage was run with `--appimage-extract-and-run` and passed the same smoke test with schema version 4.
+- The release binary launches with a clean `XDG_DATA_HOME`, creates `com.serverdesk.app/serverdesk.sqlite3`, reaches database schema version 5, reports the main window as present, and exits with status 0 through the smoke-test hook. The SQLite file is mode `0600`.
+- The RPM package was extracted to a temporary root and its `/usr/bin/serverdesk` binary passed the same smoke test with schema version 5.
+- The AppImage was run with `--appimage-extract-and-run` and passed the same smoke test with schema version 5.
 - Package metadata, version `0.1.0`, desktop entry contents, and icon files were inspected. The packaged 32x32 and 512x512 icon hashes match `src-tauri/icons/32x32.png` and `src-tauri/icons/icon.png`.
 - The ignored OS credential-store round-trip test passed against the local Secret Service.
 - `serverdesk --purge-data` removed two real Secret Service entries (one referenced by SQLite and one referenced only by the credential index), deleted the app-data directory, and exited 0. A second test forced a credential deletion failure and confirmed that the database and index are kept for a retry.
