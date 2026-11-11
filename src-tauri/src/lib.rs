@@ -11,7 +11,7 @@ use crate::{
         credential_index::CredentialIndex,
         credentials::{CredentialStore, OsCredentialStore},
         files::FileTransferManager,
-        ssh::{ConnectionManager, ConnectionTimeouts, RusshTransport},
+        ssh::{ConnectionManager, ConnectionTimeouts, RusshTransport, TunnelManager},
         terminal::TerminalManager,
     },
 };
@@ -19,6 +19,9 @@ use crate::{
 async fn release_connections(app: &tauri::AppHandle) {
     if let Some(transfers) = app.try_state::<Arc<FileTransferManager>>() {
         transfers.cancel_all();
+    }
+    if let Some(tunnels) = app.try_state::<Arc<TunnelManager>>() {
+        tunnels.close_all().await;
     }
     if let Some(terminal) = app.try_state::<Arc<TerminalManager>>() {
         terminal.close_all().await;
@@ -116,7 +119,9 @@ pub fn run() {
                 Arc::new(TauriConnectionEventSink::new(app.handle().clone())),
                 ConnectionTimeouts::default(),
             ));
+            let tunnels = TunnelManager::new(Arc::clone(&connections));
             app.manage(Arc::clone(&connections));
+            app.manage(tunnels);
             app.manage(Arc::new(FileTransferManager::new(
                 connections,
                 Arc::new(TauriFileTransferEventSink::new(app.handle().clone())),
@@ -150,6 +155,11 @@ pub fn run() {
             commands::connections::disconnect_server,
             commands::connections::get_connection_state,
             commands::connections::test_server_connection,
+            commands::database_tunnels::open_database_tunnel,
+            commands::database_tunnels::close_database_tunnel,
+            commands::database_tunnels::get_database_tunnel_state,
+            commands::database_tunnels::list_database_tunnels,
+            commands::database_tunnels::delete_database_connection,
             commands::remote::run_remote_command,
             commands::history::list_operation_history,
             commands::history::get_operation_history_policy,

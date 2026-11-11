@@ -24,7 +24,7 @@ use crate::core::terminal::{TerminalChannel, TerminalChannelEvent, TerminalOptio
 use super::{
     Authentication, CommandOutput, ConnectionRequest, SftpBrowser, SftpDirEntry, SftpEntryKind,
     SftpError, SftpFile, SftpMetadata, SftpOpenMode, SshSession, SshTransport, TransportError,
-    TrustedHostKey, private_key::load_private_key,
+    TrustedHostKey, TunnelStream, private_key::load_private_key,
 };
 
 const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -458,6 +458,28 @@ impl SshSession for RusshSession {
                 session: Arc::new(session),
             })),
         }
+    }
+
+    async fn open_direct_tcpip(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<Box<dyn TunnelStream>, TransportError> {
+        let channel = {
+            let handle = self.handle.lock().await;
+            if self.closed.load(Ordering::SeqCst) || handle.is_closed() {
+                return Err(TransportError::Network);
+            }
+            handle
+                .channel_open_direct_tcpip(host.to_string(), u32::from(port), "127.0.0.1", 0)
+                .await
+                .map_err(map_russh_error)?
+        };
+
+        // The tunnel manager moves bytes between the loopback listener and this
+        // channel. Dropping the stream closes the SSH channel and never exposes
+        // a second local or remote port.
+        Ok(Box::new(channel.into_stream()))
     }
 
     async fn is_healthy(&self) -> bool {
