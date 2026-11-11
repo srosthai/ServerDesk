@@ -74,6 +74,27 @@ first is still running. This prevents a retry from writing the same destination
 twice when the previous backend task has not finished. The retry uses a new
 transfer identifier and a new partial path; no transfer is resumed silently.
 
+## Database tunnels
+
+- A database tunnel is keyed by saved database profile and runs on the
+  existing authenticated SSH session through a `direct-tcpip` channel.
+- The local listener always binds `127.0.0.1` with an OS-assigned ephemeral
+  port; a wildcard or public bind is not available through the tunnel API.
+- The remote endpoint is probed before a local port is published. SSH host-key,
+  authentication, remote refusal, and timeout failures therefore surface as
+  typed errors before any database driver or database login is attempted.
+- A duplicate request for the same profile and endpoint reuses the active
+  tunnel. A conflicting endpoint, a request while the first tunnel is still
+  opening, or a request past the tunnel bound returns `conflict`.
+- Open tunnels, forwarded channels, and listeners are bounded. Accepted local
+  clients beyond the per-tunnel bound are closed rather than queued without
+  limit.
+- Disconnecting a server, deleting a database profile, closing a tunnel, and
+  application exit close the listener and every forwarded channel. Failed setup
+  drops the listener and probe channel before returning the error.
+- Forwarded bytes are never logged, and tunnel events contain only profile,
+  endpoint, state, and local port metadata.
+
 ## Transfer completeness
 
 - Uploads and downloads write to a sibling `.serverdesk-*.part` file.

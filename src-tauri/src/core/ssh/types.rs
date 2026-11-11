@@ -305,6 +305,14 @@ pub trait SftpBrowser: Send + Sync {
     async fn close(&self) -> Result<(), SftpError>;
 }
 
+/// One bidirectional byte stream carried inside an SSH channel.
+///
+/// Database tunnels use this for `direct-tcpip` channels so the tunnel manager
+/// can move bytes without knowing anything about the database protocol.
+pub trait TunnelStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+
+impl<T> TunnelStream for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {
     HostKeyUnknown {
@@ -409,6 +417,21 @@ pub trait SshSession: Send + Sync {
     async fn open_sftp(&self) -> Result<std::sync::Arc<dyn SftpBrowser>, TransportError> {
         Err(TransportError::Remote(
             "This SSH session does not support SFTP file browsing.".to_string(),
+        ))
+    }
+
+    /// Opens an SSH `direct-tcpip` channel to one remote TCP endpoint.
+    ///
+    /// The channel runs inside the already authenticated SSH connection. No
+    /// additional SSH connection or public port is opened. Implementations
+    /// that cannot forward TCP keep the typed default failure.
+    async fn open_direct_tcpip(
+        &self,
+        _host: &str,
+        _port: u16,
+    ) -> Result<Box<dyn TunnelStream>, TransportError> {
+        Err(TransportError::Remote(
+            "This SSH session does not support TCP forwarding.".to_string(),
         ))
     }
 

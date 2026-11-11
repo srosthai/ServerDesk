@@ -53,6 +53,21 @@ run `--purge-data`, which reads both the database and the credential index and
 removes every credential known to the installation before deleting the local
 database.
 
+### Database tunnels
+
+Database connections use an SSH local-forward tunnel by default. ServerDesk
+binds the tunnel listener to `127.0.0.1` on an OS-assigned ephemeral port; it
+never binds a wildcard or public address, and it never opens a separate SSH
+connection for the tunnel. Each local client is carried in a `direct-tcpip`
+channel inside the authenticated SSH session.
+
+Forwarded payloads are streamed between the local socket and the SSH channel
+without being logged, persisted, or included in errors. Tunnel metadata is
+limited to the database profile identifier, remote host and port, optional Unix
+socket metadata, lifecycle state, and local loopback port. Listeners and
+channels are closed when the SSH session disconnects, the database profile is
+deleted, the tunnel is closed, or the application exits.
+
 ### No telemetry
 
 ServerDesk does not send usage data, analytics, crash reports, diagnostics,
