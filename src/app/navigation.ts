@@ -2,6 +2,7 @@ import type { Icon } from "@phosphor-icons/react";
 import {
   ChartLineIcon,
   ClockCounterClockwiseIcon,
+  DatabaseIcon,
   FilesIcon,
   FolderSimpleIcon,
   GaugeIcon,
@@ -39,6 +40,7 @@ export const navGroups: NavGroup[] = [
     label: "Server",
     items: [
       { label: "Services", to: "/services", icon: GaugeIcon },
+      { label: "Databases", to: "/databases", icon: DatabaseIcon },
       { label: "File Manager", to: "/files", icon: FilesIcon },
       { label: "Terminal", to: "/terminal", icon: TerminalWindowIcon },
       { label: "Logs", to: "/logs", icon: ListMagnifyingGlassIcon },
