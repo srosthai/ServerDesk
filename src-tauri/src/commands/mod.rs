@@ -1,6 +1,6 @@
 pub mod connections;
 pub mod credentials;
-pub mod database_tunnels;
+pub mod database;
 pub mod files;
 pub mod history;
 pub mod identity;
