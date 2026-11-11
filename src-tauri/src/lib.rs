@@ -168,6 +168,7 @@ pub fn run() {
             commands::database::profiles::update_database_profile,
             commands::database::profiles::delete_database_profile,
             commands::database::profiles::test_database_profile,
+            commands::database::profiles::test_database_profile_draft,
             commands::database::profiles::connect_database_profile,
             commands::database::profiles::reconnect_database_profile,
             commands::database::profiles::disconnect_database_profile,
