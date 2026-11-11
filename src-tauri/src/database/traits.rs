@@ -81,23 +81,82 @@ pub struct DatabasePing {
     pub latency_ms: u64,
 }
 
+/// An optional metadata field reported by an engine.
+///
+/// `Unavailable` is deliberate: the engine has no concept for the field, the
+/// account cannot read it, or the server version does not expose it. Adapters
+/// must never substitute a guessed value. React can render unsupported fields
+/// as unavailable without guessing from a missing/null field.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", content = "value", rename_all = "camelCase")]
+pub enum MetadataValue<T> {
+    Available(T),
+    #[default]
+    Unavailable,
+}
+
+impl<T> MetadataValue<T> {
+    pub const fn available(value: T) -> Self {
+        Self::Available(value)
+    }
+
+    pub const fn unavailable() -> Self {
+        Self::Unavailable
+    }
+
+    pub const fn is_available(&self) -> bool {
+        matches!(self, Self::Available(_))
+    }
+
+    pub const fn value(&self) -> Option<&T> {
+        match self {
+            Self::Available(value) => Some(value),
+            Self::Unavailable => None,
+        }
+    }
+
+    pub fn map<U>(self, map: impl FnOnce(T) -> U) -> MetadataValue<U> {
+        match self {
+            Self::Available(value) => MetadataValue::Available(map(value)),
+            Self::Unavailable => MetadataValue::Unavailable,
+        }
+    }
+}
+
+impl<T> From<Option<T>> for MetadataValue<T> {
+    fn from(value: Option<T>) -> Self {
+        value.map_or(Self::Unavailable, Self::Available)
+    }
+}
+
+/// Common database-object metadata. Every field is explicit about whether the
+/// selected engine can report it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectMetadata {
+    pub owner: MetadataValue<String>,
+    pub encoding: MetadataValue<String>,
+    pub collation: MetadataValue<String>,
+    pub size_bytes: MetadataValue<u64>,
+    pub engine: MetadataValue<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DatabaseSummary {
     pub name: String,
-    pub owner: Option<String>,
-    pub encoding: Option<String>,
-    pub collation: Option<String>,
-    pub size_bytes: Option<u64>,
     pub system: bool,
+    #[serde(flatten)]
+    pub metadata: ObjectMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SchemaSummary {
     pub name: String,
-    pub owner: Option<String>,
     pub system: bool,
+    #[serde(flatten)]
+    pub metadata: ObjectMetadata,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +169,13 @@ pub enum TableKind {
     Other,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewKind {
+    View,
+    MaterializedView,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TableSummary {
@@ -117,8 +183,44 @@ pub struct TableSummary {
     pub schema: Option<String>,
     pub name: String,
     pub kind: TableKind,
-    pub estimated_rows: Option<u64>,
-    pub size_bytes: Option<u64>,
+    pub estimated_rows: MetadataValue<u64>,
+    #[serde(flatten)]
+    pub metadata: ObjectMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewSummary {
+    pub database: Option<String>,
+    pub schema: Option<String>,
+    pub name: String,
+    pub kind: ViewKind,
+    #[serde(flatten)]
+    pub metadata: ObjectMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SequenceSummary {
+    pub database: Option<String>,
+    pub schema: Option<String>,
+    pub name: String,
+    pub data_type: MetadataValue<String>,
+    pub start_value: MetadataValue<String>,
+    pub increment: MetadataValue<String>,
+    #[serde(flatten)]
+    pub metadata: ObjectMetadata,
+}
+
+/// Counts for the object groups shown under one explorer node. Unsupported
+/// groups are `Unavailable`, not zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectCounts {
+    pub tables: MetadataValue<u64>,
+    pub views: MetadataValue<u64>,
+    pub materialized_views: MetadataValue<u64>,
+    pub sequences: MetadataValue<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +353,21 @@ pub trait DatabaseAdapter: Send + Sync {
         page: PageRequest,
     ) -> Result<Page<TableSummary>, DatabaseError>;
 
+    async fn list_views(
+        &self,
+        scope: &MetadataScope,
+        page: PageRequest,
+    ) -> Result<Page<ViewSummary>, DatabaseError>;
+
+    async fn list_sequences(
+        &self,
+        scope: &MetadataScope,
+        page: PageRequest,
+    ) -> Result<Page<SequenceSummary>, DatabaseError>;
+
+    /// Returns bounded object counts for one explorer node in a single query.
+    async fn object_counts(&self, scope: &MetadataScope) -> Result<ObjectCounts, DatabaseError>;
+
     async fn list_columns(
         &self,
         table: &TableRef,
@@ -297,6 +414,29 @@ mod tests {
         assert!(TableRef::new(None, None, "").is_err());
         assert!(TableRef::new(None, None, "app.users").is_err());
         assert!(MetadataScope::new(Some("app"), Some("bad\nschema")).is_err());
+    }
+
+    #[test]
+    fn metadata_values_distinguish_available_from_unsupported() {
+        let available = MetadataValue::available("utf8mb4".to_string());
+        let unavailable = MetadataValue::<String>::unavailable();
+
+        assert!(available.is_available());
+        assert_eq!(available.value().map(String::as_str), Some("utf8mb4"));
+        assert!(!unavailable.is_available());
+        assert_eq!(unavailable.value(), None);
+
+        let json = serde_json::to_string(&available).expect("available json");
+        assert_eq!(json, r#"{"status":"available","value":"utf8mb4"}"#);
+        let json = serde_json::to_string(&unavailable).expect("unavailable json");
+        assert_eq!(json, r#"{"status":"unavailable"}"#);
+
+        assert_eq!(
+            MetadataValue::from(Some(4_u64)),
+            MetadataValue::Available(4)
+        );
+        assert_eq!(MetadataValue::<u64>::from(None), MetadataValue::Unavailable);
+        assert_eq!(MetadataValue::<u64>::default(), MetadataValue::Unavailable);
     }
 
     #[test]

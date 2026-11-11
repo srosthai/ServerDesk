@@ -138,6 +138,22 @@ async fn live_postgres_connects_pings_reports_version_and_closes() {
             .all(|table| table.schema.as_deref() == Some("public"))
     );
 
+    let views = adapter
+        .list_views(&scope, PageRequest::new(50, 0))
+        .await
+        .expect("list views");
+    assert!(views.limit > 0);
+    let sequences = adapter
+        .list_sequences(&scope, PageRequest::new(50, 0))
+        .await
+        .expect("list sequences");
+    assert!(sequences.limit > 0);
+    let counts = adapter.object_counts(&scope).await.expect("object counts");
+    assert!(counts.tables.is_available());
+    assert!(counts.views.is_available());
+    assert!(counts.sequences.is_available());
+    assert!(counts.materialized_views.is_available());
+
     let other =
         MetadataScope::new(Some("serverdesk_other_database"), Some("public")).expect("scope");
     let error = adapter
