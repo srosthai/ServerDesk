@@ -5,5 +5,6 @@
 //! across the Tauri boundary.
 
 pub mod capabilities;
+pub mod discovery;
 pub mod profiles;
 pub mod tunnels;

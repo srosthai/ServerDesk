@@ -60,6 +60,13 @@ mod tests {
         assert!(sql::LIST_SCHEMAS.contains("pg_namespace"));
         assert!(sql::SET_READ_ONLY.contains("READ ONLY"));
         assert!(sql::SERVER_INFO.contains("current_database"));
+        assert!(sql::LIST_TABLES.contains("LIMIT $2 OFFSET $3"));
+        assert!(sql::LIST_TABLES.contains("pg_total_relation_size"));
+        assert!(sql::LIST_VIEWS.contains("MATERIALIZED VIEW"));
+        assert!(sql::LIST_VIEWS.contains("LIMIT $2 OFFSET $3"));
+        assert!(sql::LIST_SEQUENCES.contains("information_schema.sequences"));
+        assert!(sql::OBJECT_COUNTS.contains("sequence_count"));
+        assert!(!sql::OBJECT_COUNTS.contains('?'));
     }
 
     #[test]

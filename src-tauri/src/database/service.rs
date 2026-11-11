@@ -213,7 +213,9 @@ impl DatabaseConnectionRegistry {
         }
     }
 
-    async fn adapter(
+    /// Returns the live adapter for metadata services. The adapter lock is
+    /// held only for the duration of one bounded metadata operation.
+    pub(crate) async fn adapter(
         &self,
         profile_id: &str,
     ) -> Result<Arc<Mutex<Box<dyn DatabaseAdapter>>>, AppError> {

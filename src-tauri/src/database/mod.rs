@@ -7,6 +7,7 @@
 
 pub mod capabilities;
 pub mod dialect;
+pub mod discovery;
 pub mod errors;
 pub mod fake;
 pub mod mysql;
@@ -23,6 +24,9 @@ pub use dialect::{
     Identifier, IdentifierQuoter, MAX_BIND_PARAMETERS, MAX_IDENTIFIER_LENGTH, ParameterizedQuery,
     QualifiedName, SqlDialect, SqlValue, ValueParameterizer,
 };
+pub use discovery::{
+    DatabaseDiscoveryService, ExplorerNode, ExplorerNodeKind, ExplorerNodePayload,
+};
 pub use errors::{DatabaseError, DatabaseErrorKind};
 pub use fake::FakeDatabaseAdapter;
 pub use mysql::MysqlDatabaseAdapter;
@@ -34,7 +38,8 @@ pub use service::{DEFAULT_DATABASE_CONNECT_TIMEOUT, DatabaseConnectionRegistry};
 pub use traits::{
     ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter, DatabaseConnectRequest,
     DatabaseConnectionInfo, DatabasePassword, DatabasePing, DatabaseSummary, DatabaseVersionInfo,
-    IndexSummary, MetadataScope, SchemaSummary, TableKind, TableRef, TableSummary,
+    IndexSummary, MetadataScope, MetadataValue, ObjectCounts, ObjectMetadata, SchemaSummary,
+    SequenceSummary, TableKind, TableRef, TableSummary, ViewKind, ViewSummary,
 };
 
 use crate::storage::DatabaseEngine;

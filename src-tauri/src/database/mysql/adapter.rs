@@ -34,7 +34,8 @@ use crate::database::{
     traits::{
         ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter, DatabaseConnectRequest,
         DatabaseConnectionInfo, DatabasePing, DatabaseSummary, DatabaseVersionInfo, IndexSummary,
-        MetadataScope, SchemaSummary, TableKind, TableRef, TableSummary,
+        MetadataScope, MetadataValue, ObjectCounts, ObjectMetadata, SchemaSummary, SequenceSummary,
+        TableKind, TableRef, TableSummary, ViewKind, ViewSummary,
     },
     validation::validate_connect_request,
 };
@@ -323,10 +324,9 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
         self.require_capability(DatabaseAction::BrowseDatabases)?;
         let mut guard = self.live_connection().await?;
         let connection = guard.as_mut().expect("checked above");
-        let statement = format!("{} LIMIT ? OFFSET ?", sql::LIST_DATABASES);
         let rows = timeout_at(
             tokio::time::Instant::now() + self.operation_timeout,
-            sqlx::query(sqlx::AssertSqlSafe(statement))
+            sqlx::query(sql::LIST_DATABASES)
                 .bind(i64::from(page.limit) + 1)
                 .bind(i64::try_from(page.offset).unwrap_or(i64::MAX))
                 .fetch_all(&mut *connection),
@@ -342,10 +342,7 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
                 Ok(DatabaseSummary {
                     system: is_system_database(&name),
                     name,
-                    owner: None,
-                    encoding: decode(row, "encoding")?,
-                    collation: decode(row, "collation")?,
-                    size_bytes: None,
+                    metadata: schema_metadata(row)?,
                 })
             })
             .collect::<Result<Vec<_>, DatabaseError>>()?;
@@ -357,10 +354,9 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
         self.require_capability(DatabaseAction::BrowseSchemas)?;
         let mut guard = self.live_connection().await?;
         let connection = guard.as_mut().expect("checked above");
-        let statement = format!("{} LIMIT ? OFFSET ?", sql::LIST_SCHEMAS);
         let rows = timeout_at(
             tokio::time::Instant::now() + self.operation_timeout,
-            sqlx::query(sqlx::AssertSqlSafe(statement))
+            sqlx::query(sql::LIST_SCHEMAS)
                 .bind(i64::from(page.limit) + 1)
                 .bind(i64::try_from(page.offset).unwrap_or(i64::MAX))
                 .fetch_all(&mut *connection),
@@ -376,7 +372,7 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
                 Ok(SchemaSummary {
                     system: is_system_database(&name),
                     name,
-                    owner: None,
+                    metadata: schema_metadata(row)?,
                 })
             })
             .collect::<Result<Vec<_>, DatabaseError>>()?;
@@ -393,10 +389,9 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
         let database = Self::scope_name(scope)?;
         let mut guard = self.live_connection().await?;
         let connection = guard.as_mut().expect("checked above");
-        let statement = format!("{} LIMIT ? OFFSET ?", sql::LIST_TABLES);
         let rows = timeout_at(
             tokio::time::Instant::now() + self.operation_timeout,
-            sqlx::query(sqlx::AssertSqlSafe(statement))
+            sqlx::query(sql::LIST_TABLES)
                 .bind(database.as_deref())
                 .bind(database.as_deref())
                 .bind(i64::from(page.limit) + 1)
@@ -417,13 +412,94 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
                     schema: Some(database),
                     name: decode(row, "name")?,
                     kind: table_kind(&table_type),
-                    estimated_rows: decode(row, "estimated_rows")?,
-                    size_bytes: decode(row, "size_bytes")?,
+                    estimated_rows: decode::<Option<u64>>(row, "estimated_rows")?.into(),
+                    metadata: ObjectMetadata {
+                        size_bytes: decode::<Option<u64>>(row, "size_bytes")?.into(),
+                        engine: decode::<Option<String>>(row, "engine")?.into(),
+                        ..ObjectMetadata::default()
+                    },
                 })
             })
             .collect::<Result<Vec<_>, DatabaseError>>()?;
 
         Ok(Page::from_items(tables, page, None))
+    }
+
+    async fn list_views(
+        &self,
+        scope: &MetadataScope,
+        page: PageRequest,
+    ) -> Result<Page<ViewSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseViews)?;
+        let database = Self::scope_name(scope)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::LIST_VIEWS)
+                .bind(database.as_deref())
+                .bind(database.as_deref())
+                .bind(i64::from(page.limit) + 1)
+                .bind(i64::try_from(page.offset).unwrap_or(i64::MAX))
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+
+        let views = rows
+            .iter()
+            .map(|row| {
+                let database: String = decode(row, "database_name")?;
+                Ok(ViewSummary {
+                    database: Some(database.clone()),
+                    schema: Some(database),
+                    name: decode(row, "name")?,
+                    kind: ViewKind::View,
+                    metadata: ObjectMetadata {
+                        owner: decode::<Option<String>>(row, "owner")?.into(),
+                        ..ObjectMetadata::default()
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+
+        Ok(Page::from_items(views, page, None))
+    }
+
+    async fn list_sequences(
+        &self,
+        _scope: &MetadataScope,
+        _page: PageRequest,
+    ) -> Result<Page<SequenceSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseSequences)?;
+        Err(DatabaseError::capability(
+            "MySQL does not expose sequences.",
+        ))
+    }
+
+    async fn object_counts(&self, scope: &MetadataScope) -> Result<ObjectCounts, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseTables)?;
+        let database = Self::scope_name(scope)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let row = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::OBJECT_COUNTS)
+                .bind(database.as_deref())
+                .bind(database.as_deref())
+                .fetch_one(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+
+        Ok(ObjectCounts {
+            tables: MetadataValue::available(decode::<u64>(&row, "table_count")?),
+            views: MetadataValue::available(decode::<u64>(&row, "view_count")?),
+            materialized_views: MetadataValue::Unavailable,
+            sequences: MetadataValue::Unavailable,
+        })
     }
 
     async fn list_columns(
@@ -609,6 +685,15 @@ fn ssl_mode(request: &DatabaseConnectRequest) -> Result<MySqlSslMode, DatabaseEr
             "The configured database SSL mode is not supported.",
         )),
     }
+}
+
+fn schema_metadata(row: &MySqlRow) -> Result<ObjectMetadata, DatabaseError> {
+    Ok(ObjectMetadata {
+        encoding: decode::<Option<String>>(row, "encoding")?.into(),
+        collation: decode::<Option<String>>(row, "collation")?.into(),
+        size_bytes: decode::<Option<u64>>(row, "size_bytes")?.into(),
+        ..ObjectMetadata::default()
+    })
 }
 
 fn is_system_database(name: &str) -> bool {
@@ -987,6 +1072,14 @@ mod tests {
             .await
             .expect("create probe table");
 
+        adapter
+            .execute_for_test(
+                "CREATE OR REPLACE VIEW serverdesk_probe_view AS \
+                 SELECT id, email FROM serverdesk_writable_probe",
+            )
+            .await
+            .expect("create probe view");
+
         let scope = MetadataScope::new(Some(&fixture.database), None).expect("scope");
         let tables = adapter
             .list_tables(&scope, PageRequest::new(500, 0))
@@ -998,6 +1091,43 @@ mod tests {
                 .iter()
                 .any(|table| table.name == "serverdesk_writable_probe")
         );
+        let probe = tables
+            .items
+            .iter()
+            .find(|table| table.name == "serverdesk_writable_probe")
+            .expect("probe table metadata");
+        assert!(probe.metadata.engine.is_available());
+        assert!(probe.metadata.size_bytes.is_available());
+        assert!(!probe.metadata.owner.is_available());
+
+        let views = adapter
+            .list_views(&scope, PageRequest::new(500, 0))
+            .await
+            .expect("list views");
+        assert!(
+            views
+                .items
+                .iter()
+                .any(|view| view.name == "serverdesk_probe_view")
+        );
+        let counts = adapter.object_counts(&scope).await.expect("object counts");
+        assert!(counts.tables.value().is_some_and(|value| *value >= 1));
+        assert!(counts.views.value().is_some_and(|value| *value >= 1));
+        assert_eq!(counts.sequences, MetadataValue::Unavailable);
+
+        let databases = adapter
+            .list_databases(PageRequest::new(500, 0))
+            .await
+            .expect("list databases");
+        let database = databases
+            .items
+            .iter()
+            .find(|database| database.name == fixture.database)
+            .expect("fixture database");
+        assert!(database.metadata.encoding.is_available());
+        assert!(database.metadata.collation.is_available());
+        assert!(database.metadata.size_bytes.is_available());
+        assert!(!database.metadata.owner.is_available());
 
         let table = TableRef::new(Some(&fixture.database), None, "serverdesk_writable_probe")
             .expect("table ref");
@@ -1027,6 +1157,10 @@ mod tests {
                 .any(|constraint| constraint.kind == ConstraintKind::PrimaryKey)
         );
 
+        adapter
+            .execute_for_test("DROP VIEW serverdesk_probe_view")
+            .await
+            .expect("drop probe view");
         adapter
             .execute_for_test("DROP TABLE serverdesk_writable_probe")
             .await
