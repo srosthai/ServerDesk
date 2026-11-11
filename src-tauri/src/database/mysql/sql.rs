@@ -17,7 +17,7 @@ pub const LIST_SCHEMAS: &str = "SELECT SCHEMA_NAME AS name FROM information_sche
 
 pub const LIST_TABLES: &str = "SELECT TABLE_SCHEMA AS database_name, TABLE_NAME AS name, \
     TABLE_TYPE AS table_type, TABLE_ROWS AS estimated_rows, \
-    COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0) AS size_bytes \
+    CAST(COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0) AS UNSIGNED) AS size_bytes \
     FROM information_schema.TABLES \
     WHERE (? IS NULL OR TABLE_SCHEMA = ?) \
     ORDER BY TABLE_SCHEMA, TABLE_NAME";
@@ -30,7 +30,7 @@ pub const LIST_VIEWS: &str = "SELECT TABLE_SCHEMA AS database_name, TABLE_NAME A
 pub const LIST_COLUMNS: &str = "SELECT COLUMN_NAME AS name, COLUMN_TYPE AS data_type, \
     IS_NULLABLE = 'YES' AS nullable, COLUMN_DEFAULT AS default_value, \
     ORDINAL_POSITION AS ordinal_position, COLUMN_KEY = 'PRI' AS primary_key, \
-    EXTRA LIKE '%GENERATED%' AS generated, COLUMN_COMMENT AS comment \
+    EXTRA LIKE '%GENERATED%' AS `generated`, COLUMN_COMMENT AS comment \
     FROM information_schema.COLUMNS \
     WHERE (? IS NULL OR TABLE_SCHEMA = ?) \
     AND (? IS NULL OR TABLE_NAME = ?) \
@@ -44,12 +44,25 @@ pub const LIST_INDEXES: &str = "SELECT INDEX_NAME AS name, COLUMN_NAME AS column
     AND (? IS NULL OR TABLE_NAME = ?) \
     ORDER BY INDEX_NAME, SEQ_IN_INDEX";
 
-pub const LIST_CONSTRAINTS: &str = "SELECT CONSTRAINT_NAME AS name, CONSTRAINT_TYPE AS kind, \
-    TABLE_SCHEMA AS database_name, TABLE_NAME AS table_name \
-    FROM information_schema.TABLE_CONSTRAINTS \
-    WHERE (? IS NULL OR TABLE_SCHEMA = ?) \
-    AND (? IS NULL OR TABLE_NAME = ?) \
-    ORDER BY CONSTRAINT_NAME";
+pub const LIST_CONSTRAINTS: &str = "SELECT tc.CONSTRAINT_NAME AS name, \
+    tc.CONSTRAINT_TYPE AS kind, tc.TABLE_SCHEMA AS database_name, \
+    tc.TABLE_NAME AS table_name, kcu.COLUMN_NAME AS column_name, \
+    kcu.REFERENCED_TABLE_NAME AS referenced_table, \
+    kcu.REFERENCED_COLUMN_NAME AS referenced_column, \
+    rc.UPDATE_RULE AS on_update, rc.DELETE_RULE AS on_delete \
+    FROM information_schema.TABLE_CONSTRAINTS tc \
+    LEFT JOIN information_schema.KEY_COLUMN_USAGE kcu \
+    ON kcu.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA \
+    AND kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME \
+    AND kcu.TABLE_SCHEMA = tc.TABLE_SCHEMA \
+    AND kcu.TABLE_NAME = tc.TABLE_NAME \
+    LEFT JOIN information_schema.REFERENTIAL_CONSTRAINTS rc \
+    ON rc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA \
+    AND rc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME \
+    AND rc.TABLE_NAME = tc.TABLE_NAME \
+    WHERE (? IS NULL OR tc.TABLE_SCHEMA = ?) \
+    AND (? IS NULL OR tc.TABLE_NAME = ?) \
+    ORDER BY tc.TABLE_SCHEMA, tc.TABLE_NAME, tc.CONSTRAINT_NAME, kcu.ORDINAL_POSITION";
 
 pub const LIST_ROUTINES: &str = "SELECT ROUTINE_SCHEMA AS database_name, ROUTINE_NAME AS name, \
     ROUTINE_TYPE AS routine_type \
