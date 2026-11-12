@@ -64,6 +64,7 @@ const categoryLabels: Record<OperationCategory, string> = {
   artisan: "Artisan",
   sftp: "SFTP",
   queue: "Queue",
+  database: "Database",
 };
 
 const resultLabels: Record<OperationResult, string> = {

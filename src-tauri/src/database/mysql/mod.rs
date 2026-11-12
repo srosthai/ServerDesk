@@ -13,6 +13,7 @@ use super::{
     errors::DatabaseError,
 };
 
+pub mod actions;
 pub mod adapter;
 pub mod capabilities;
 pub mod sql;

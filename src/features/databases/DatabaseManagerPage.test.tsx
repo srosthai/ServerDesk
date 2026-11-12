@@ -5,6 +5,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DatabaseManagerPage } from "@/features/databases/DatabaseManagerPage";
 import { DEFAULT_PREFERENCES } from "@/lib/preferences";
 import { getConnectionState } from "@/services/connections";
+import { previewDatabaseAction, dropDatabase, setActiveDatabase } from "@/services/databaseActions";
+import { refreshExplorerNode } from "@/services/databaseDiscovery";
 import {
   connectDatabaseProfile,
   deleteDatabaseProfile,
@@ -24,6 +26,7 @@ import type {
   DatabaseConnectionSnapshot,
   DatabaseExplorerNodePayload,
   DatabaseProfile,
+  DatabaseSummary,
   DatabaseTestResult,
   ServerProfile,
 } from "@/types/contracts";
@@ -47,6 +50,26 @@ vi.mock("@/services/connections", () => ({
   disconnectServer: vi.fn(),
   getConnectionState: vi.fn(),
   testServerConnection: vi.fn(),
+}));
+
+vi.mock("@/services/databaseActions", () => ({
+  previewDatabaseAction: vi.fn(),
+  createDatabase: vi.fn(),
+  renameDatabase: vi.fn(),
+  dropDatabase: vi.fn(),
+  setActiveDatabase: vi.fn(),
+  runDatabaseAction: vi.fn(),
+}));
+
+vi.mock("@/services/databaseDiscovery", () => ({
+  listDatabases: vi.fn(),
+  listSchemas: vi.fn(),
+  listTables: vi.fn(),
+  listViews: vi.fn(),
+  listSequences: vi.fn(),
+  getObjectCounts: vi.fn(),
+  loadExplorerNode: vi.fn(),
+  refreshExplorerNode: vi.fn(),
 }));
 
 const server: ServerProfile = {
@@ -148,6 +171,46 @@ const disconnectedSnapshot: DatabaseConnectionSnapshot = {
   changedAt: 12,
 };
 
+function databaseSummary(name: string): DatabaseSummary {
+  return {
+    name,
+    system: false,
+    owner: { status: "available", value: "app" },
+    encoding: { status: "available", value: "UTF8" },
+    collation: { status: "available", value: "C.UTF-8" },
+    sizeBytes: { status: "available", value: 8_192 },
+    engine: { status: "unavailable" },
+  };
+}
+
+const databasesPayload: DatabaseExplorerNodePayload = {
+  nodeKind: "databases",
+  payload: {
+    items: [databaseSummary("app"), databaseSummary("analytics")],
+    limit: 100,
+    offset: 0,
+    hasMore: false,
+    total: 2,
+  },
+};
+
+const actionResult = (
+  action: "create" | "rename" | "drop" | "set_active",
+  database: string,
+): import("@/types/contracts").DatabaseActionResult => ({
+  action,
+  engine: "postgresql",
+  database,
+  previousName: action === "rename" ? "app" : null,
+  statements: [],
+  verified: true,
+  verification: `Metadata re-read confirms database ${database}.`,
+  verificationError: null,
+  metadata: databaseSummary(database),
+  activeDatabase: action === "set_active" ? database : null,
+  durationMs: 4,
+});
+
 const testResult: DatabaseTestResult = {
   profileId: profile.id,
   serverId: server.id,
@@ -200,6 +263,20 @@ function useProfileStore(
   });
 }
 
+function useLoadedDatabases() {
+  useDatabaseExplorerStore.setState({
+    nodes: {
+      [databaseExplorerNodeKey(profile.id, { kind: "databases" })]: {
+        status: "ready",
+        payload: databasesPayload,
+        updatedAt: 1,
+      },
+    },
+    error: null,
+    commandError: null,
+  });
+}
+
 describe("DatabaseManagerPage", () => {
   beforeEach(() => {
     enableTauriRuntime();
@@ -237,6 +314,24 @@ describe("DatabaseManagerPage", () => {
     vi.mocked(disconnectDatabaseProfile).mockResolvedValue(disconnectedSnapshot);
     vi.mocked(testDatabaseProfile).mockResolvedValue(testResult);
     vi.mocked(deleteDatabaseProfile).mockResolvedValue(undefined);
+    vi.mocked(previewDatabaseAction).mockReset();
+    vi.mocked(previewDatabaseAction).mockResolvedValue({
+      action: "drop",
+      engine: "postgresql",
+      database: "analytics",
+      targetDatabase: null,
+      statements: ['DROP DATABASE "analytics"'],
+      ddl: 'DROP DATABASE "analytics"',
+      warnings: ["Dropping a database permanently removes every table, view, and row inside it."],
+      destructive: true,
+      requiresConfirmation: true,
+    });
+    vi.mocked(dropDatabase).mockReset();
+    vi.mocked(dropDatabase).mockResolvedValue(actionResult("drop", "analytics"));
+    vi.mocked(setActiveDatabase).mockReset();
+    vi.mocked(setActiveDatabase).mockResolvedValue(actionResult("set_active", "analytics"));
+    vi.mocked(refreshExplorerNode).mockReset();
+    vi.mocked(refreshExplorerNode).mockResolvedValue(databasesPayload);
   });
 
   it("renders the connection list with engine, server, endpoint, status, and runtime details", async () => {
@@ -483,6 +578,135 @@ describe("DatabaseManagerPage", () => {
     const context = screen.getByLabelText("Selected database and schema");
     expect(within(context).getByText("app")).toBeInTheDocument();
     expect(within(context).getByText("public")).toBeInTheDocument();
+  });
+
+  it("sets the active database and refreshes the explorer context", async () => {
+    const user = userEvent.setup();
+    useConnectedServer();
+    useProfileStore();
+    useLoadedDatabases();
+    renderPage();
+
+    await user.click(screen.getByRole("treeitem", { name: /^Primary/ }));
+    await user.click(await screen.findByRole("button", { name: "Set analytics active" }));
+
+    await waitFor(() => {
+      expect(setActiveDatabase).toHaveBeenCalledWith(profile.id, "analytics");
+    });
+    expect(
+      await screen.findByText("Metadata re-read confirms database analytics."),
+    ).toBeInTheDocument();
+    expect(refreshExplorerNode).toHaveBeenCalledWith(profile.id, { kind: "databases" }, undefined);
+    const context = screen.getByLabelText("Selected database and schema");
+    expect(within(context).getByText("analytics")).toBeInTheDocument();
+  });
+
+  it("previews DDL and requires confirmation before dropping a database", async () => {
+    const user = userEvent.setup();
+    useConnectedServer();
+    vi.mocked(getDatabaseConnectionState).mockResolvedValue({
+      ...connectedSnapshot,
+      readOnly: false,
+    });
+    useProfileStore({
+      profiles: { [server.id]: [{ ...profile, readOnly: false }] },
+      snapshots: { [profile.id]: { ...connectedSnapshot, readOnly: false } },
+    });
+    useLoadedDatabases();
+    renderPage();
+
+    await user.click(screen.getByRole("treeitem", { name: /^Primary/ }));
+    await user.click(await screen.findByRole("button", { name: "Drop analytics" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Drop database analytics?" });
+    expect(within(dialog).getByText("Production (198.51.100.24)")).toBeInTheDocument();
+    expect(within(dialog).getByText("PostgreSQL")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("DROP DATABASE analytics (permanent deletion)"),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText('DROP DATABASE "analytics"')).toBeInTheDocument();
+    expect(dropDatabase).not.toHaveBeenCalled();
+
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(dropDatabase).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("dialog", { name: "Drop database analytics?" }),
+    ).not.toBeInTheDocument();
+
+    await user.click(await screen.findByRole("button", { name: "Drop analytics" }));
+    const confirmDialog = await screen.findByRole("dialog", {
+      name: "Drop database analytics?",
+    });
+    await user.click(within(confirmDialog).getByRole("button", { name: "Drop database" }));
+
+    await waitFor(() => {
+      expect(dropDatabase).toHaveBeenCalledWith(profile.id, "analytics");
+    });
+    expect(
+      await screen.findByText("Metadata re-read confirms database analytics."),
+    ).toBeInTheDocument();
+  });
+
+  it("explains that MySQL rename is unavailable", async () => {
+    const user = userEvent.setup();
+    const mysqlProfile: DatabaseProfile = {
+      ...profile,
+      engine: "mysql",
+      port: 3306,
+      databaseName: "app",
+      readOnly: false,
+    };
+    const mysqlCapabilities: DatabaseCapabilities = {
+      ...capabilities,
+      engine: "mysql",
+      flags: { ...capabilities.flags, databaseRename: false, schemas: false, sequences: false },
+    };
+    useConnectedServer();
+    vi.mocked(getDatabaseConnectionState).mockResolvedValue({
+      ...connectedSnapshot,
+      engine: "mysql",
+      readOnly: false,
+      capabilities: mysqlCapabilities,
+    });
+    useProfileStore({
+      profiles: { [server.id]: [mysqlProfile] },
+      snapshots: {
+        [mysqlProfile.id]: {
+          ...connectedSnapshot,
+          engine: "mysql",
+          readOnly: false,
+          capabilities: mysqlCapabilities,
+          databaseName: "app",
+        },
+      },
+    });
+    useDatabaseExplorerStore.setState({
+      nodes: {
+        [databaseExplorerNodeKey(mysqlProfile.id, { kind: "databases" })]: {
+          status: "ready",
+          payload: databasesPayload,
+          updatedAt: 1,
+        },
+      },
+      error: null,
+      commandError: null,
+    });
+    renderPage();
+
+    await user.click(screen.getByRole("treeitem", { name: /^Primary/ }));
+    await user.click(await screen.findByRole("treeitem", { name: /^app/ }));
+
+    const rename = await screen.findByRole("button", { name: "Rename app" });
+    expect(rename).toBeDisabled();
+    expect(rename).toHaveAttribute(
+      "title",
+      expect.stringContaining("MySQL does not support renaming a database safely"),
+    );
+    expect(
+      screen.getByText(
+        "MySQL does not support renaming a database safely. Create a new database and migrate its data instead.",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("shows a loading placeholder while server profiles load", () => {

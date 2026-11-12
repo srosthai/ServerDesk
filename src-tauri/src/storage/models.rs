@@ -123,15 +123,17 @@ pub enum OperationCategory {
     Artisan,
     Sftp,
     Queue,
+    Database,
 }
 
 impl OperationCategory {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Command,
         Self::Service,
         Self::Artisan,
         Self::Sftp,
         Self::Queue,
+        Self::Database,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -141,6 +143,7 @@ impl OperationCategory {
             Self::Artisan => "artisan",
             Self::Sftp => "sftp",
             Self::Queue => "queue",
+            Self::Database => "database",
         }
     }
 

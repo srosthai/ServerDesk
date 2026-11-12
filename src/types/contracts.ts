@@ -283,6 +283,7 @@ export type DatabaseAction =
   | "create_database"
   | "rename_database"
   | "drop_database"
+  | "set_active_database"
   | "create_schema"
   | "drop_schema"
   | "create_table"
@@ -482,9 +483,50 @@ export type DatabaseExplorerNodePayload =
   | { nodeKind: "sequences"; payload: DatabasePage<DatabaseSequenceSummary> }
   | { nodeKind: "objectCounts"; payload: DatabaseObjectCounts };
 
+export type DatabaseActionKind = "create" | "rename" | "drop" | "set_active";
+
+export type DatabaseActionRequest =
+  | {
+      kind: "create";
+      name: string;
+      encoding?: string | null;
+      collation?: string | null;
+      owner?: string | null;
+      template?: string | null;
+    }
+  | { kind: "rename"; name: string; newName: string }
+  | { kind: "drop"; name: string }
+  | { kind: "set_active"; name: string };
+
+export type DatabaseDdlPreview = {
+  action: DatabaseActionKind;
+  engine: DatabaseEngine;
+  database: string;
+  targetDatabase?: string | null;
+  statements: string[];
+  ddl: string;
+  warnings: string[];
+  destructive: boolean;
+  requiresConfirmation: boolean;
+};
+
+export type DatabaseActionResult = {
+  action: DatabaseActionKind;
+  engine: DatabaseEngine;
+  database: string;
+  previousName?: string | null;
+  statements: string[];
+  verified: boolean;
+  verification: string;
+  verificationError?: string | null;
+  metadata?: DatabaseSummary | null;
+  activeDatabase?: string | null;
+  durationMs: number;
+};
+
 export type ProjectType = "laravel";
 
-export type OperationCategory = "command" | "service" | "artisan" | "sftp" | "queue";
+export type OperationCategory = "command" | "service" | "artisan" | "sftp" | "queue" | "database";
 
 export type OperationResult = "success" | "failure" | "cancelled" | "unknown";
 

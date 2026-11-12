@@ -25,6 +25,17 @@ WHERE datallowconn
 ORDER BY datname
 LIMIT $1 OFFSET $2"#;
 
+pub const DATABASE_SUMMARY: &str = r#"SELECT datname AS name,
+    pg_catalog.pg_get_userbyid(datdba) AS owner,
+    pg_catalog.pg_encoding_to_char(encoding) AS encoding,
+    datcollate AS collation,
+    CASE WHEN pg_catalog.has_database_privilege(datname, 'CONNECT')
+         THEN pg_catalog.pg_database_size(datname)
+    END AS size_bytes
+FROM pg_catalog.pg_database
+WHERE datname = $1
+LIMIT 1"#;
+
 pub const LIST_SCHEMAS: &str = r#"SELECT nspname AS name,
     pg_catalog.pg_get_userbyid(nspowner) AS owner,
     (nspname IN ('information_schema', 'pg_catalog')

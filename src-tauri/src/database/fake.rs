@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use crate::storage::DatabaseEngine;
 
 use super::{
+    actions::{DatabaseDdlPreview, ValidatedDatabaseAction},
     capabilities::{DatabaseAction, DatabaseCapabilities, DatabaseVersion},
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
@@ -38,6 +39,8 @@ pub struct FakeDatabaseAdapter {
     ping_count: AtomicUsize,
     close_count: AtomicUsize,
     connect_error: Option<DatabaseError>,
+    read_only: bool,
+    active_database: Option<String>,
     databases: Vec<DatabaseSummary>,
     schemas: Vec<SchemaSummary>,
     tables: Vec<TableSummary>,
@@ -81,6 +84,8 @@ impl FakeDatabaseAdapter {
             ping_count: AtomicUsize::new(0),
             close_count: AtomicUsize::new(0),
             connect_error: None,
+            read_only: false,
+            active_database: None,
             databases: fixtures.databases,
             schemas: fixtures.schemas,
             tables: fixtures.tables,
@@ -111,12 +116,19 @@ impl FakeDatabaseAdapter {
         self.close_count.load(Ordering::SeqCst)
     }
 
+    pub fn active_database(&self) -> Option<&str> {
+        self.active_database.as_deref()
+    }
+
     fn connection_info(&self, request: &DatabaseConnectRequest) -> DatabaseConnectionInfo {
         DatabaseConnectionInfo {
             engine: self.engine,
             version: self.version.clone(),
-            database: request.database.clone(),
-            read_only: request.read_only,
+            database: self
+                .active_database
+                .clone()
+                .or_else(|| request.database.clone()),
+            read_only: self.read_only,
             capabilities: self.capabilities.snapshot(),
         }
     }
@@ -186,6 +198,8 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
         }
 
         self.connected.store(true, Ordering::SeqCst);
+        self.read_only = request.read_only;
+        self.active_database = request.database.clone();
         Ok(self.connection_info(&request))
     }
 
@@ -206,7 +220,13 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
     async fn close(&mut self) -> Result<(), DatabaseError> {
         self.close_count.fetch_add(1, Ordering::SeqCst);
         self.connected.store(false, Ordering::SeqCst);
+        self.read_only = false;
+        self.active_database = None;
         Ok(())
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     async fn list_databases(
@@ -216,6 +236,134 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
         self.require_capability(DatabaseAction::BrowseDatabases)?;
         self.require_connection()?;
         Ok(Self::paginate(&self.databases, page))
+    }
+
+    async fn database_summary(
+        &self,
+        database: &Identifier,
+    ) -> Result<Option<DatabaseSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseDatabases)?;
+        self.require_connection()?;
+        Ok(self
+            .databases
+            .iter()
+            .find(|summary| summary.name == database.as_str())
+            .cloned())
+    }
+
+    async fn preview_database_action(
+        &self,
+        action: &ValidatedDatabaseAction,
+    ) -> Result<DatabaseDdlPreview, DatabaseError> {
+        self.require_connection()?;
+        if matches!(action, ValidatedDatabaseAction::Rename { .. })
+            && self.engine == DatabaseEngine::Mysql
+        {
+            return mysql::actions::preview(action);
+        }
+        self.require_capability(action.capability())?;
+        if let ValidatedDatabaseAction::Rename { name, .. } | ValidatedDatabaseAction::Drop { name } =
+            action
+            && self.active_database.as_deref() == Some(name.as_str())
+        {
+            return Err(DatabaseError::validation(
+                "The active database cannot be renamed or dropped. Set another database active \
+                 first.",
+            ));
+        }
+        match self.engine {
+            DatabaseEngine::Mysql => mysql::actions::preview(action),
+            DatabaseEngine::Postgresql => postgres::actions::preview(action),
+        }
+    }
+
+    async fn execute_database_action(
+        &mut self,
+        action: &ValidatedDatabaseAction,
+    ) -> Result<Option<DatabaseConnectionInfo>, DatabaseError> {
+        self.require_connection()?;
+        self.preview_database_action(action).await?;
+
+        match action {
+            ValidatedDatabaseAction::Create(options) => {
+                let summary = match self.engine {
+                    DatabaseEngine::Mysql => DatabaseSummary {
+                        name: options.name.as_str().to_string(),
+                        system: false,
+                        metadata: ObjectMetadata {
+                            encoding: MetadataValue::available(
+                                options
+                                    .encoding
+                                    .clone()
+                                    .unwrap_or_else(|| "utf8mb4".to_string()),
+                            ),
+                            collation: MetadataValue::available(
+                                options
+                                    .collation
+                                    .clone()
+                                    .unwrap_or_else(|| "utf8mb4_unicode_ci".to_string()),
+                            ),
+                            size_bytes: MetadataValue::available(0),
+                            ..ObjectMetadata::default()
+                        },
+                    },
+                    DatabaseEngine::Postgresql => DatabaseSummary {
+                        name: options.name.as_str().to_string(),
+                        system: false,
+                        metadata: ObjectMetadata {
+                            owner: MetadataValue::available(
+                                options
+                                    .owner
+                                    .as_ref()
+                                    .map(|owner| owner.as_str().to_string())
+                                    .unwrap_or_else(|| "app".to_string()),
+                            ),
+                            encoding: MetadataValue::available(
+                                options
+                                    .encoding
+                                    .clone()
+                                    .unwrap_or_else(|| "UTF8".to_string()),
+                            ),
+                            collation: MetadataValue::available(
+                                options
+                                    .collation
+                                    .clone()
+                                    .unwrap_or_else(|| "C.UTF-8".to_string()),
+                            ),
+                            size_bytes: MetadataValue::available(0),
+                            ..ObjectMetadata::default()
+                        },
+                    },
+                };
+                self.databases.push(summary);
+                Ok(None)
+            }
+            ValidatedDatabaseAction::Rename { name, new_name } => {
+                if let Some(summary) = self
+                    .databases
+                    .iter_mut()
+                    .find(|summary| summary.name == name.as_str())
+                {
+                    summary.name = new_name.as_str().to_string();
+                }
+                Ok(None)
+            }
+            ValidatedDatabaseAction::Drop { name } => {
+                self.databases
+                    .retain(|summary| summary.name != name.as_str());
+                Ok(None)
+            }
+            ValidatedDatabaseAction::SetActive { name } => {
+                self.active_database = Some(name.as_str().to_string());
+                Ok(Some(DatabaseConnectionInfo {
+                    engine: self.engine,
+                    version: self.version.clone(),
+                    database: self.active_database.clone(),
+                    read_only: self.read_only,
+                    capabilities: self.capabilities.snapshot(),
+                }))
+            }
+        }
     }
 
     async fn list_schemas(&self, page: PageRequest) -> Result<Page<SchemaSummary>, DatabaseError> {

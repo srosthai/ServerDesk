@@ -21,7 +21,7 @@ fn server_input(name: &str) -> NewServer {
 fn initializes_schema_at_current_version() {
     let database = Database::in_memory().expect("in-memory database");
 
-    assert_eq!(database.schema_version().expect("schema version"), 5);
+    assert_eq!(database.schema_version().expect("schema version"), 6);
     assert!(database.list_servers().expect("server list").is_empty());
 }
 

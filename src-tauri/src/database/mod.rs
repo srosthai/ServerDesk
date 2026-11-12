@@ -5,6 +5,7 @@
 //! types; React receives only serialized metadata, capability snapshots, and
 //! stable error kinds.
 
+pub mod actions;
 pub mod capabilities;
 pub mod dialect;
 pub mod discovery;
@@ -17,6 +18,11 @@ pub mod service;
 pub mod traits;
 pub mod validation;
 
+pub use actions::{
+    DatabaseActionKind, DatabaseActionRequest, DatabaseActionResult, DatabaseActionService,
+    DatabaseDdlPreview, MAX_DATABASE_OPTION_LENGTH, ValidatedCreateDatabase,
+    ValidatedDatabaseAction, execute_with_adapter, preview_with_adapter,
+};
 pub use capabilities::{
     CapabilityFlags, CapabilitySnapshot, DatabaseAction, DatabaseCapabilities, DatabaseVersion,
 };
