@@ -1,9 +1,11 @@
 import { useEffect } from "react";
-import { useLocation } from "react-router-dom";
-import { ListIcon, SidebarSimpleIcon } from "@phosphor-icons/react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { ArrowCircleUpIcon, ListIcon, SidebarSimpleIcon } from "@phosphor-icons/react";
 import { allNavItems, navGroups } from "@/app/navigation";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { useActiveServer } from "@/hooks/useActiveServer";
+import { formatVersionLabel } from "@/lib/updates";
+import { useUpdateStore } from "@/stores/updateStore";
 
 type TopbarProps = {
   sidebarCollapsed: boolean;
@@ -13,6 +15,11 @@ type TopbarProps = {
 
 function Topbar({ sidebarCollapsed, onOpenNavigation, onToggleSidebar }: TopbarProps) {
   const location = useLocation();
+  const navigate = useNavigate();
+  const updateStatus = useUpdateStore((state) => state.status);
+  const availableVersion = useUpdateStore((state) =>
+    state.status === "available" && state.available ? state.available.version : null,
+  );
   const current = allNavItems.find(
     (item) =>
       location.pathname === item.to || (!item.end && location.pathname.startsWith(`${item.to}/`)),
@@ -58,6 +65,21 @@ function Topbar({ sidebarCollapsed, onOpenNavigation, onToggleSidebar }: TopbarP
       </div>
 
       <div className="flex min-w-0 shrink-0 items-center gap-2">
+        {availableVersion ? (
+          <button
+            type="button"
+            onClick={() => navigate("/settings")}
+            className="inline-flex h-7 items-center gap-1.5 rounded-sm border border-primary/30 bg-primary/10 px-2 text-[11px] font-medium text-primary outline-none transition-colors hover:bg-primary/15 focus-visible:ring-2 focus-visible:ring-ring/40"
+            aria-label={`Update ${formatVersionLabel(availableVersion)} available. Open Settings to install it.`}
+            aria-live={updateStatus === "available" ? "polite" : undefined}
+          >
+            <ArrowCircleUpIcon className="size-3.5" aria-hidden="true" />
+            <span className="hidden sm:inline">
+              {formatVersionLabel(availableVersion)} available
+            </span>
+            <span className="sm:hidden">Update</span>
+          </button>
+        ) : null}
         {activeServer ? (
           <span className="hidden max-w-40 truncate text-[11px] font-medium text-muted-foreground sm:inline">
             {activeServer.name}

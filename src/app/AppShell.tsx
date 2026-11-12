@@ -4,6 +4,7 @@ import { Sidebar } from "@/components/layout/Sidebar";
 import { Topbar } from "@/components/layout/Topbar";
 import { useConnectionEvents } from "@/hooks/useConnectionEvents";
 import { useTerminalEvents } from "@/hooks/useTerminalEvents";
+import { useUpdateAutoCheck } from "@/hooks/useUpdateAutoCheck";
 import { useServerStore } from "@/stores/serverStore";
 import { cn } from "@/lib/utils";
 
@@ -18,6 +19,7 @@ function AppShell() {
 
   useConnectionEvents();
   useTerminalEvents();
+  useUpdateAutoCheck();
 
   useEffect(() => {
     window.scrollTo({ top: 0 });

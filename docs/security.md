@@ -1,9 +1,10 @@
 # Security and privacy model
 
 ServerDesk is a local-first desktop application. It has no hosted account,
-cloud backend, server-side agent, analytics service, crash reporter, or
-auto-updater. The local desktop session is trusted; the SSH server and
-everything it returns are untrusted.
+cloud backend, server-side agent, analytics service, or crash reporter. Installed
+builds check GitHub Releases for signed updates, as described below. The local
+desktop session is trusted; the SSH server and everything it returns are
+untrusted.
 
 ## Privacy summary
 
@@ -68,18 +69,38 @@ socket metadata, lifecycle state, and local loopback port. Listeners and
 channels are closed when the SSH session disconnects, the database profile is
 deleted, the tunnel is closed, or the application exits.
 
-### No telemetry
+### Network activity and updates
 
 ServerDesk does not send usage data, analytics, crash reports, diagnostics,
 server inventory, or credentials to the project or any third party. It has no
 telemetry setting to disable because there is no telemetry client.
 
-The application's only network activity is the SSH connection to a server
-profile you explicitly test or connect to, plus the DNS lookup needed to resolve
-that host. ServerDesk has no update checker, so it does not contact GitHub or any
-release service. The optional opener plugin is present in the desktop
-capability set but the current interface does not use it to load remote content;
-the webview loads local application assets.
+The application's network activity is limited to:
+
+- the SSH connection to a server profile you explicitly test or connect to, plus
+  the DNS lookup needed to resolve that host;
+- update checks and signed update downloads against
+  `https://github.com/srosthai/ServerDesk/releases/latest/download/latest.json`
+  and the release assets it names;
+- opening a release page in the system browser when you explicitly choose a
+  manual-download action.
+
+Update checks send an ordinary HTTPS request to GitHub. They do not send server
+inventory, credentials, history, preferences, or a device identifier. The
+request necessarily exposes normal network metadata such as the public IP
+address to GitHub, subject to GitHub's privacy policy. Update checks are skipped
+in browser previews and development builds, are throttled on startup, and are
+skipped while the device reports that it is offline.
+
+Downloaded updates must match the embedded minisign public key before the
+updater replaces anything. A missing or invalid signature is rejected. The
+update signature is separate from Windows Authenticode and Apple notarization.
+There is no automatic rollback and no remote command channel; see
+[updates.md](updates.md) for release signing, platform support, and rollback
+limitations.
+
+The opener plugin is used only for explicit release-page links. The webview
+loads local application assets; it does not load remote content.
 
 The remote SSH server necessarily sees the connection, the fixed commands
 ServerDesk runs, and any terminal input you type. That server and its

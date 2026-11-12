@@ -2,6 +2,12 @@
 
 ServerDesk keeps server inventory and metadata on your computer while all remote work runs over SSH.
 
+## Signed application updates
+
+Installed desktop builds check GitHub Releases for signed updates on startup and from **Settings > Updates**. Checks are throttled to once every six hours, skipped while offline, and never run in the browser preview or a development build. The topbar shows a compact badge when a newer version is available, and the Settings panel shows the installed version, available version, release notes, download progress, install state, and actionable errors.
+
+AppImage, Windows NSIS, and macOS app bundles can download, verify, install, and relaunch in place. The updater verifies a minisign signature with the public key embedded in the application before replacing anything. DEB and RPM installs are detected and linked to the release page instead of being replaced behind the package manager's back. Relaunch happens only after installation completes; a relaunch failure leaves the new build installed and asks the user to reopen the app. See [updates.md](updates.md) for signing-key storage, `latest.json`, platform caveats, and rollback limits.
+
 ## Credentials
 
 SSH passwords and private key material are stored in the operating system credential store through the Rust keyring integration. SQLite stores only a credential reference. Secret input is available in the desktop build, not the browser preview.
