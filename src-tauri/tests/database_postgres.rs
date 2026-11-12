@@ -12,8 +12,9 @@ use std::{
 
 use serverdesk_lib::{
     database::{
-        DatabaseAction, DatabaseAdapter, DatabaseConnectRequest, DatabaseErrorKind,
-        DatabasePassword, MetadataScope, PageRequest, PostgresDatabaseAdapter,
+        DatabaseAction, DatabaseActionRequest, DatabaseAdapter, DatabaseConnectRequest,
+        DatabaseErrorKind, DatabasePassword, MetadataScope, MetadataValue, PageRequest,
+        PostgresDatabaseAdapter, execute_with_adapter, preview_with_adapter,
     },
     storage::DatabaseEngine,
 };
@@ -242,4 +243,154 @@ async fn non_loopback_postgres_hosts_are_rejected_before_a_driver_connect() {
     assert_eq!(error.kind, DatabaseErrorKind::Validation);
     assert!(error.message.contains("loopback"));
     assert!(!adapter.is_connected());
+}
+
+#[tokio::test]
+async fn live_postgres_create_rename_set_active_and_drop_are_verified() {
+    let Some(fixture) = LivePostgres::from_env() else {
+        eprintln!("skipping live PostgreSQL database action test: fixture environment is not set");
+        return;
+    };
+
+    let mut adapter = PostgresDatabaseAdapter::new();
+    adapter
+        .connect(fixture.request(false))
+        .await
+        .expect("connect to fixture");
+
+    let target = "serverdesk_action_test";
+    let renamed = "serverdesk_action_test_renamed";
+    for leftover in [target, renamed, "serverdesk_action_test_other"] {
+        let _ = execute_with_adapter(
+            &mut adapter,
+            DatabaseActionRequest::Drop {
+                name: leftover.to_string(),
+            },
+            true,
+        )
+        .await;
+    }
+
+    let create = DatabaseActionRequest::Create {
+        name: target.to_string(),
+        encoding: Some("UTF8".to_string()),
+        collation: Some("C".to_string()),
+        owner: Some(fixture.username.clone()),
+        template: Some("template0".to_string()),
+    };
+
+    let preview = preview_with_adapter(&adapter, &create)
+        .await
+        .expect("create preview");
+    assert!(
+        preview
+            .ddl
+            .contains("CREATE DATABASE \"serverdesk_action_test\"")
+    );
+    assert!(preview.ddl.contains("TEMPLATE = \"template0\""));
+
+    let created = execute_with_adapter(&mut adapter, create, false)
+        .await
+        .expect("create database");
+    assert!(created.verified, "{}", created.verification);
+    let metadata = created.metadata.expect("created metadata");
+    assert_eq!(metadata.name, target);
+    assert_eq!(
+        metadata.metadata.owner,
+        MetadataValue::available(fixture.username.clone())
+    );
+
+    let renamed_result = execute_with_adapter(
+        &mut adapter,
+        DatabaseActionRequest::Rename {
+            name: target.to_string(),
+            new_name: renamed.to_string(),
+        },
+        false,
+    )
+    .await
+    .expect("rename database");
+    assert!(renamed_result.verified, "{}", renamed_result.verification);
+    assert_eq!(renamed_result.database, target);
+    assert_eq!(renamed_result.previous_name.as_deref(), Some(target));
+
+    let active = execute_with_adapter(
+        &mut adapter,
+        DatabaseActionRequest::SetActive {
+            name: renamed.to_string(),
+        },
+        false,
+    )
+    .await
+    .expect("set active database");
+    assert!(active.verified, "{}", active.verification);
+    assert_eq!(active.active_database.as_deref(), Some(renamed));
+    assert_eq!(adapter.current_database(), Some(renamed));
+
+    let rename_active = execute_with_adapter(
+        &mut adapter,
+        DatabaseActionRequest::Rename {
+            name: renamed.to_string(),
+            new_name: "serverdesk_action_test_other".to_string(),
+        },
+        false,
+    )
+    .await
+    .expect_err("active catalog cannot be renamed");
+    assert_eq!(rename_active.kind, DatabaseErrorKind::Validation);
+
+    execute_with_adapter(
+        &mut adapter,
+        DatabaseActionRequest::SetActive {
+            name: fixture.database.clone(),
+        },
+        false,
+    )
+    .await
+    .expect("restore active database");
+
+    let dropped = execute_with_adapter(
+        &mut adapter,
+        DatabaseActionRequest::Drop {
+            name: renamed.to_string(),
+        },
+        true,
+    )
+    .await
+    .expect("drop database");
+    assert!(dropped.verified, "{}", dropped.verification);
+
+    adapter.close().await.expect("close fixture");
+}
+
+#[tokio::test]
+async fn live_postgres_read_only_profile_rejects_create_with_a_permission_error() {
+    let Some(fixture) = LivePostgres::from_env() else {
+        eprintln!("skipping live PostgreSQL read-only action test: fixture environment is not set");
+        return;
+    };
+
+    let mut adapter = PostgresDatabaseAdapter::new();
+    adapter
+        .connect(fixture.request(true))
+        .await
+        .expect("connect read-only to fixture");
+
+    let error = execute_with_adapter(
+        &mut adapter,
+        DatabaseActionRequest::Create {
+            name: "serverdesk_read_only_created".to_string(),
+            encoding: None,
+            collation: None,
+            owner: None,
+            template: None,
+        },
+        false,
+    )
+    .await
+    .expect_err("read-only profile must reject create");
+    assert_eq!(error.kind, DatabaseErrorKind::Permission);
+    assert!(error.message.contains("read-only"));
+
+    adapter.close().await.expect("close fixture");
 }

@@ -16,6 +16,11 @@ type ConfirmationDetail = {
   value: string;
 };
 
+type ConfirmationPreview = {
+  label: string;
+  text: string;
+};
+
 type ConfirmDialogProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -24,6 +29,7 @@ type ConfirmDialogProps = {
   confirmLabel: string;
   onConfirm: () => void;
   details?: ConfirmationDetail[];
+  preview?: ConfirmationPreview | null;
   destructive?: boolean;
   pending?: boolean;
   warningTitle?: string;
@@ -38,6 +44,7 @@ function ConfirmDialog({
   confirmLabel,
   onConfirm,
   details,
+  preview,
   destructive = true,
   pending = false,
   warningTitle = "This action changes the remote server.",
@@ -62,6 +69,15 @@ function ConfirmDialog({
               </React.Fragment>
             ))}
           </dl>
+        ) : null}
+
+        {preview ? (
+          <div className="space-y-1.5">
+            <p className="text-[11px] font-semibold text-foreground">{preview.label}</p>
+            <pre className="max-h-40 overflow-auto rounded-md border border-border bg-muted/45 p-3 font-mono text-[11px] leading-5 whitespace-pre-wrap text-foreground">
+              {preview.text}
+            </pre>
+          </div>
         ) : null}
 
         {destructive ? (

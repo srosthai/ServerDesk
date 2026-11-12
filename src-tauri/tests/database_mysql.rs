@@ -12,8 +12,9 @@ use std::{
 
 use serverdesk_lib::{
     database::{
-        DatabaseAction, DatabaseAdapter, DatabaseConnectRequest, DatabaseErrorKind,
-        DatabasePassword, MetadataScope, MetadataValue, MysqlDatabaseAdapter, PageRequest,
+        DatabaseAction, DatabaseActionRequest, DatabaseAdapter, DatabaseConnectRequest,
+        DatabaseErrorKind, DatabasePassword, Identifier, MetadataScope, MetadataValue,
+        MysqlDatabaseAdapter, PageRequest, execute_with_adapter, preview_with_adapter,
     },
     storage::DatabaseEngine,
 };
@@ -205,4 +206,152 @@ async fn non_loopback_hosts_are_rejected_before_a_driver_connect() {
     assert_eq!(error.kind, DatabaseErrorKind::Validation);
     assert!(error.message.contains("loopback"));
     assert!(!adapter.is_connected());
+}
+
+#[tokio::test]
+async fn live_mysql_create_set_active_and_drop_are_verified() {
+    let Some(fixture) = LiveMysql::from_env() else {
+        eprintln!("skipping live MySQL database action test: fixture environment is not set");
+        return;
+    };
+
+    let mut adapter = MysqlDatabaseAdapter::new();
+    adapter
+        .connect(fixture.request(false))
+        .await
+        .expect("connect to fixture");
+
+    let target = "serverdesk_action_test";
+    let _ = execute_with_adapter(
+        &mut adapter,
+        DatabaseActionRequest::Drop {
+            name: target.to_string(),
+        },
+        true,
+    )
+    .await;
+
+    let request = DatabaseActionRequest::Create {
+        name: target.to_string(),
+        encoding: Some("utf8mb4".to_string()),
+        collation: Some("utf8mb4_unicode_ci".to_string()),
+        owner: None,
+        template: None,
+    };
+
+    let preview = preview_with_adapter(&adapter, &request)
+        .await
+        .expect("create preview");
+    assert!(
+        preview
+            .ddl
+            .contains("CREATE DATABASE `serverdesk_action_test`")
+    );
+    assert_eq!(
+        adapter
+            .database_summary(&Identifier::new(target).expect("target"))
+            .await
+            .expect("summary before create"),
+        None
+    );
+
+    let created = execute_with_adapter(&mut adapter, request, false)
+        .await
+        .expect("create database");
+    assert!(created.verified, "{}", created.verification);
+    let metadata = created.metadata.expect("created metadata");
+    assert_eq!(metadata.name, target);
+    assert_eq!(
+        metadata.metadata.encoding,
+        MetadataValue::available("utf8mb4".to_string())
+    );
+    assert_eq!(
+        metadata.metadata.collation,
+        MetadataValue::available("utf8mb4_unicode_ci".to_string())
+    );
+
+    let active = execute_with_adapter(
+        &mut adapter,
+        DatabaseActionRequest::SetActive {
+            name: target.to_string(),
+        },
+        false,
+    )
+    .await
+    .expect("set active database");
+    assert!(active.verified, "{}", active.verification);
+    assert_eq!(active.active_database.as_deref(), Some(target));
+    assert_eq!(adapter.current_database(), Some(target));
+
+    let restore_request = DatabaseActionRequest::SetActive {
+        name: fixture.database.clone(),
+    };
+    execute_with_adapter(&mut adapter, restore_request, false)
+        .await
+        .expect("restore active database");
+    assert_eq!(adapter.current_database(), Some(fixture.database.as_str()));
+
+    let dropped = execute_with_adapter(
+        &mut adapter,
+        DatabaseActionRequest::Drop {
+            name: target.to_string(),
+        },
+        true,
+    )
+    .await
+    .expect("drop database");
+    assert!(dropped.verified, "{}", dropped.verification);
+    assert_eq!(
+        adapter
+            .database_summary(&Identifier::new(target).expect("target"))
+            .await
+            .expect("summary after drop"),
+        None
+    );
+
+    let rename = preview_with_adapter(
+        &adapter,
+        &DatabaseActionRequest::Rename {
+            name: fixture.database.clone(),
+            new_name: "serverdesk_renamed".to_string(),
+        },
+    )
+    .await
+    .expect_err("MySQL rename is unsupported");
+    assert_eq!(rename.kind, DatabaseErrorKind::Capability);
+    assert!(rename.message.contains("does not support renaming"));
+
+    adapter.close().await.expect("close fixture");
+}
+
+#[tokio::test]
+async fn live_mysql_read_only_profile_rejects_create_with_a_permission_error() {
+    let Some(fixture) = LiveMysql::from_env() else {
+        eprintln!("skipping live MySQL read-only action test: fixture environment is not set");
+        return;
+    };
+
+    let mut adapter = MysqlDatabaseAdapter::new();
+    adapter
+        .connect(fixture.request(true))
+        .await
+        .expect("connect read-only to fixture");
+
+    let error = execute_with_adapter(
+        &mut adapter,
+        DatabaseActionRequest::Create {
+            name: "serverdesk_read_only_created".to_string(),
+            encoding: None,
+            collation: None,
+            owner: None,
+            template: None,
+        },
+        false,
+    )
+    .await
+    .expect_err("read-only profile must reject create");
+    assert_eq!(error.kind, DatabaseErrorKind::Permission);
+    assert!(error.message.contains("read-only"));
+
+    adapter.close().await.expect("close fixture");
 }

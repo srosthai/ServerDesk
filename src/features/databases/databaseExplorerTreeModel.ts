@@ -72,6 +72,8 @@ export type DatabaseExplorerRow = {
   hasMore?: boolean;
   busy?: boolean;
   action?: DatabaseExplorerRowAction;
+  readOnly?: boolean;
+  databaseRename?: boolean;
 };
 
 export type BuildDatabaseExplorerRowsInput = {
@@ -731,6 +733,9 @@ export function buildDatabaseExplorerRows(
       expanded,
       selectable: true,
       busy: databaseEntry?.status === "loading" || databaseEntry?.loadingMore === true,
+      readOnly: snapshot?.readOnly ?? profile.readOnly,
+      databaseRename:
+        snapshot?.capabilities?.flags.databaseRename ?? profile.engine === "postgresql",
     };
     rows.push(connectionRow);
     pushConnectionChildren(rows, connectionRow, profile, snapshot, input, expanded);

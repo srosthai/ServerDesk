@@ -25,10 +25,11 @@ use tokio::{
 
 use crate::storage::DatabaseEngine;
 
-use super::{MYSQL_DIALECT, sql};
+use super::{MYSQL_DIALECT, actions as engine_actions, sql};
 use crate::database::{
+    actions::{DatabaseDdlPreview, ValidatedDatabaseAction},
     capabilities::{DatabaseAction, DatabaseCapabilities, DatabaseVersion},
-    dialect::SqlDialect,
+    dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
     pagination::{Page, PageRequest},
     traits::{
@@ -49,6 +50,9 @@ pub struct MysqlDatabaseAdapter {
     connected: AtomicBool,
     capabilities: DatabaseCapabilities,
     version: Option<DatabaseVersionInfo>,
+    current_database: Option<String>,
+    read_only: bool,
+    connect_request: Option<DatabaseConnectRequest>,
     operation_timeout: Duration,
 }
 
@@ -65,8 +69,17 @@ impl MysqlDatabaseAdapter {
             connected: AtomicBool::new(false),
             capabilities: DatabaseCapabilities::unknown(DatabaseEngine::Mysql),
             version: None,
+            current_database: None,
+            read_only: false,
+            connect_request: None,
             operation_timeout: Duration::from_secs(10),
         }
+    }
+
+    /// Returns the active database reported after the last connect or
+    /// set-active action.
+    pub fn current_database(&self) -> Option<&str> {
+        self.current_database.as_deref()
     }
 
     /// Returns the raw server version observed during the last successful
@@ -97,6 +110,33 @@ impl MysqlDatabaseAdapter {
             "The database did not respond within {} seconds.",
             self.operation_timeout.as_secs().max(1)
         ))
+    }
+
+    async fn execute_statement(&self, statement: &str) -> Result<(), DatabaseError> {
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::raw_sql(sqlx::AssertSqlSafe(statement.to_string())).execute(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
+    fn connection_info(&self) -> Result<DatabaseConnectionInfo, DatabaseError> {
+        let version = self
+            .version
+            .clone()
+            .ok_or_else(|| DatabaseError::internal("The database version was not recorded."))?;
+        Ok(DatabaseConnectionInfo {
+            engine: DatabaseEngine::Mysql,
+            version,
+            database: self.current_database.clone(),
+            read_only: self.read_only,
+            capabilities: self.capabilities.snapshot(),
+        })
     }
 
     #[cfg(test)]
@@ -135,70 +175,12 @@ impl MysqlDatabaseAdapter {
         decode(&row, "VERSION()")
     }
 
-    fn scope_name(scope: &MetadataScope) -> Result<Option<String>, DatabaseError> {
-        match (
-            scope.database.as_ref().map(|value| value.as_str()),
-            scope.schema.as_ref().map(|value| value.as_str()),
-        ) {
-            (Some(database), Some(schema)) if database != schema => Err(DatabaseError::validation(
-                "MySQL uses one database/schema namespace; the scope values must match.",
-            )),
-            (Some(database), _) => Ok(Some(database.to_string())),
-            (None, Some(schema)) => Ok(Some(schema.to_string())),
-            (None, None) => Ok(None),
-        }
-    }
-
-    fn table_name(table: &TableRef) -> Result<Option<String>, DatabaseError> {
-        match (
-            table.database.as_ref().map(|value| value.as_str()),
-            table.schema.as_ref().map(|value| value.as_str()),
-        ) {
-            (Some(database), Some(schema)) if database != schema => Err(DatabaseError::validation(
-                "MySQL uses one database/schema namespace; the table reference values must match.",
-            )),
-            (Some(database), _) => Ok(Some(database.to_string())),
-            (None, Some(schema)) => Ok(Some(schema.to_string())),
-            (None, None) => Ok(None),
-        }
-    }
-}
-
-#[async_trait]
-impl DatabaseAdapter for MysqlDatabaseAdapter {
-    fn engine(&self) -> DatabaseEngine {
-        DatabaseEngine::Mysql
-    }
-
-    fn capabilities(&self) -> &DatabaseCapabilities {
-        &self.capabilities
-    }
-
-    fn dialect(&self) -> &dyn SqlDialect {
-        &MYSQL_DIALECT
-    }
-
-    fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::SeqCst)
-    }
-
-    async fn connect(
-        &mut self,
-        request: DatabaseConnectRequest,
-    ) -> Result<DatabaseConnectionInfo, DatabaseError> {
-        validate_connect_request(&request)?;
-        let ssl_mode = ssl_mode(&request)?;
+    async fn open_connection(
+        request: &DatabaseConnectRequest,
+    ) -> Result<(MySqlConnection, DatabaseVersionInfo, DatabaseCapabilities), DatabaseError> {
+        validate_connect_request(request)?;
+        let ssl_mode = ssl_mode(request)?;
         let connect_timeout = request.connect_timeout;
-        self.operation_timeout = connect_timeout.max(Duration::from_secs(1));
-
-        // Replacing a live connection must not leave the previous driver
-        // session open after the new attempt fails.
-        if let Some(previous) = self.connection.get_mut().take() {
-            let _ = previous.close().await;
-        }
-        self.connected.store(false, Ordering::SeqCst);
-        self.version = None;
-        self.capabilities = DatabaseCapabilities::unknown(DatabaseEngine::Mysql);
 
         let mut options = MySqlConnectOptions::new()
             .host(request.host.trim())
@@ -258,16 +240,93 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
             raw: raw_version,
         };
 
+        Ok((connection, version, capabilities))
+    }
+
+    fn scope_name(scope: &MetadataScope) -> Result<Option<String>, DatabaseError> {
+        match (
+            scope.database.as_ref().map(|value| value.as_str()),
+            scope.schema.as_ref().map(|value| value.as_str()),
+        ) {
+            (Some(database), Some(schema)) if database != schema => Err(DatabaseError::validation(
+                "MySQL uses one database/schema namespace; the scope values must match.",
+            )),
+            (Some(database), _) => Ok(Some(database.to_string())),
+            (None, Some(schema)) => Ok(Some(schema.to_string())),
+            (None, None) => Ok(None),
+        }
+    }
+
+    fn table_name(table: &TableRef) -> Result<Option<String>, DatabaseError> {
+        match (
+            table.database.as_ref().map(|value| value.as_str()),
+            table.schema.as_ref().map(|value| value.as_str()),
+        ) {
+            (Some(database), Some(schema)) if database != schema => Err(DatabaseError::validation(
+                "MySQL uses one database/schema namespace; the table reference values must match.",
+            )),
+            (Some(database), _) => Ok(Some(database.to_string())),
+            (None, Some(schema)) => Ok(Some(schema.to_string())),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+#[async_trait]
+impl DatabaseAdapter for MysqlDatabaseAdapter {
+    fn engine(&self) -> DatabaseEngine {
+        DatabaseEngine::Mysql
+    }
+
+    fn capabilities(&self) -> &DatabaseCapabilities {
+        &self.capabilities
+    }
+
+    fn dialect(&self) -> &dyn SqlDialect {
+        &MYSQL_DIALECT
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    async fn connect(
+        &mut self,
+        request: DatabaseConnectRequest,
+    ) -> Result<DatabaseConnectionInfo, DatabaseError> {
+        self.operation_timeout = request.connect_timeout.max(Duration::from_secs(1));
+
+        // Replacing a live connection must not leave the previous driver
+        // session open after the new attempt fails.
+        if let Some(previous) = self.connection.get_mut().take() {
+            let _ = previous.close().await;
+        }
+        self.connected.store(false, Ordering::SeqCst);
+        self.version = None;
+        self.current_database = None;
+        self.read_only = false;
+        self.connect_request = None;
+        self.capabilities = DatabaseCapabilities::unknown(DatabaseEngine::Mysql);
+
+        let (connection, version, capabilities) = Self::open_connection(&request).await?;
+
         *self.connection.get_mut() = Some(connection);
         self.version = Some(version.clone());
+        self.current_database = request.database.clone();
+        self.read_only = request.read_only;
+        self.connect_request = Some(request);
         self.capabilities = capabilities.clone();
         self.connected.store(true, Ordering::SeqCst);
 
         Ok(DatabaseConnectionInfo {
             engine: DatabaseEngine::Mysql,
             version,
-            database: request.database,
-            read_only: request.read_only,
+            database: self.current_database.clone(),
+            read_only: self.read_only,
             capabilities: capabilities.snapshot(),
         })
     }
@@ -306,6 +365,8 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
     async fn close(&mut self) -> Result<(), DatabaseError> {
         self.connected.store(false, Ordering::SeqCst);
         self.version = None;
+        self.current_database = None;
+        self.read_only = false;
         self.capabilities = DatabaseCapabilities::unknown(DatabaseEngine::Mysql);
 
         if let Some(connection) = self.connection.get_mut().take() {
@@ -348,6 +409,101 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
             .collect::<Result<Vec<_>, DatabaseError>>()?;
 
         Ok(Page::from_items(databases, page, None))
+    }
+
+    async fn database_summary(
+        &self,
+        database: &Identifier,
+    ) -> Result<Option<DatabaseSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseDatabases)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let row = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::DATABASE_SUMMARY)
+                .bind(database.as_str())
+                .fetch_optional(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+
+        row.as_ref()
+            .map(|row| {
+                let name: String = decode(row, "name")?;
+                Ok(DatabaseSummary {
+                    system: is_system_database(&name),
+                    name,
+                    metadata: schema_metadata(row)?,
+                })
+            })
+            .transpose()
+    }
+
+    async fn preview_database_action(
+        &self,
+        action: &ValidatedDatabaseAction,
+    ) -> Result<DatabaseDdlPreview, DatabaseError> {
+        self.require_connection()?;
+        if matches!(action, ValidatedDatabaseAction::Rename { .. }) {
+            // Keep the explanation specific instead of the generic capability
+            // message; MySQL has no safe rename operation at any version.
+            return engine_actions::preview(action);
+        }
+        self.require_capability(action.capability())?;
+        if let ValidatedDatabaseAction::Drop { name } = action
+            && self.current_database.as_deref() == Some(name.as_str())
+        {
+            return Err(DatabaseError::validation(
+                "MySQL cannot drop the database used by the current connection. Set another \
+                 database active first.",
+            ));
+        }
+        engine_actions::preview(action)
+    }
+
+    async fn execute_database_action(
+        &mut self,
+        action: &ValidatedDatabaseAction,
+    ) -> Result<Option<DatabaseConnectionInfo>, DatabaseError> {
+        self.require_connection()?;
+        self.require_capability(action.capability())?;
+        let preview = self.preview_database_action(action).await?;
+
+        match action {
+            ValidatedDatabaseAction::SetActive { name } => {
+                if self.current_database.as_deref() == Some(name.as_str()) {
+                    return self.connection_info().map(Some);
+                }
+
+                let mut request = self.connect_request.clone().ok_or_else(|| {
+                    DatabaseError::internal(
+                        "The MySQL connection settings were not recorded for a reconnect.",
+                    )
+                })?;
+                request.database = Some(name.as_str().to_string());
+
+                // Open the replacement session before closing the old one. A
+                // failed switch leaves the current browsing context usable.
+                let (connection, version, capabilities) = Self::open_connection(&request).await?;
+                if let Some(previous) = self.connection.get_mut().take() {
+                    let _ = previous.close().await;
+                }
+
+                *self.connection.get_mut() = Some(connection);
+                self.version = Some(version);
+                self.current_database = request.database.clone();
+                self.capabilities = capabilities;
+                self.connect_request = Some(request);
+                self.connection_info().map(Some)
+            }
+            _ => {
+                for statement in &preview.statements {
+                    self.execute_statement(statement).await?;
+                }
+                Ok(None)
+            }
+        }
     }
 
     async fn list_schemas(&self, page: PageRequest) -> Result<Page<SchemaSummary>, DatabaseError> {
@@ -412,9 +568,13 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
                     schema: Some(database),
                     name: decode(row, "name")?,
                     kind: table_kind(&table_type),
-                    estimated_rows: decode::<Option<u64>>(row, "estimated_rows")?.into(),
+                    estimated_rows: decode::<Option<i64>>(row, "estimated_rows")?
+                        .and_then(|value| u64::try_from(value).ok())
+                        .into(),
                     metadata: ObjectMetadata {
-                        size_bytes: decode::<Option<u64>>(row, "size_bytes")?.into(),
+                        size_bytes: decode::<Option<i64>>(row, "size_bytes")?
+                            .and_then(|value| u64::try_from(value).ok())
+                            .into(),
                         engine: decode::<Option<String>>(row, "engine")?.into(),
                         ..ObjectMetadata::default()
                     },
@@ -495,8 +655,8 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
         .map_err(map_sqlx_error)?;
 
         Ok(ObjectCounts {
-            tables: MetadataValue::available(decode::<u64>(&row, "table_count")?),
-            views: MetadataValue::available(decode::<u64>(&row, "view_count")?),
+            tables: MetadataValue::available(decode_count(&row, "table_count")?),
+            views: MetadataValue::available(decode_count(&row, "view_count")?),
             materialized_views: MetadataValue::Unavailable,
             sequences: MetadataValue::Unavailable,
         })
@@ -531,7 +691,7 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
         let columns = rows
             .iter()
             .map(|row| {
-                let ordinal_position: u64 = decode(row, "ordinal_position")?;
+                let ordinal_position: i64 = decode(row, "ordinal_position")?;
                 Ok(ColumnSummary {
                     name: decode(row, "name")?,
                     data_type: decode(row, "data_type")?,
@@ -691,7 +851,9 @@ fn schema_metadata(row: &MySqlRow) -> Result<ObjectMetadata, DatabaseError> {
     Ok(ObjectMetadata {
         encoding: decode::<Option<String>>(row, "encoding")?.into(),
         collation: decode::<Option<String>>(row, "collation")?.into(),
-        size_bytes: decode::<Option<u64>>(row, "size_bytes")?.into(),
+        size_bytes: decode::<Option<i64>>(row, "size_bytes")?
+            .and_then(|value| u64::try_from(value).ok())
+            .into(),
         ..ObjectMetadata::default()
     })
 }
@@ -736,6 +898,15 @@ where
 
 fn decode_flag(row: &MySqlRow, column: &str) -> Result<bool, DatabaseError> {
     Ok(decode::<i64>(row, column)? != 0)
+}
+
+fn decode_count(row: &MySqlRow, column: &str) -> Result<u64, DatabaseError> {
+    let value: i64 = decode(row, column)?;
+    u64::try_from(value).map_err(|_| {
+        DatabaseError::query("The database returned a negative count.").with_details(format!(
+            "The database value in column {column} could not be converted to an unsigned count."
+        ))
+    })
 }
 
 /// Maps SQLx errors into the shared taxonomy without exposing the raw driver
