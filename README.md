@@ -12,6 +12,7 @@ ServerDesk is a local-first desktop application for managing Linux VPS servers o
 - Systemd service discovery with verified start, stop, and restart actions.
 - Laravel project detection, fixed Artisan actions, and a read-only queue and Supervisor view.
 - Bounded log tails and a local, sanitized operation history.
+- Signed in-app updates for AppImage, Windows NSIS, and macOS builds, with a manual package-manager path for DEB/RPM.
 - Local SQLite metadata with secrets kept in the operating system credential store.
 
 Detailed behavior is documented in [docs/features.md](docs/features.md).
@@ -26,7 +27,7 @@ Release builds are attached to the repository's GitHub Releases page. If no rele
 
 ## Install
 
-Download the installer for your platform and follow [docs/install.md](docs/install.md) for package commands, first-run setup, and uninstall notes. Linux/macOS and Windows also support verified command-line install scripts described in [docs/install.md](docs/install.md#command-line-install).
+Download the installer for your platform and follow [docs/install.md](docs/install.md) for package commands, first-run setup, update behavior, and uninstall notes. Linux/macOS and Windows also support verified command-line install scripts described in [docs/install.md](docs/install.md#command-line-install).
 
 ## Development setup
 
@@ -47,12 +48,13 @@ npm run dev
 
 ```bash
 npm run check
+export TAURI_SIGNING_PRIVATE_KEY=/home/dev/.config/serverdesk-updater/serverdesk-updater.key  # Linux/macOS; set the variable on Windows
 npm run tauri build -- --bundles deb,rpm,appimage   # Linux
 npm run tauri build -- --bundles nsis               # Windows
 npm run tauri build -- --target universal-apple-darwin --bundles app,dmg  # macOS
 ```
 
-Artifacts are written to `src-tauri/target/release/bundle`. Do not commit `dist/`, `src-tauri/target/`, or installer output.
+Bundle builds create signed updater artifacts, so `TAURI_SIGNING_PRIVATE_KEY` must point at the local updater private key. Do not commit the key or its path file. Artifacts are written to `src-tauri/target/release/bundle`. Do not commit `dist/`, `src-tauri/target/`, or installer output. Release signing and `latest.json` generation are documented in [docs/updates.md](docs/updates.md).
 
 ## Documentation
 
@@ -62,6 +64,7 @@ User guide:
 - [SSH account and scoped sudo](docs/ssh-setup.md)
 - [Host key verification and recovery](docs/host-keys.md)
 - [Features](docs/features.md)
+- [Updates and release signing](docs/updates.md)
 - [Database adapter architecture](docs/database-architecture.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Security and privacy](docs/security.md)

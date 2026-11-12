@@ -6,6 +6,8 @@
   "permissions": [
     "core:default",
     "opener:default",
+    "process:allow-restart",
+    "updater:default",
     "clipboard-manager:allow-read-text",
     "clipboard-manager:allow-write-text"
   ]

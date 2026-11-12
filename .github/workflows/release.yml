@@ -71,6 +71,8 @@ jobs:
         if: "!startsWith(github.ref, 'refs/tags/')"
 
       - name: Build Linux packages
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: npm run tauri build -- --bundles deb,rpm,appimage
 
       - name: Smoke test the built application
@@ -96,6 +98,8 @@ jobs:
             src-tauri/target/release/bundle/deb/*.deb
             src-tauri/target/release/bundle/rpm/*.rpm
             src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/appimage/*.AppImage.tar.gz
+            src-tauri/target/release/bundle/appimage/*.sig
 
   macos:
     name: macOS universal DMG
@@ -141,6 +145,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
           # GitHub sets missing secrets to empty strings. Tauri treats an
           # empty APPLE_CERTIFICATE as a signing request and fails while
@@ -173,6 +178,8 @@ jobs:
           if-no-files-found: error
           path: |
             src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/universal-apple-darwin/release/bundle/macos/*.sig
             ${{ runner.temp }}/ServerDesk.app.zip
 
   windows:
@@ -209,6 +216,8 @@ jobs:
         shell: pwsh
 
       - name: Build NSIS installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: npm run tauri build -- --bundles nsis
 
       - name: Upload Windows installer
@@ -216,7 +225,9 @@ jobs:
         with:
           name: ServerDesk-windows
           if-no-files-found: error
-          path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          path: |
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/nsis/*.sig
 
   publish:
     name: Publish draft release
@@ -226,6 +237,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download build artefacts
         uses: actions/download-artifact@v4
         with:
@@ -233,14 +249,42 @@ jobs:
           merge-multiple: true
           path: release-assets
 
-      - name: Prepare release assets and checksums
+      - name: Prepare release assets, updater manifest, and checksums
         run: |
           set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
           flat="$RUNNER_TEMP/serverdesk-release"
+          notes_file="$RUNNER_TEMP/serverdesk-release-notes.txt"
           rm -rf "$flat"
           mkdir -p "$flat"
-          find release-assets -type f \(             -name '*.deb' -o             -name '*.rpm' -o             -name '*.AppImage' -o             -name '*-setup.exe' -o             -name '*.dmg' -o             -name 'ServerDesk.app.zip'           \) -exec cp {} "$flat/" \;
+          find release-assets -type f \( \
+            -name '*.deb' -o \
+            -name '*.rpm' -o \
+            -name '*.AppImage' -o \
+            -name '*.AppImage.tar.gz' -o \
+            -name '*-setup.exe' -o \
+            -name '*.dmg' -o \
+            -name '*.app.tar.gz' -o \
+            -name 'ServerDesk.app.zip' -o \
+            -name '*.sig' \
+          \) -exec cp {} "$flat/" \;
           test -n "$(find "$flat" -type f | head -1)"
+
+          # Use the annotated tag message when it exists. The fallback keeps
+          # latest.json useful for lightweight tags and workflow_dispatch.
+          git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > "$notes_file"
+          if [ ! -s "$notes_file" ]; then
+            printf 'See https://github.com/srosthai/ServerDesk/releases/tag/%s for release notes.\n' \
+              "$GITHUB_REF_NAME" > "$notes_file"
+          fi
+
+          node scripts/latest-json.mjs \
+            --version "$version" \
+            --notes-file "$notes_file" \
+            --pub-date "$(git log -1 --format=%cI "$GITHUB_SHA")" \
+            --asset-dir "$flat" \
+            --output "$flat/latest.json"
+
           cp scripts/install.sh scripts/install.ps1 "$flat/"
           (cd "$flat" && sha256sum * > SHA256SUMS)
           ls -lh "$flat"

@@ -85,6 +85,8 @@ npm run dev
 
 The browser preview has no Tauri commands, so server, credential, terminal, and
 filesystem features are limited. Use the desktop shell for end-to-end work.
+Development builds and browser previews never run update checks. Packaged
+builds use the signing and manifest flow in [updates.md](updates.md).
 
 ## Checks
 
@@ -117,9 +119,11 @@ Windows artifacts.
 
 `npm test` runs Vitest with jsdom and Testing Library. Tests live beside the
 code as `*.test.ts` or `*.test.tsx`. They cover routing and page behavior,
-connection and host-key dialogs, theming and preferences, terminal tab
-lifecycle, file selection and transfer queues, service and project views, log
-presentation, history filters, error presentation, and store cleanup.
+connection and host-key dialogs, theming and preferences, update states and
+failure handling, terminal tab lifecycle, file selection and transfer queues,
+service and project views, log presentation, history filters, error
+presentation, and store cleanup. The release-manifest generator tests live in
+`scripts/latest-json.test.mjs` and run in the same Vitest suite.
 
 Useful focused commands:
 

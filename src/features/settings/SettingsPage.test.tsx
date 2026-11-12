@@ -20,6 +20,8 @@ describe("SettingsPage", () => {
     expect(screen.getByRole("heading", { name: "Settings" })).toBeInTheDocument();
     expect(screen.getByText("Web preview")).toBeInTheDocument();
     expect(screen.getByText(/Preferences are stored locally in SQLite/)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Updates" })).toBeInTheDocument();
+    expect(screen.getByText("v0.1.0")).toBeInTheDocument();
   });
 
   it("applies a theme immediately and stores it", async () => {
