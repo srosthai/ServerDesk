@@ -23,10 +23,16 @@ export type ErrorCode =
   | "credential_invalid"
   | "internal";
 
+export type ErrorScope = {
+  object: string;
+  name: string;
+};
+
 export type CommandError = {
   code: ErrorCode;
   message: string;
   details?: string;
+  scope?: ErrorScope;
 };
 
 export type AppInfo = {
@@ -422,7 +428,85 @@ export type DatabaseTableSummary = {
   name: string;
   kind: DatabaseTableKind;
   estimatedRows: DatabaseMetadataValue<number>;
+  metadataRefreshedAt: DatabaseMetadataValue<string>;
 } & DatabaseObjectMetadata;
+
+export type DatabaseColumnIdentity = "none" | "auto_increment" | "always" | "by_default";
+
+export type DatabaseColumnSummary = {
+  name: string;
+  dataType: string;
+  length: DatabaseMetadataValue<number | null>;
+  precision: DatabaseMetadataValue<number | null>;
+  scale: DatabaseMetadataValue<number | null>;
+  nullable: boolean;
+  defaultValue: DatabaseMetadataValue<string | null>;
+  ordinalPosition: number;
+  primaryKey: boolean;
+  identity: DatabaseMetadataValue<DatabaseColumnIdentity>;
+  generated: DatabaseMetadataValue<boolean>;
+  generationExpression: DatabaseMetadataValue<string | null>;
+  comment: DatabaseMetadataValue<string | null>;
+  collation: DatabaseMetadataValue<string | null>;
+};
+
+export type DatabaseIndexSummary = {
+  name: string;
+  columns: string[];
+  unique: boolean;
+  primary: boolean;
+  method: DatabaseMetadataValue<string>;
+  predicate: DatabaseMetadataValue<string | null>;
+};
+
+export type DatabaseConstraintKind = "primary_key" | "unique" | "foreign_key" | "check" | "other";
+
+export type DatabaseConstraintSummary = {
+  name: string;
+  kind: DatabaseConstraintKind;
+  columns: string[];
+  referencedSchema: DatabaseMetadataValue<string | null>;
+  referencedTable: DatabaseMetadataValue<string | null>;
+  referencedColumns: string[];
+  onUpdate: DatabaseMetadataValue<string | null>;
+  onDelete: DatabaseMetadataValue<string | null>;
+  checkExpression: DatabaseMetadataValue<string | null>;
+  deferrable: DatabaseMetadataValue<boolean>;
+  initiallyDeferred: DatabaseMetadataValue<boolean>;
+};
+
+export type DatabaseDependencyKind =
+  | "incoming_foreign_key"
+  | "dependent_view"
+  | "dependent_materialized_view"
+  | "owned_sequence"
+  | "trigger";
+
+export type DatabaseDependencySummary = {
+  kind: DatabaseDependencyKind;
+  name: string;
+  database: string | null;
+  schema: string | null;
+  table: string | null;
+  columns: string[];
+  referencedColumns: string[];
+  onUpdate: DatabaseMetadataValue<string | null>;
+  onDelete: DatabaseMetadataValue<string | null>;
+  details: DatabaseMetadataValue<string>;
+};
+
+export type DatabaseBounded<T> = {
+  items: T[];
+  limit: number;
+  truncated: boolean;
+};
+
+export type DatabaseTableDependencies = {
+  incomingForeignKeys: DatabaseMetadataValue<DatabaseBounded<DatabaseDependencySummary>>;
+  dependentViews: DatabaseMetadataValue<DatabaseBounded<DatabaseDependencySummary>>;
+  ownedSequences: DatabaseMetadataValue<DatabaseBounded<DatabaseDependencySummary>>;
+  triggers: DatabaseMetadataValue<DatabaseBounded<DatabaseDependencySummary>>;
+};
 
 export type DatabaseViewSummary = {
   database: string | null;

@@ -89,6 +89,10 @@ async fn fake_adapter_proves_the_shared_interface_without_a_database() {
         MetadataValue::available("app".to_string())
     );
     assert!(tables.items[0].metadata.size_bytes.is_available());
+    assert_eq!(
+        tables.items[0].metadata_refreshed_at,
+        MetadataValue::available("2026-01-02T03:04:05Z".to_string())
+    );
 
     let views = adapter
         .list_views(&scope, PageRequest::new(10, 0))
@@ -129,18 +133,49 @@ async fn fake_adapter_proves_the_shared_interface_without_a_database() {
         .expect("columns");
     assert_eq!(columns.items.len(), 2);
     assert!(columns.items[0].primary_key);
+    assert_eq!(
+        columns.items[0].identity,
+        MetadataValue::available(serverdesk_lib::database::ColumnIdentity::Always)
+    );
+    assert_eq!(
+        columns.items[1].comment,
+        MetadataValue::available(Some("Login address".to_string()))
+    );
 
     let indexes = adapter
         .list_indexes(&table, PageRequest::new(10, 0))
         .await
         .expect("indexes");
     assert_eq!(indexes.items[0].name, "users_pkey");
+    assert!(indexes.items[0].method.is_available());
 
     let constraints = adapter
         .list_constraints(&table, PageRequest::new(10, 0))
         .await
         .expect("constraints");
     assert_eq!(constraints.items[0].name, "users_pkey");
+    assert_eq!(
+        constraints.items[0].deferrable,
+        MetadataValue::available(false)
+    );
+
+    let dependencies = adapter
+        .table_dependencies(&table, 10)
+        .await
+        .expect("dependencies");
+    let foreign_keys = dependencies
+        .incoming_foreign_keys
+        .value()
+        .expect("incoming foreign keys");
+    assert_eq!(foreign_keys.items[0].name, "orders_user_fk");
+    assert_eq!(foreign_keys.items[0].columns, ["user_id"]);
+    let views = dependencies.dependent_views.value().expect("views");
+    assert_eq!(views.items[0].name, "active_users");
+    let sequences = dependencies
+        .owned_sequences
+        .value()
+        .expect("owned sequences");
+    assert_eq!(sequences.items[0].name, "users_id_seq");
 
     adapter.close().await.expect("fake close");
     assert!(!adapter.is_connected());
@@ -174,6 +209,16 @@ async fn mysql_discovery_marks_unsupported_groups_unavailable() {
     assert_eq!(counts.views, MetadataValue::available(1));
     assert_eq!(counts.materialized_views, MetadataValue::Unavailable);
     assert_eq!(counts.sequences, MetadataValue::Unavailable);
+
+    let table = TableRef::new(Some("app"), Some("app"), "users").expect("table ref");
+    let dependencies = adapter
+        .table_dependencies(&table, 10)
+        .await
+        .expect("dependencies");
+    assert!(dependencies.incoming_foreign_keys.is_available());
+    assert_eq!(dependencies.dependent_views, MetadataValue::Unavailable);
+    assert_eq!(dependencies.owned_sequences, MetadataValue::Unavailable);
+    assert!(dependencies.triggers.is_available());
 
     let databases = adapter
         .list_databases(PageRequest::new(10, 0))
@@ -368,6 +413,77 @@ fn restricted_metadata_failures_keep_the_typed_permission_code() {
 
     assert_eq!(error.code, serverdesk_lib::core::ErrorCode::Permission);
     assert!(!error.message.contains("SELECT"));
+}
+
+#[tokio::test]
+async fn table_detail_catalogs_are_bounded_per_page() {
+    let mut adapter = FakeDatabaseAdapter::new(DatabaseEngine::Postgresql, Some("16.2"));
+    adapter
+        .connect(connect_request("app"))
+        .await
+        .expect("fake connect");
+    let table = TableRef::new(Some("app"), Some("public"), "users").expect("table ref");
+
+    let columns = adapter
+        .list_columns(&table, PageRequest::new(1, 0))
+        .await
+        .expect("columns");
+    assert_eq!(columns.items.len(), 1);
+    assert!(columns.has_more);
+
+    let indexes = adapter
+        .list_indexes(&table, PageRequest::new(1, 0))
+        .await
+        .expect("indexes");
+    assert_eq!(indexes.items.len(), 1);
+    assert!(indexes.has_more);
+
+    let constraints = adapter
+        .list_constraints(&table, PageRequest::new(1, 0))
+        .await
+        .expect("constraints");
+    assert_eq!(constraints.items.len(), 1);
+    assert!(constraints.has_more);
+
+    let unrelated = TableRef::new(Some("app"), Some("public"), "orders").expect("table ref");
+    let empty = adapter
+        .list_columns(&unrelated, PageRequest::default())
+        .await
+        .expect("unrelated columns are empty");
+    assert!(empty.items.is_empty());
+}
+
+#[test]
+fn permission_errors_are_scoped_to_the_object_without_leaking_sql() {
+    let error = serverdesk_lib::database::DatabaseError::permission(
+        "The database account does not have permission for this operation.",
+    )
+    .scoped_permission("table", "users")
+    .with_details("MySQL error 1142 (42000).");
+
+    assert_eq!(error.kind, DatabaseErrorKind::Permission);
+    assert_eq!(
+        error.scope.as_ref().map(|scope| scope.object.as_str()),
+        Some("table")
+    );
+    assert_eq!(
+        error.scope.as_ref().map(|scope| scope.name.as_str()),
+        Some("users")
+    );
+
+    let app_error: serverdesk_lib::core::AppError = error.into();
+    assert_eq!(app_error.code, serverdesk_lib::core::ErrorCode::Permission);
+    assert_eq!(
+        app_error.scope.as_ref().map(|scope| scope.name.as_str()),
+        Some("users")
+    );
+    let json = serde_json::to_string(&app_error).expect("serialized error");
+    assert!(json.contains("\"scope\":{\"object\":\"table\",\"name\":\"users\"}"));
+    assert!(!json.contains("SELECT"));
+
+    let query = serverdesk_lib::database::DatabaseError::query("The database operation failed.")
+        .scoped_permission("table", "users");
+    assert_eq!(query.scope, None);
 }
 
 #[test]

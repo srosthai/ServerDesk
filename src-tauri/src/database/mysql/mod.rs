@@ -65,6 +65,23 @@ mod tests {
         assert!(sql::OBJECT_COUNTS.contains("table_count"));
         assert!(sql::OBJECT_COUNTS.contains("view_count"));
         assert!(!sql::OBJECT_COUNTS.contains("LIMIT"));
+
+        assert!(sql::LIST_COLUMNS.contains("CHARACTER_MAXIMUM_LENGTH"));
+        assert!(sql::LIST_COLUMNS.contains("GENERATION_EXPRESSION"));
+        assert!(sql::LIST_COLUMNS.contains("COLLATION_NAME"));
+        assert!(sql::LIST_COLUMNS.contains("LIMIT ? OFFSET ?"));
+
+        // Index and constraint pages are selected before their detail rows,
+        // so grouping never reads an unbounded number of index columns.
+        assert!(sql::LIST_INDEXES.contains("JOIN ("));
+        assert!(sql::LIST_INDEXES.contains("LIMIT ? OFFSET ?"));
+        assert!(sql::LIST_CONSTRAINTS.contains("CHECK_CLAUSE"));
+        assert!(sql::LIST_CONSTRAINTS.contains("JOIN ("));
+        assert!(sql::LIST_CONSTRAINTS.contains("LIMIT ? OFFSET ?"));
+        assert!(sql::LIST_CONSTRAINTS_WITHOUT_CHECKS.contains("NULL AS check_expression"));
+
+        assert!(sql::TABLE_INCOMING_FOREIGN_KEYS.contains("REFERENCED_TABLE_NAME"));
+        assert!(sql::TABLE_TRIGGERS.contains("information_schema.TRIGGERS"));
     }
 
     #[test]

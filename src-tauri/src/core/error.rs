@@ -32,12 +32,35 @@ pub enum ErrorCode {
     Internal,
 }
 
+/// The object a typed error is scoped to.
+///
+/// Metadata operations report permission failures with the database object the
+/// caller tried to read, so the UI can keep the error attached to that object
+/// instead of replacing the whole workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorScope {
+    pub object: String,
+    pub name: String,
+}
+
+impl ErrorScope {
+    pub fn new(object: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            object: object.into(),
+            name: name.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AppError {
     pub code: ErrorCode,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ErrorScope>,
 }
 
 impl AppError {
@@ -46,11 +69,17 @@ impl AppError {
             code,
             message: sanitize_diagnostic(message.into()),
             details: None,
+            scope: None,
         }
     }
 
     pub fn with_details(mut self, details: impl Into<String>) -> Self {
         self.details = Some(sanitize_diagnostic(details.into()));
+        self
+    }
+
+    pub fn with_scope(mut self, object: impl Into<String>, name: impl Into<String>) -> Self {
+        self.scope = Some(ErrorScope::new(object, name));
         self
     }
 

@@ -30,12 +30,13 @@ use crate::database::{
     capabilities::{DatabaseAction, DatabaseCapabilities, DatabaseVersion},
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
-    pagination::{Page, PageRequest},
+    pagination::{Bounded, Page, PageRequest},
     traits::{
-        ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter, DatabaseConnectRequest,
-        DatabaseConnectionInfo, DatabasePing, DatabaseSummary, DatabaseVersionInfo, IndexSummary,
-        MetadataScope, MetadataValue, ObjectCounts, ObjectMetadata, SchemaSummary, SequenceSummary,
-        TableKind, TableRef, TableSummary, ViewKind, ViewSummary,
+        ColumnIdentity, ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter,
+        DatabaseConnectRequest, DatabaseConnectionInfo, DatabasePing, DatabaseSummary,
+        DatabaseVersionInfo, DependencyKind, DependencySummary, IndexSummary, MetadataScope,
+        MetadataValue, ObjectCounts, ObjectMetadata, SchemaSummary, SequenceSummary,
+        TableDependencies, TableKind, TableRef, TableSummary, ViewKind, ViewSummary,
     },
     validation::validate_connect_request,
 };
@@ -589,31 +590,21 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
         )
         .await
         .map_err(|_| self.operation_timeout_error())?
-        .map_err(map_sqlx_error)?;
+        .map_err(map_sqlx_error)
+        .map_err(|error| {
+            error.scoped_permission(
+                "database",
+                schema.as_deref().unwrap_or("connected database"),
+            )
+        })?;
 
         let tables = rows
             .iter()
-            .map(|row| {
-                let table_type: String = decode(row, "table_type")?;
-                let size_bytes = decode::<Option<i64>>(row, "size_bytes")?
-                    .and_then(|size| u64::try_from(size).ok());
-                let estimated_rows = decode::<Option<i64>>(row, "estimated_rows")?
-                    .and_then(|rows| u64::try_from(rows).ok());
-                Ok(TableSummary {
-                    database: Some(decode(row, "database_name")?),
-                    schema: Some(decode(row, "schema_name")?),
-                    name: decode(row, "name")?,
-                    kind: table_kind(&table_type),
-                    estimated_rows: estimated_rows.into(),
-                    metadata: ObjectMetadata {
-                        owner: decode::<Option<String>>(row, "owner")?.into(),
-                        size_bytes: size_bytes.into(),
-                        engine: decode::<Option<String>>(row, "engine")?.into(),
-                        ..ObjectMetadata::default()
-                    },
-                })
-            })
-            .collect::<Result<Vec<_>, DatabaseError>>()?;
+            .map(PgTableRecord::from_row)
+            .collect::<Result<Vec<_>, DatabaseError>>()?
+            .into_iter()
+            .map(PgTableRecord::into_summary)
+            .collect::<Vec<_>>();
 
         Ok(Page::from_items(tables, page, None))
     }
@@ -772,23 +763,20 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
         )
         .await
         .map_err(|_| self.operation_timeout_error())?
-        .map_err(map_sqlx_error)?;
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("table", table.name.as_str()))?;
 
+        let generated_supported = self
+            .capabilities
+            .supports(DatabaseAction::CreateGeneratedColumn);
+        let identity_supported = self
+            .capabilities
+            .supports(DatabaseAction::CreateIdentityColumn);
         let columns = rows
             .iter()
             .map(|row| {
-                let ordinal_position: i64 = decode(row, "ordinal_position")?;
-                Ok(ColumnSummary {
-                    name: decode(row, "name")?,
-                    data_type: decode(row, "data_type")?,
-                    nullable: decode(row, "nullable")?,
-                    default_value: decode(row, "default_value")?,
-                    ordinal_position: u32::try_from(ordinal_position).unwrap_or(u32::MAX),
-                    primary_key: decode(row, "primary_key")?,
-                    generated: decode(row, "generated")?,
-                    identity: decode(row, "identity")?,
-                    comment: decode(row, "comment")?,
-                })
+                Ok(PgColumnRecord::from_row(row)?
+                    .into_summary(generated_supported, identity_supported))
             })
             .collect::<Result<Vec<_>, DatabaseError>>()?;
 
@@ -815,19 +803,12 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
         )
         .await
         .map_err(|_| self.operation_timeout_error())?
-        .map_err(map_sqlx_error)?;
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("table", table.name.as_str()))?;
 
         let indexes = rows
             .iter()
-            .map(|row| {
-                Ok(IndexSummary {
-                    name: decode(row, "name")?,
-                    columns: decode(row, "columns")?,
-                    unique: decode(row, "unique_index")?,
-                    primary: decode(row, "primary_index")?,
-                    method: decode(row, "method")?,
-                })
-            })
+            .map(|row| Ok(PgIndexRecord::from_row(row)?.into_summary()))
             .collect::<Result<Vec<_>, DatabaseError>>()?;
 
         Ok(Page::from_items(indexes, page, None))
@@ -853,25 +834,402 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
         )
         .await
         .map_err(|_| self.operation_timeout_error())?
-        .map_err(map_sqlx_error)?;
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("table", table.name.as_str()))?;
 
         let constraints = rows
             .iter()
+            .map(|row| Ok(PgConstraintRecord::from_row(row)?.into_summary()))
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+
+        Ok(Page::from_items(constraints, page, None))
+    }
+
+    async fn table_dependencies(
+        &self,
+        table: &TableRef,
+        limit: u32,
+    ) -> Result<TableDependencies, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseTables)?;
+        let schema = self.table_schema_filter(table)?.ok_or_else(|| {
+            DatabaseError::validation(
+                "Select a PostgreSQL schema before inspecting table dependencies.",
+            )
+        })?;
+        let table_name = table.name.as_str();
+        let limit_i64 = i64::from(limit.clamp(1, crate::database::MAX_PAGE_LIMIT));
+        let limit_usize = limit_i64 as usize;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+
+        let foreign_key_rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::TABLE_INCOMING_FOREIGN_KEYS)
+                .bind(&schema)
+                .bind(table_name)
+                .bind(limit_i64)
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("table", table_name))?;
+
+        let incoming_foreign_keys = foreign_key_rows
+            .iter()
             .map(|row| {
-                let kind: String = decode(row, "kind")?;
-                Ok(ConstraintSummary {
+                Ok(DependencySummary {
+                    kind: DependencyKind::IncomingForeignKey,
                     name: decode(row, "name")?,
-                    kind: constraint_kind(&kind),
+                    database: Some(decode(row, "database_name")?),
+                    schema: Some(decode(row, "schema_name")?),
+                    table: Some(decode(row, "table_name")?),
                     columns: decode(row, "columns")?,
-                    referenced_table: decode(row, "referenced_table")?,
                     referenced_columns: decode(row, "referenced_columns")?,
-                    on_update: decode(row, "on_update")?,
-                    on_delete: decode(row, "on_delete")?,
+                    on_update: MetadataValue::available(decode::<Option<String>>(
+                        row,
+                        "on_update",
+                    )?),
+                    on_delete: MetadataValue::available(decode::<Option<String>>(
+                        row,
+                        "on_delete",
+                    )?),
+                    details: MetadataValue::Unavailable,
                 })
             })
             .collect::<Result<Vec<_>, DatabaseError>>()?;
 
-        Ok(Page::from_items(constraints, page, None))
+        let view_rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::TABLE_DEPENDENT_VIEWS)
+                .bind(&schema)
+                .bind(table_name)
+                .bind(limit_i64)
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("table", table_name))?;
+
+        let dependent_views = view_rows
+            .iter()
+            .map(|row| {
+                let view_kind: String = decode(row, "view_kind")?;
+                Ok(DependencySummary {
+                    kind: if view_kind.eq_ignore_ascii_case("MATERIALIZED VIEW") {
+                        DependencyKind::DependentMaterializedView
+                    } else {
+                        DependencyKind::DependentView
+                    },
+                    name: decode(row, "name")?,
+                    database: Some(decode(row, "database_name")?),
+                    schema: Some(decode(row, "schema_name")?),
+                    table: None,
+                    columns: Vec::new(),
+                    referenced_columns: Vec::new(),
+                    on_update: MetadataValue::Unavailable,
+                    on_delete: MetadataValue::Unavailable,
+                    details: MetadataValue::available(view_kind),
+                })
+            })
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+
+        let sequence_rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::TABLE_OWNED_SEQUENCES)
+                .bind(&schema)
+                .bind(table_name)
+                .bind(limit_i64)
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("table", table_name))?;
+
+        let owned_sequences = sequence_rows
+            .iter()
+            .map(|row| {
+                let column: Option<String> = decode(row, "column_name")?;
+                Ok(DependencySummary {
+                    kind: DependencyKind::OwnedSequence,
+                    name: decode(row, "name")?,
+                    database: Some(decode(row, "database_name")?),
+                    schema: Some(decode(row, "schema_name")?),
+                    table: Some(table_name.to_string()),
+                    columns: column.into_iter().collect(),
+                    referenced_columns: Vec::new(),
+                    on_update: MetadataValue::Unavailable,
+                    on_delete: MetadataValue::Unavailable,
+                    details: MetadataValue::Unavailable,
+                })
+            })
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+
+        let trigger_rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::TABLE_TRIGGERS)
+                .bind(&schema)
+                .bind(table_name)
+                .bind(limit_i64)
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("table", table_name))?;
+
+        let triggers = trigger_rows
+            .iter()
+            .map(|row| {
+                Ok(DependencySummary {
+                    kind: DependencyKind::Trigger,
+                    name: decode(row, "name")?,
+                    database: Some(decode(row, "database_name")?),
+                    schema: Some(decode(row, "schema_name")?),
+                    table: Some(decode(row, "table_name")?),
+                    columns: Vec::new(),
+                    referenced_columns: Vec::new(),
+                    on_update: MetadataValue::Unavailable,
+                    on_delete: MetadataValue::Unavailable,
+                    details: MetadataValue::available(decode(row, "definition")?),
+                })
+            })
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+
+        Ok(TableDependencies {
+            incoming_foreign_keys: MetadataValue::available(Bounded::new(
+                incoming_foreign_keys,
+                limit_usize,
+            )),
+            dependent_views: MetadataValue::available(Bounded::new(dependent_views, limit_usize)),
+            owned_sequences: MetadataValue::available(Bounded::new(owned_sequences, limit_usize)),
+            triggers: MetadataValue::available(Bounded::new(triggers, limit_usize)),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PgTableRecord {
+    database_name: String,
+    schema_name: String,
+    name: String,
+    table_type: String,
+    owner: Option<String>,
+    size_bytes: Option<i64>,
+    estimated_rows: Option<i64>,
+    engine: Option<String>,
+    metadata_refreshed_at: Option<String>,
+}
+
+impl PgTableRecord {
+    fn from_row(row: &PgRow) -> Result<Self, DatabaseError> {
+        Ok(Self {
+            database_name: decode(row, "database_name")?,
+            schema_name: decode(row, "schema_name")?,
+            name: decode(row, "name")?,
+            table_type: decode(row, "table_type")?,
+            owner: decode(row, "owner")?,
+            size_bytes: decode(row, "size_bytes")?,
+            estimated_rows: decode(row, "estimated_rows")?,
+            engine: decode(row, "engine")?,
+            metadata_refreshed_at: decode(row, "metadata_refreshed_at")?,
+        })
+    }
+
+    fn into_summary(self) -> TableSummary {
+        TableSummary {
+            database: Some(self.database_name),
+            schema: Some(self.schema_name),
+            name: self.name,
+            kind: table_kind(&self.table_type),
+            estimated_rows: self
+                .estimated_rows
+                .and_then(|value| u64::try_from(value).ok())
+                .into(),
+            metadata_refreshed_at: self.metadata_refreshed_at.into(),
+            metadata: ObjectMetadata {
+                owner: self.owner.into(),
+                size_bytes: self
+                    .size_bytes
+                    .and_then(|value| u64::try_from(value).ok())
+                    .into(),
+                engine: self.engine.into(),
+                ..ObjectMetadata::default()
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PgColumnRecord {
+    name: String,
+    data_type: String,
+    length: Option<i64>,
+    precision: Option<i64>,
+    scale: Option<i64>,
+    nullable: bool,
+    column_expression: Option<String>,
+    ordinal_position: i64,
+    primary_key: bool,
+    generated: bool,
+    identity_generation: String,
+    collation: Option<String>,
+    comment: Option<String>,
+}
+
+impl PgColumnRecord {
+    fn from_row(row: &PgRow) -> Result<Self, DatabaseError> {
+        Ok(Self {
+            name: decode(row, "name")?,
+            data_type: decode(row, "data_type")?,
+            length: decode(row, "length")?,
+            precision: decode(row, "precision")?,
+            scale: decode(row, "scale")?,
+            nullable: decode(row, "nullable")?,
+            column_expression: decode(row, "column_expression")?,
+            ordinal_position: decode(row, "ordinal_position")?,
+            primary_key: decode(row, "primary_key")?,
+            generated: decode(row, "generated")?,
+            identity_generation: decode(row, "identity_generation")?,
+            collation: decode(row, "collation")?,
+            comment: decode(row, "comment")?,
+        })
+    }
+
+    fn into_summary(self, generated_supported: bool, identity_supported: bool) -> ColumnSummary {
+        let generation_expression = if generated_supported {
+            MetadataValue::available(if self.generated {
+                self.column_expression.clone()
+            } else {
+                None
+            })
+        } else {
+            MetadataValue::Unavailable
+        };
+        let generated = if generated_supported {
+            MetadataValue::available(self.generated)
+        } else {
+            MetadataValue::Unavailable
+        };
+        let identity = if identity_supported {
+            MetadataValue::available(match self.identity_generation.as_str() {
+                "a" => ColumnIdentity::Always,
+                "d" => ColumnIdentity::ByDefault,
+                _ => ColumnIdentity::None,
+            })
+        } else {
+            MetadataValue::Unavailable
+        };
+
+        ColumnSummary {
+            name: self.name,
+            data_type: self.data_type,
+            length: MetadataValue::available(
+                self.length.and_then(|value| u64::try_from(value).ok()),
+            ),
+            precision: MetadataValue::available(
+                self.precision.and_then(|value| u32::try_from(value).ok()),
+            ),
+            scale: MetadataValue::available(self.scale.and_then(|value| u32::try_from(value).ok())),
+            nullable: self.nullable,
+            default_value: MetadataValue::available(if self.generated {
+                None
+            } else {
+                self.column_expression
+            }),
+            ordinal_position: u32::try_from(self.ordinal_position).unwrap_or(u32::MAX),
+            primary_key: self.primary_key,
+            identity,
+            generated,
+            generation_expression,
+            comment: MetadataValue::available(self.comment),
+            collation: MetadataValue::available(self.collation),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PgIndexRecord {
+    name: String,
+    columns: Vec<String>,
+    unique: bool,
+    primary: bool,
+    method: Option<String>,
+    predicate: Option<String>,
+}
+
+impl PgIndexRecord {
+    fn from_row(row: &PgRow) -> Result<Self, DatabaseError> {
+        Ok(Self {
+            name: decode(row, "name")?,
+            columns: decode(row, "columns")?,
+            unique: decode(row, "unique_index")?,
+            primary: decode(row, "primary_index")?,
+            method: decode(row, "method")?,
+            predicate: decode(row, "predicate")?,
+        })
+    }
+
+    fn into_summary(self) -> IndexSummary {
+        IndexSummary {
+            name: self.name,
+            columns: self.columns,
+            unique: self.unique,
+            primary: self.primary,
+            method: self.method.into(),
+            predicate: MetadataValue::available(self.predicate),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PgConstraintRecord {
+    name: String,
+    kind: String,
+    columns: Vec<String>,
+    referenced_schema: Option<String>,
+    referenced_table: Option<String>,
+    referenced_columns: Vec<String>,
+    on_update: Option<String>,
+    on_delete: Option<String>,
+    check_expression: Option<String>,
+    deferrable: bool,
+    initially_deferred: bool,
+}
+
+impl PgConstraintRecord {
+    fn from_row(row: &PgRow) -> Result<Self, DatabaseError> {
+        Ok(Self {
+            name: decode(row, "name")?,
+            kind: decode(row, "kind")?,
+            columns: decode(row, "columns")?,
+            referenced_schema: decode(row, "referenced_schema")?,
+            referenced_table: decode(row, "referenced_table")?,
+            referenced_columns: decode(row, "referenced_columns")?,
+            on_update: decode(row, "on_update")?,
+            on_delete: decode(row, "on_delete")?,
+            check_expression: decode(row, "check_expression")?,
+            deferrable: decode(row, "deferrable")?,
+            initially_deferred: decode(row, "initially_deferred")?,
+        })
+    }
+
+    fn into_summary(self) -> ConstraintSummary {
+        ConstraintSummary {
+            kind: constraint_kind(&self.kind),
+            name: self.name,
+            columns: self.columns,
+            referenced_schema: MetadataValue::available(self.referenced_schema),
+            referenced_table: MetadataValue::available(self.referenced_table),
+            referenced_columns: self.referenced_columns,
+            on_update: MetadataValue::available(self.on_update),
+            on_delete: MetadataValue::available(self.on_delete),
+            check_expression: MetadataValue::available(self.check_expression),
+            deferrable: MetadataValue::available(self.deferrable),
+            initially_deferred: MetadataValue::available(self.initially_deferred),
+        }
     }
 }
 
@@ -1158,6 +1516,20 @@ mod tests {
     }
 
     #[test]
+    fn permission_failures_are_scoped_without_driver_text_or_sql() {
+        let error = map_postgres_error("42501").scoped_permission("table", "users");
+        assert_eq!(error.kind, DatabaseErrorKind::Permission);
+        assert_eq!(
+            error.scope.as_ref().map(|scope| scope.name.as_str()),
+            Some("users")
+        );
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("SELECT"));
+        assert!(!debug.contains("pg_catalog"));
+        assert!(!debug.contains("super-secret-token"));
+    }
+
+    #[test]
     fn unsupported_ssl_mode_does_not_leak_the_value_through_a_driver_error() {
         let mut request = request();
         request.password = DatabasePassword::new("super-secret-token");
@@ -1256,6 +1628,230 @@ mod tests {
         assert!(!capabilities::flags_for(Some(DatabaseVersion::new(11, 9, 0))).generated_columns);
     }
 
+    #[test]
+    fn postgres_fixture_table_and_column_metadata_match_the_ddl() {
+        let summary = PgTableRecord {
+            database_name: "app".to_string(),
+            schema_name: "public".to_string(),
+            name: "users".to_string(),
+            table_type: "BASE TABLE".to_string(),
+            owner: Some("app".to_string()),
+            size_bytes: Some(8_192),
+            estimated_rows: Some(42),
+            engine: Some("heap".to_string()),
+            metadata_refreshed_at: Some("2026-01-02T03:04:05Z".to_string()),
+        }
+        .into_summary();
+        assert_eq!(summary.database.as_deref(), Some("app"));
+        assert_eq!(summary.schema.as_deref(), Some("public"));
+        assert_eq!(summary.kind, TableKind::Table);
+        assert_eq!(summary.estimated_rows, MetadataValue::available(42));
+        assert_eq!(
+            summary.metadata_refreshed_at,
+            MetadataValue::available("2026-01-02T03:04:05Z".to_string())
+        );
+        assert_eq!(
+            summary.metadata.owner,
+            MetadataValue::available("app".to_string())
+        );
+
+        let id = PgColumnRecord {
+            name: "id".to_string(),
+            data_type: "bigint".to_string(),
+            precision: Some(64),
+            scale: Some(0),
+            ordinal_position: 1,
+            primary_key: true,
+            identity_generation: "a".to_string(),
+            ..fixture_column("id", "bigint")
+        }
+        .into_summary(true, true);
+        assert_eq!(
+            id.identity,
+            MetadataValue::available(ColumnIdentity::Always)
+        );
+        assert!(id.primary_key);
+        assert_eq!(id.precision, MetadataValue::available(Some(64)));
+
+        let email = PgColumnRecord {
+            name: "email".to_string(),
+            data_type: "character varying(255)".to_string(),
+            length: Some(255),
+            ordinal_position: 2,
+            collation: Some("default".to_string()),
+            comment: Some("Login address".to_string()),
+            ..fixture_column("email", "character varying(255)")
+        }
+        .into_summary(true, true);
+        assert_eq!(email.length, MetadataValue::available(Some(255)));
+        assert_eq!(
+            email.collation,
+            MetadataValue::available(Some("default".to_string()))
+        );
+        assert_eq!(
+            email.comment,
+            MetadataValue::available(Some("Login address".to_string()))
+        );
+
+        let status = PgColumnRecord {
+            name: "status".to_string(),
+            data_type: "character varying(16)".to_string(),
+            length: Some(16),
+            column_expression: Some("'active'::character varying".to_string()),
+            ordinal_position: 3,
+            ..fixture_column("status", "character varying(16)")
+        }
+        .into_summary(true, true);
+        assert_eq!(
+            status.default_value,
+            MetadataValue::available(Some("'active'::character varying".to_string()))
+        );
+
+        let note = PgColumnRecord {
+            name: "note".to_string(),
+            data_type: "text".to_string(),
+            ordinal_position: 5,
+            nullable: true,
+            generated: true,
+            column_expression: Some("((email)::text || ':note'::text)".to_string()),
+            ..fixture_column("note", "text")
+        }
+        .into_summary(true, true);
+        assert_eq!(note.generated, MetadataValue::available(true));
+        assert_eq!(
+            note.generation_expression,
+            MetadataValue::available(Some("((email)::text || ':note'::text)".to_string()))
+        );
+        assert_eq!(
+            note.default_value,
+            MetadataValue::<Option<String>>::available(None)
+        );
+
+        let old_server_note = PgColumnRecord {
+            name: "note".to_string(),
+            data_type: "text".to_string(),
+            generated: true,
+            column_expression: Some("((email)::text || ':note'::text)".to_string()),
+            ..fixture_column("note", "text")
+        }
+        .into_summary(false, false);
+        assert_eq!(old_server_note.generated, MetadataValue::Unavailable);
+        assert_eq!(old_server_note.identity, MetadataValue::Unavailable);
+        assert_eq!(
+            old_server_note.generation_expression,
+            MetadataValue::Unavailable
+        );
+    }
+
+    #[test]
+    fn postgres_fixture_indexes_and_constraints_match_the_ddl() {
+        let primary = PgIndexRecord {
+            name: "users_pkey".to_string(),
+            columns: vec!["id".to_string()],
+            unique: true,
+            primary: true,
+            method: Some("btree".to_string()),
+            predicate: None,
+        }
+        .into_summary();
+        assert!(primary.primary);
+        assert_eq!(
+            primary.method,
+            MetadataValue::available("btree".to_string())
+        );
+        assert_eq!(
+            primary.predicate,
+            MetadataValue::<Option<String>>::available(None)
+        );
+
+        let partial = PgIndexRecord {
+            name: "users_active_email_key".to_string(),
+            columns: vec!["email".to_string()],
+            unique: true,
+            primary: false,
+            method: Some("btree".to_string()),
+            predicate: Some("(status = 'active'::text)".to_string()),
+        }
+        .into_summary();
+        assert_eq!(
+            partial.predicate,
+            MetadataValue::available(Some("(status = 'active'::text)".to_string()))
+        );
+
+        let foreign_key = PgConstraintRecord {
+            name: "users_parent_fk".to_string(),
+            kind: "FOREIGN KEY".to_string(),
+            columns: vec!["parent_id".to_string()],
+            referenced_schema: Some("public".to_string()),
+            referenced_table: Some("users".to_string()),
+            referenced_columns: vec!["id".to_string()],
+            on_update: Some("CASCADE".to_string()),
+            on_delete: Some("SET NULL".to_string()),
+            check_expression: None,
+            deferrable: false,
+            initially_deferred: false,
+        }
+        .into_summary();
+        assert_eq!(foreign_key.kind, ConstraintKind::ForeignKey);
+        assert_eq!(
+            foreign_key.referenced_schema,
+            MetadataValue::available(Some("public".to_string()))
+        );
+        assert_eq!(
+            foreign_key.referenced_table,
+            MetadataValue::available(Some("users".to_string()))
+        );
+        assert_eq!(foreign_key.referenced_columns, ["id"]);
+        assert_eq!(
+            foreign_key.on_update,
+            MetadataValue::available(Some("CASCADE".to_string()))
+        );
+        assert_eq!(
+            foreign_key.on_delete,
+            MetadataValue::available(Some("SET NULL".to_string()))
+        );
+
+        let check = PgConstraintRecord {
+            name: "users_balance_check".to_string(),
+            kind: "CHECK".to_string(),
+            columns: Vec::new(),
+            referenced_schema: None,
+            referenced_table: None,
+            referenced_columns: Vec::new(),
+            on_update: None,
+            on_delete: None,
+            check_expression: Some("CHECK ((balance >= (0)::numeric))".to_string()),
+            deferrable: true,
+            initially_deferred: false,
+        }
+        .into_summary();
+        assert_eq!(check.kind, ConstraintKind::Check);
+        assert_eq!(
+            check.check_expression,
+            MetadataValue::available(Some("CHECK ((balance >= (0)::numeric))".to_string()))
+        );
+        assert_eq!(check.deferrable, MetadataValue::available(true));
+        assert_eq!(check.initially_deferred, MetadataValue::available(false));
+    }
+
+    fn fixture_column(name: &str, data_type: &str) -> PgColumnRecord {
+        PgColumnRecord {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            length: None,
+            precision: None,
+            scale: None,
+            nullable: false,
+            column_expression: None,
+            ordinal_position: 1,
+            primary_key: false,
+            generated: false,
+            identity_generation: String::new(),
+            collation: None,
+            comment: None,
+        }
+    }
+
     // Live tests are opt-in. They are skipped unless the container fixture
     // environment is present; see docs/database-architecture.md.
     struct LivePostgres {
@@ -1331,6 +1927,10 @@ mod tests {
             .expect("connect to fixture");
 
         adapter
+            .execute_for_test("DROP VIEW IF EXISTS serverdesk_probe_view")
+            .await
+            .expect("drop stale probe view");
+        adapter
             .execute_for_test("DROP TABLE IF EXISTS serverdesk_writable_probe")
             .await
             .expect("drop stale probe");
@@ -1359,6 +1959,37 @@ mod tests {
             )
             .await
             .expect("create probe sequence");
+        adapter
+            .execute_for_test(
+                "CREATE TABLE serverdesk_probe_child (
+                    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    probe_id bigint NOT NULL,
+                    CONSTRAINT serverdesk_probe_child_fk FOREIGN KEY (probe_id)
+                        REFERENCES serverdesk_writable_probe(id)
+                        ON DELETE CASCADE ON UPDATE RESTRICT
+                )",
+            )
+            .await
+            .expect("create probe child table");
+        adapter
+            .execute_for_test(
+                "CREATE FUNCTION serverdesk_probe_trigger_fn() RETURNS trigger
+                 LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
+            )
+            .await
+            .expect("create probe trigger function");
+        adapter
+            .execute_for_test(
+                "CREATE TRIGGER serverdesk_probe_trigger BEFORE INSERT
+                 ON serverdesk_writable_probe FOR EACH ROW
+                 EXECUTE FUNCTION serverdesk_probe_trigger_fn()",
+            )
+            .await
+            .expect("create probe trigger");
+        adapter
+            .execute_for_test("ANALYZE serverdesk_writable_probe")
+            .await
+            .expect("analyze probe table");
 
         let scope = MetadataScope::new(Some(&fixture.database), Some("public")).expect("scope");
         let tables = adapter
@@ -1374,6 +2005,7 @@ mod tests {
         assert!(probe.metadata.size_bytes.is_available());
         assert!(probe.metadata.engine.is_available());
         assert!(probe.estimated_rows.is_available());
+        assert!(probe.metadata_refreshed_at.is_available());
 
         let views = adapter
             .list_views(&scope, PageRequest::new(500, 0))
@@ -1423,8 +2055,11 @@ mod tests {
             .expect("list columns");
         assert_eq!(columns.items.len(), 3);
         assert!(columns.items[0].primary_key);
-        assert!(columns.items[0].identity);
-        assert!(columns.items[2].generated);
+        assert_eq!(
+            columns.items[0].identity,
+            MetadataValue::available(ColumnIdentity::Always)
+        );
+        assert_eq!(columns.items[2].generated, MetadataValue::available(true));
 
         let indexes = adapter
             .list_indexes(&table, PageRequest::new(500, 0))
@@ -1450,6 +2085,47 @@ mod tests {
                 .any(|constraint| constraint.kind == ConstraintKind::Check)
         );
 
+        let dependencies = adapter
+            .table_dependencies(&table, 50)
+            .await
+            .expect("table dependencies");
+        let foreign_keys = dependencies
+            .incoming_foreign_keys
+            .value()
+            .expect("incoming foreign keys");
+        assert!(foreign_keys.items.iter().any(|dependency| {
+            dependency.name == "serverdesk_probe_child_fk"
+                && dependency.table.as_deref() == Some("serverdesk_probe_child")
+                && dependency.columns == ["probe_id"]
+                && dependency.referenced_columns == ["id"]
+                && dependency.on_delete == MetadataValue::available(Some("CASCADE".to_string()))
+        }));
+        let views = dependencies.dependent_views.value().expect("views");
+        assert!(
+            views
+                .items
+                .iter()
+                .any(|dependency| dependency.name == "serverdesk_probe_view")
+        );
+        let sequences = dependencies
+            .owned_sequences
+            .value()
+            .expect("owned sequences");
+        assert!(sequences.items.iter().any(|dependency| {
+            dependency.name == "serverdesk_writable_probe_id_seq" && dependency.columns == ["id"]
+        }));
+        let triggers = dependencies.triggers.value().expect("triggers");
+        assert!(
+            triggers
+                .items
+                .iter()
+                .any(|dependency| dependency.name == "serverdesk_probe_trigger")
+        );
+
+        adapter
+            .execute_for_test("DROP TABLE serverdesk_probe_child")
+            .await
+            .expect("drop probe child table");
         adapter
             .execute_for_test("DROP VIEW serverdesk_probe_view")
             .await
@@ -1462,6 +2138,10 @@ mod tests {
             .execute_for_test("DROP TABLE serverdesk_writable_probe")
             .await
             .expect("drop probe table");
+        adapter
+            .execute_for_test("DROP FUNCTION serverdesk_probe_trigger_fn()")
+            .await
+            .expect("drop probe trigger function");
         adapter.close().await.expect("close fixture");
     }
 

@@ -68,6 +68,27 @@ mod tests {
         assert!(sql::LIST_SEQUENCES.contains("information_schema.sequences"));
         assert!(sql::OBJECT_COUNTS.contains("sequence_count"));
         assert!(!sql::OBJECT_COUNTS.contains('?'));
+
+        assert!(sql::LIST_TABLES.contains("pg_stat_user_tables"));
+        assert!(sql::LIST_TABLES.contains("metadata_refreshed_at"));
+        assert!(sql::LIST_COLUMNS.contains("character_maximum_length"));
+        assert!(sql::LIST_COLUMNS.contains("attidentity"));
+        assert!(sql::LIST_COLUMNS.contains("collation_name"));
+        assert!(sql::LIST_INDEXES.contains("indpred"));
+        assert!(sql::LIST_CONSTRAINTS.contains("CHECK"));
+        assert!(sql::LIST_CONSTRAINTS.contains("condeferrable"));
+        assert!(sql::TABLE_INCOMING_FOREIGN_KEYS.contains("confupdtype"));
+        assert!(sql::TABLE_DEPENDENT_VIEWS.contains("pg_depend"));
+        assert!(sql::TABLE_OWNED_SEQUENCES.contains("deptype IN ('a', 'i')"));
+        assert!(sql::TABLE_TRIGGERS.contains("tgisinternal"));
+        for statement in [
+            sql::TABLE_INCOMING_FOREIGN_KEYS,
+            sql::TABLE_DEPENDENT_VIEWS,
+            sql::TABLE_OWNED_SEQUENCES,
+            sql::TABLE_TRIGGERS,
+        ] {
+            assert!(statement.contains("LIMIT $3"));
+        }
     }
 
     #[test]

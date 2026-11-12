@@ -59,10 +59,18 @@ pub const LIST_TABLES: &str = r#"SELECT current_database() AS database_name,
          THEN pg_catalog.pg_total_relation_size(c.oid)
     END AS size_bytes,
     CASE WHEN c.reltuples >= 0 THEN c.reltuples::bigint END AS estimated_rows,
-    am.amname AS engine
+    am.amname AS engine,
+    CASE
+        WHEN GREATEST(st.last_analyze, st.last_autoanalyze) IS NOT NULL
+        THEN pg_catalog.to_char(
+            GREATEST(st.last_analyze, st.last_autoanalyze) AT TIME ZONE 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+        )
+    END AS metadata_refreshed_at
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
+LEFT JOIN pg_catalog.pg_stat_user_tables st ON st.relid = c.oid
 WHERE c.relkind IN ('r', 'p', 'f')
   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
   AND ($1::text IS NULL OR n.nspname = $1)
@@ -135,8 +143,11 @@ pub const OBJECT_COUNTS: &str = r#"SELECT
 
 pub const LIST_COLUMNS: &str = r#"SELECT a.attname AS name,
     pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+    isc.character_maximum_length::bigint AS length,
+    COALESCE(isc.numeric_precision, isc.datetime_precision)::bigint AS precision,
+    isc.numeric_scale::bigint AS scale,
     NOT a.attnotnull AS nullable,
-    pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) AS default_value,
+    pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) AS column_expression,
     a.attnum::bigint AS ordinal_position,
     EXISTS (
         SELECT 1
@@ -146,13 +157,18 @@ pub const LIST_COLUMNS: &str = r#"SELECT a.attname AS name,
           AND a.attnum = ANY (i.indkey)
     ) AS primary_key,
     COALESCE(row_to_json(a)->>'attgenerated', '') <> '' AS generated,
-    COALESCE(row_to_json(a)->>'attidentity', '') <> '' AS identity,
+    COALESCE(row_to_json(a)->>'attidentity', '') AS identity_generation,
+    isc.collation_name AS collation,
     pg_catalog.col_description(a.attrelid, a.attnum) AS comment
 FROM pg_catalog.pg_attribute a
 JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN pg_catalog.pg_attrdef ad
        ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+LEFT JOIN information_schema.columns isc
+       ON isc.table_schema = n.nspname
+      AND isc.table_name = c.relname
+      AND isc.column_name = a.attname
 WHERE a.attnum > 0
   AND NOT a.attisdropped
   AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
@@ -166,6 +182,7 @@ pub const LIST_INDEXES: &str = r#"SELECT i.relname AS name,
     ix.indisunique AS unique_index,
     ix.indisprimary AS primary_index,
     am.amname AS method,
+    pg_catalog.pg_get_expr(ix.indpred, ix.indrelid) AS predicate,
     ARRAY(
         SELECT pg_catalog.pg_get_indexdef(ix.indexrelid, position, true)
         FROM generate_series(1, ix.indnatts) AS position
@@ -191,6 +208,11 @@ pub const LIST_CONSTRAINTS: &str = r#"SELECT c.conname AS name,
     END AS kind,
     n.nspname AS schema_name,
     t.relname AS table_name,
+    c.condeferrable AS deferrable,
+    c.condeferred AS initially_deferred,
+    CASE WHEN c.contype = 'c'
+         THEN pg_catalog.pg_get_constraintdef(c.oid)
+    END AS check_expression,
     ARRAY(
         SELECT a.attname
         FROM unnest(c.conkey) WITH ORDINALITY AS key(attnum, position)
@@ -226,11 +248,115 @@ JOIN pg_catalog.pg_class t ON t.oid = c.conrelid
 JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
 LEFT JOIN pg_catalog.pg_class rt ON rt.oid = c.confrelid
 LEFT JOIN pg_catalog.pg_namespace rn ON rn.oid = rt.relnamespace
-WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+WHERE c.contype IN ('p', 'u', 'f', 'c', 'x')
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
   AND ($1::text IS NULL OR n.nspname = $1)
   AND ($2::text IS NULL OR t.relname = $2)
 ORDER BY n.nspname, t.relname, c.conname
 LIMIT $3 OFFSET $4"#;
+
+/// Incoming foreign keys are the primary dependency to inspect before
+/// dropping or rewriting a referenced table or column.
+pub const TABLE_INCOMING_FOREIGN_KEYS: &str = r#"SELECT c.conname AS name,
+    current_database() AS database_name,
+    n.nspname AS schema_name,
+    t.relname AS table_name,
+    ARRAY(
+        SELECT a.attname
+        FROM unnest(c.conkey) WITH ORDINALITY AS key(attnum, position)
+        JOIN pg_catalog.pg_attribute a
+          ON a.attrelid = c.conrelid AND a.attnum = key.attnum
+        ORDER BY key.position
+    ) AS columns,
+    ARRAY(
+        SELECT a.attname
+        FROM unnest(c.confkey) WITH ORDINALITY AS key(attnum, position)
+        JOIN pg_catalog.pg_attribute a
+          ON a.attrelid = c.confrelid AND a.attnum = key.attnum
+        ORDER BY key.position
+    ) AS referenced_columns,
+    CASE c.confupdtype
+        WHEN 'a' THEN 'NO ACTION'
+        WHEN 'r' THEN 'RESTRICT'
+        WHEN 'c' THEN 'CASCADE'
+        WHEN 'n' THEN 'SET NULL'
+        WHEN 'd' THEN 'SET DEFAULT'
+    END AS on_update,
+    CASE c.confdeltype
+        WHEN 'a' THEN 'NO ACTION'
+        WHEN 'r' THEN 'RESTRICT'
+        WHEN 'c' THEN 'CASCADE'
+        WHEN 'n' THEN 'SET NULL'
+        WHEN 'd' THEN 'SET DEFAULT'
+    END AS on_delete
+FROM pg_catalog.pg_constraint c
+JOIN pg_catalog.pg_class t ON t.oid = c.conrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+JOIN pg_catalog.pg_class rt ON rt.oid = c.confrelid
+JOIN pg_catalog.pg_namespace rn ON rn.oid = rt.relnamespace
+WHERE c.contype = 'f'
+  AND rn.nspname = $1
+  AND rt.relname = $2
+ORDER BY n.nspname, t.relname, c.conname
+LIMIT $3"#;
+
+/// Views and materialized views that depend on the table.
+pub const TABLE_DEPENDENT_VIEWS: &str = r#"SELECT DISTINCT
+    current_database() AS database_name,
+    vn.nspname AS schema_name,
+    v.relname AS name,
+    CASE v.relkind WHEN 'm' THEN 'MATERIALIZED VIEW' ELSE 'VIEW' END AS view_kind
+FROM pg_catalog.pg_depend d
+JOIN pg_catalog.pg_rewrite r ON r.oid = d.objid
+JOIN pg_catalog.pg_class v ON v.oid = r.ev_class
+JOIN pg_catalog.pg_namespace vn ON vn.oid = v.relnamespace
+WHERE d.classid = 'pg_rewrite'::regclass
+  AND d.refclassid = 'pg_class'::regclass
+  AND d.refobjid = (
+      SELECT c.oid
+      FROM pg_catalog.pg_class c
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = $1 AND c.relname = $2
+  )
+  AND v.oid <> d.refobjid
+  AND v.relkind IN ('v', 'm')
+ORDER BY schema_name, name
+LIMIT $3"#;
+
+/// Sequences owned by a column, including identity and serial sequences.
+pub const TABLE_OWNED_SEQUENCES: &str = r#"SELECT
+    current_database() AS database_name,
+    sn.nspname AS schema_name,
+    s.relname AS name,
+    a.attname AS column_name
+FROM pg_catalog.pg_depend d
+JOIN pg_catalog.pg_class s ON s.oid = d.objid AND s.relkind = 'S'
+JOIN pg_catalog.pg_namespace sn ON sn.oid = s.relnamespace
+JOIN pg_catalog.pg_class t ON t.oid = d.refobjid
+JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace
+LEFT JOIN pg_catalog.pg_attribute a
+       ON a.attrelid = t.oid AND a.attnum = d.refobjsubid
+WHERE d.deptype IN ('a', 'i')
+  AND tn.nspname = $1
+  AND t.relname = $2
+ORDER BY sn.nspname, s.relname
+LIMIT $3"#;
+
+/// User-defined triggers on the table.
+pub const TABLE_TRIGGERS: &str = r#"SELECT
+    current_database() AS database_name,
+    n.nspname AS schema_name,
+    t.relname AS table_name,
+    tr.tgname AS name,
+    pg_catalog.pg_get_triggerdef(tr.oid) AS definition
+FROM pg_catalog.pg_trigger tr
+JOIN pg_catalog.pg_class t ON t.oid = tr.tgrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+WHERE NOT tr.tgisinternal
+  AND n.nspname = $1
+  AND t.relname = $2
+ORDER BY tr.tgname
+LIMIT $3"#;
 
 pub const LIST_ROUTINES: &str = "SELECT routine_schema AS schema_name, routine_name AS name, \
     routine_type AS routine_type \
