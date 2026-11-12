@@ -129,6 +129,7 @@ const usersTable: DatabaseTableSummary = {
   name: "users",
   kind: "table",
   estimatedRows: { status: "available", value: 250 },
+  metadataRefreshedAt: unavailable,
   ...metadata,
 };
 

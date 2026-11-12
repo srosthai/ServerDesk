@@ -63,7 +63,7 @@ impl PageRequest {
 }
 
 /// A collection that never contains more than its configured bound.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Bounded<T> {
     pub items: Vec<T>,

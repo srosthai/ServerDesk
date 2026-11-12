@@ -31,12 +31,13 @@ use crate::database::{
     capabilities::{DatabaseAction, DatabaseCapabilities, DatabaseVersion},
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
-    pagination::{Page, PageRequest},
+    pagination::{Bounded, Page, PageRequest},
     traits::{
-        ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter, DatabaseConnectRequest,
-        DatabaseConnectionInfo, DatabasePing, DatabaseSummary, DatabaseVersionInfo, IndexSummary,
-        MetadataScope, MetadataValue, ObjectCounts, ObjectMetadata, SchemaSummary, SequenceSummary,
-        TableKind, TableRef, TableSummary, ViewKind, ViewSummary,
+        ColumnIdentity, ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter,
+        DatabaseConnectRequest, DatabaseConnectionInfo, DatabasePing, DatabaseSummary,
+        DatabaseVersionInfo, DependencyKind, DependencySummary, IndexSummary, MetadataScope,
+        MetadataValue, ObjectCounts, ObjectMetadata, SchemaSummary, SequenceSummary,
+        TableDependencies, TableKind, TableRef, TableSummary, ViewKind, ViewSummary,
     },
     validation::validate_connect_request,
 };
@@ -269,6 +270,56 @@ impl MysqlDatabaseAdapter {
             (None, Some(schema)) => Ok(Some(schema.to_string())),
             (None, None) => Ok(None),
         }
+    }
+
+    /// Reads InnoDB statistics refresh timestamps for the current page only.
+    /// Every failure is treated as unavailable: the table list itself already
+    /// succeeded and this optional table is commonly inaccessible.
+    async fn table_statistics_refresh_times(
+        &self,
+        connection: &mut MySqlConnection,
+        database: Option<&str>,
+        records: &[MysqlTableRecord],
+    ) -> HashMap<String, String> {
+        let Some(database) = database else {
+            return HashMap::new();
+        };
+        if records.is_empty() {
+            return HashMap::new();
+        }
+
+        let names = records
+            .iter()
+            .map(|record| record.name.as_str())
+            .collect::<Vec<_>>();
+        let placeholders = std::iter::repeat_n("?", names.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let statement = format!(
+            "{} AND table_name IN ({placeholders})",
+            sql::TABLE_STATISTICS_REFRESHED_AT
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(statement)).bind(database);
+        for name in names {
+            query = query.bind(name);
+        }
+
+        let rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            query.fetch_all(&mut *connection),
+        )
+        .await;
+        let Ok(Ok(rows)) = rows else {
+            return HashMap::new();
+        };
+
+        rows.iter()
+            .filter_map(|row| {
+                let name: String = row.try_get("name").ok()?;
+                let refreshed_at: Option<String> = row.try_get("refreshed_at").ok()?;
+                Some((name, refreshed_at?))
+            })
+            .collect()
     }
 }
 
@@ -556,31 +607,33 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
         )
         .await
         .map_err(|_| self.operation_timeout_error())?
-        .map_err(map_sqlx_error)?;
+        .map_err(map_sqlx_error)
+        .map_err(|error| {
+            error.scoped_permission("database", database.as_deref().unwrap_or("all databases"))
+        })?;
 
-        let tables = rows
+        let records = rows
             .iter()
-            .map(|row| {
-                let database: String = decode(row, "database_name")?;
-                let table_type: String = decode(row, "table_type")?;
-                Ok(TableSummary {
-                    database: Some(database.clone()),
-                    schema: Some(database),
-                    name: decode(row, "name")?,
-                    kind: table_kind(&table_type),
-                    estimated_rows: decode::<Option<i64>>(row, "estimated_rows")?
-                        .and_then(|value| u64::try_from(value).ok())
-                        .into(),
-                    metadata: ObjectMetadata {
-                        size_bytes: decode::<Option<i64>>(row, "size_bytes")?
-                            .and_then(|value| u64::try_from(value).ok())
-                            .into(),
-                        engine: decode::<Option<String>>(row, "engine")?.into(),
-                        ..ObjectMetadata::default()
-                    },
-                })
-            })
+            .map(MysqlTableRecord::from_row)
             .collect::<Result<Vec<_>, DatabaseError>>()?;
+
+        // InnoDB statistics timestamps live in a mysql schema table that most
+        // application accounts cannot read. Treat that failure as an
+        // unavailable field, not as a failed table listing.
+        let refresh_times = self
+            .table_statistics_refresh_times(&mut *connection, database.as_deref(), &records)
+            .await;
+
+        let tables = records
+            .into_iter()
+            .map(|record| {
+                let refreshed_at = refresh_times
+                    .get(&record.name)
+                    .cloned()
+                    .map_or(MetadataValue::Unavailable, MetadataValue::available);
+                record.into_summary(refreshed_at)
+            })
+            .collect::<Vec<_>>();
 
         Ok(Page::from_items(tables, page, None))
     }
@@ -670,12 +723,14 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
         self.require_capability(DatabaseAction::BrowseColumns)?;
         let database = Self::table_name(table)?;
         let table_name = table.name.as_str();
+        let generated_supported = self
+            .capabilities
+            .supports(DatabaseAction::CreateGeneratedColumn);
         let mut guard = self.live_connection().await?;
         let connection = guard.as_mut().expect("checked above");
-        let statement = format!("{} LIMIT ? OFFSET ?", sql::LIST_COLUMNS);
         let rows = timeout_at(
             tokio::time::Instant::now() + self.operation_timeout,
-            sqlx::query(sqlx::AssertSqlSafe(statement))
+            sqlx::query(sql::LIST_COLUMNS)
                 .bind(database.as_deref())
                 .bind(database.as_deref())
                 .bind(table_name)
@@ -686,24 +741,12 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
         )
         .await
         .map_err(|_| self.operation_timeout_error())?
-        .map_err(map_sqlx_error)?;
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("table", table_name))?;
 
         let columns = rows
             .iter()
-            .map(|row| {
-                let ordinal_position: i64 = decode(row, "ordinal_position")?;
-                Ok(ColumnSummary {
-                    name: decode(row, "name")?,
-                    data_type: decode(row, "data_type")?,
-                    nullable: decode_flag(row, "nullable")?,
-                    default_value: decode(row, "default_value")?,
-                    ordinal_position: u32::try_from(ordinal_position).unwrap_or(u32::MAX),
-                    primary_key: decode_flag(row, "primary_key")?,
-                    generated: decode_flag(row, "generated")?,
-                    identity: false,
-                    comment: decode(row, "comment")?,
-                })
-            })
+            .map(|row| Ok(MysqlColumnRecord::from_row(row)?.into_summary(generated_supported)))
             .collect::<Result<Vec<_>, DatabaseError>>()?;
 
         Ok(Page::from_items(columns, page, None))
@@ -726,38 +769,26 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
                 .bind(database.as_deref())
                 .bind(table_name)
                 .bind(table_name)
+                .bind(i64::from(page.limit) + 1)
+                .bind(i64::try_from(page.offset).unwrap_or(i64::MAX))
+                .bind(database.as_deref())
+                .bind(database.as_deref())
+                .bind(table_name)
+                .bind(table_name)
                 .fetch_all(&mut *connection),
         )
         .await
         .map_err(|_| self.operation_timeout_error())?
-        .map_err(map_sqlx_error)?;
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("table", table_name))?;
 
-        // MySQL returns one row per index column; group the rows before
-        // applying the shared page bound.
-        let mut indexes: Vec<IndexSummary> = Vec::new();
-        let mut positions: HashMap<String, usize> = HashMap::new();
-        for row in rows {
-            let name: String = decode(&row, "name")?;
-            let position = match positions.get(&name) {
-                Some(position) => *position,
-                None => {
-                    let position = indexes.len();
-                    positions.insert(name.clone(), position);
-                    indexes.push(IndexSummary {
-                        name,
-                        columns: Vec::new(),
-                        unique: decode_flag(&row, "unique_index")?,
-                        primary: decode_flag(&row, "primary_index")?,
-                        method: decode(&row, "method")?,
-                    });
-                    position
-                }
-            };
-            let column: Option<String> = decode(&row, "column_name")?;
-            if let Some(column) = column {
-                indexes[position].columns.push(column);
-            }
-        }
+        // MySQL returns one row per index column. The query already selected
+        // at most one page of index names; group only that bounded set.
+        let records = rows
+            .iter()
+            .map(MysqlIndexRow::from_row)
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+        let indexes = MysqlIndexRow::group(records);
 
         Ok(Page::from_items(indexes, page, None))
     }
@@ -770,11 +801,25 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
         self.require_capability(DatabaseAction::BrowseConstraints)?;
         let database = Self::table_name(table)?;
         let table_name = table.name.as_str();
+        let check_supported = self
+            .capabilities
+            .supports(DatabaseAction::CreateCheckConstraint);
+        let statement = if check_supported {
+            sql::LIST_CONSTRAINTS
+        } else {
+            sql::LIST_CONSTRAINTS_WITHOUT_CHECKS
+        };
         let mut guard = self.live_connection().await?;
         let connection = guard.as_mut().expect("checked above");
         let rows = timeout_at(
             tokio::time::Instant::now() + self.operation_timeout,
-            sqlx::query(sql::LIST_CONSTRAINTS)
+            sqlx::query(statement)
+                .bind(database.as_deref())
+                .bind(database.as_deref())
+                .bind(table_name)
+                .bind(table_name)
+                .bind(i64::from(page.limit) + 1)
+                .bind(i64::try_from(page.offset).unwrap_or(i64::MAX))
                 .bind(database.as_deref())
                 .bind(database.as_deref())
                 .bind(table_name)
@@ -783,45 +828,433 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
         )
         .await
         .map_err(|_| self.operation_timeout_error())?
-        .map_err(map_sqlx_error)?;
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("table", table_name))?;
 
+        let records = rows
+            .iter()
+            .map(MysqlConstraintRow::from_row)
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+
+        Ok(Page::from_items(
+            MysqlConstraintRow::group(records, check_supported),
+            page,
+            None,
+        ))
+    }
+
+    async fn table_dependencies(
+        &self,
+        table: &TableRef,
+        limit: u32,
+    ) -> Result<TableDependencies, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseTables)?;
+        let database = Self::table_name(table)?.ok_or_else(|| {
+            DatabaseError::validation(
+                "Select a MySQL database before inspecting table dependencies.",
+            )
+        })?;
+        let table_name = table.name.as_str();
+        let limit = i64::from(limit.clamp(1, crate::database::MAX_PAGE_LIMIT));
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+
+        let foreign_key_rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::TABLE_INCOMING_FOREIGN_KEYS)
+                .bind(&database)
+                .bind(table_name)
+                .bind(limit)
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("table", table_name))?;
+
+        let foreign_key_records = foreign_key_rows
+            .iter()
+            .map(MysqlForeignKeyRow::from_row)
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+        let foreign_keys = MysqlForeignKeyRow::group(foreign_key_records);
+
+        let trigger_rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::TABLE_TRIGGERS)
+                .bind(&database)
+                .bind(table_name)
+                .bind(limit)
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("table", table_name))?;
+
+        let triggers = trigger_rows
+            .iter()
+            .map(|row| MysqlTriggerRow::from_row(row, &database))
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+
+        Ok(TableDependencies {
+            incoming_foreign_keys: MetadataValue::available(Bounded::new(
+                foreign_keys,
+                limit as usize,
+            )),
+            // MariaDB 11.4 does not expose information_schema.VIEW_TABLE_USAGE,
+            // so view dependencies are explicitly unavailable rather than
+            // guessed from view definition text.
+            dependent_views: MetadataValue::Unavailable,
+            owned_sequences: MetadataValue::Unavailable,
+            triggers: MetadataValue::available(Bounded::new(triggers, limit as usize)),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MysqlTableRecord {
+    database_name: String,
+    name: String,
+    table_type: String,
+    estimated_rows: Option<i64>,
+    size_bytes: Option<i64>,
+    engine: Option<String>,
+}
+
+impl MysqlTableRecord {
+    fn from_row(row: &MySqlRow) -> Result<Self, DatabaseError> {
+        Ok(Self {
+            database_name: decode(row, "database_name")?,
+            name: decode(row, "name")?,
+            table_type: decode(row, "table_type")?,
+            estimated_rows: decode(row, "estimated_rows")?,
+            size_bytes: decode(row, "size_bytes")?,
+            engine: decode(row, "engine")?,
+        })
+    }
+
+    fn into_summary(self, metadata_refreshed_at: MetadataValue<String>) -> TableSummary {
+        TableSummary {
+            database: Some(self.database_name.clone()),
+            schema: Some(self.database_name),
+            name: self.name,
+            kind: table_kind(&self.table_type),
+            estimated_rows: self
+                .estimated_rows
+                .and_then(|value| u64::try_from(value).ok())
+                .into(),
+            metadata_refreshed_at,
+            metadata: ObjectMetadata {
+                size_bytes: self
+                    .size_bytes
+                    .and_then(|value| u64::try_from(value).ok())
+                    .into(),
+                engine: self.engine.into(),
+                ..ObjectMetadata::default()
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MysqlColumnRecord {
+    name: String,
+    data_type: String,
+    length: Option<i64>,
+    precision: Option<i64>,
+    scale: Option<i64>,
+    nullable: bool,
+    default_value: Option<String>,
+    ordinal_position: i64,
+    primary_key: bool,
+    generated: bool,
+    generation_expression: Option<String>,
+    auto_increment: bool,
+    comment: String,
+    collation: Option<String>,
+}
+
+impl MysqlColumnRecord {
+    fn from_row(row: &MySqlRow) -> Result<Self, DatabaseError> {
+        Ok(Self {
+            name: decode(row, "name")?,
+            data_type: decode(row, "data_type")?,
+            length: decode(row, "value_length")?,
+            precision: decode(row, "numeric_precision")?,
+            scale: decode(row, "numeric_scale")?,
+            nullable: decode_flag(row, "nullable")?,
+            default_value: decode(row, "default_value")?,
+            ordinal_position: decode(row, "ordinal_position")?,
+            primary_key: decode_flag(row, "primary_key")?,
+            generated: decode_flag(row, "generated")?,
+            generation_expression: decode(row, "generation_expression")?,
+            auto_increment: decode_flag(row, "auto_increment")?,
+            comment: decode(row, "comment")?,
+            collation: decode(row, "collation")?,
+        })
+    }
+
+    fn into_summary(self, generated_supported: bool) -> ColumnSummary {
+        let generation_expression = if generated_supported {
+            MetadataValue::available(if self.generated {
+                self.generation_expression.filter(|value| !value.is_empty())
+            } else {
+                None
+            })
+        } else {
+            MetadataValue::Unavailable
+        };
+        let generated = if generated_supported {
+            MetadataValue::available(self.generated)
+        } else {
+            MetadataValue::Unavailable
+        };
+
+        ColumnSummary {
+            name: self.name,
+            data_type: self.data_type,
+            length: MetadataValue::available(
+                self.length.and_then(|value| u64::try_from(value).ok()),
+            ),
+            precision: MetadataValue::available(
+                self.precision.and_then(|value| u32::try_from(value).ok()),
+            ),
+            scale: MetadataValue::available(self.scale.and_then(|value| u32::try_from(value).ok())),
+            nullable: self.nullable,
+            default_value: MetadataValue::available(self.default_value),
+            ordinal_position: u32::try_from(self.ordinal_position).unwrap_or(u32::MAX),
+            primary_key: self.primary_key,
+            identity: MetadataValue::available(if self.auto_increment {
+                ColumnIdentity::AutoIncrement
+            } else {
+                ColumnIdentity::None
+            }),
+            generated,
+            generation_expression,
+            comment: MetadataValue::available((!self.comment.is_empty()).then_some(self.comment)),
+            collation: MetadataValue::available(self.collation),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MysqlIndexRow {
+    name: String,
+    column_name: Option<String>,
+    unique: bool,
+    primary: bool,
+    method: Option<String>,
+}
+
+impl MysqlIndexRow {
+    fn from_row(row: &MySqlRow) -> Result<Self, DatabaseError> {
+        Ok(Self {
+            name: decode(row, "name")?,
+            column_name: decode(row, "column_name")?,
+            unique: decode_flag(row, "unique_index")?,
+            primary: decode_flag(row, "primary_index")?,
+            method: decode(row, "method")?,
+        })
+    }
+
+    fn group(rows: Vec<Self>) -> Vec<IndexSummary> {
+        let mut indexes: Vec<IndexSummary> = Vec::new();
+        let mut positions: HashMap<String, usize> = HashMap::new();
+        for row in rows {
+            let position = match positions.get(&row.name) {
+                Some(position) => *position,
+                None => {
+                    let position = indexes.len();
+                    positions.insert(row.name.clone(), position);
+                    indexes.push(IndexSummary {
+                        name: row.name,
+                        columns: Vec::new(),
+                        unique: row.unique,
+                        primary: row.primary,
+                        method: row.method.into(),
+                        predicate: MetadataValue::available(None),
+                    });
+                    position
+                }
+            };
+            if let Some(column) = row.column_name {
+                indexes[position].columns.push(column);
+            }
+        }
+        indexes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MysqlConstraintRow {
+    name: String,
+    kind: String,
+    database_name: String,
+    table_name: String,
+    column_name: Option<String>,
+    referenced_schema: Option<String>,
+    referenced_table: Option<String>,
+    referenced_column: Option<String>,
+    on_update: Option<String>,
+    on_delete: Option<String>,
+    check_expression: Option<String>,
+}
+
+impl MysqlConstraintRow {
+    fn from_row(row: &MySqlRow) -> Result<Self, DatabaseError> {
+        Ok(Self {
+            name: decode(row, "name")?,
+            kind: decode(row, "kind")?,
+            database_name: decode(row, "database_name")?,
+            table_name: decode(row, "table_name")?,
+            column_name: decode(row, "column_name")?,
+            referenced_schema: decode(row, "referenced_schema")?,
+            referenced_table: decode(row, "referenced_table")?,
+            referenced_column: decode(row, "referenced_column")?,
+            on_update: decode(row, "on_update")?,
+            on_delete: decode(row, "on_delete")?,
+            check_expression: decode(row, "check_expression")?,
+        })
+    }
+
+    fn group(rows: Vec<Self>, check_supported: bool) -> Vec<ConstraintSummary> {
         let mut constraints: Vec<ConstraintSummary> = Vec::new();
         let mut positions: HashMap<String, usize> = HashMap::new();
         for row in rows {
-            let name: String = decode(&row, "name")?;
-            let kind_text: String = decode(&row, "kind")?;
             let key = format!(
                 "{}\u{1f}{}\u{1f}{}",
-                decode::<String>(&row, "database_name")?,
-                decode::<String>(&row, "table_name")?,
-                name
+                row.database_name, row.table_name, row.name
             );
             let position = match positions.get(&key) {
                 Some(position) => *position,
                 None => {
                     let position = constraints.len();
                     positions.insert(key, position);
+                    let check_expression = if check_supported {
+                        MetadataValue::available(row.check_expression.clone())
+                    } else {
+                        MetadataValue::Unavailable
+                    };
                     constraints.push(ConstraintSummary {
-                        name,
-                        kind: constraint_kind(&kind_text),
+                        name: row.name,
+                        kind: constraint_kind(&row.kind),
                         columns: Vec::new(),
-                        referenced_table: decode(&row, "referenced_table")?,
+                        referenced_schema: MetadataValue::available(row.referenced_schema),
+                        referenced_table: MetadataValue::available(row.referenced_table),
                         referenced_columns: Vec::new(),
-                        on_update: decode(&row, "on_update")?,
-                        on_delete: decode(&row, "on_delete")?,
+                        on_update: MetadataValue::available(row.on_update),
+                        on_delete: MetadataValue::available(row.on_delete),
+                        check_expression,
+                        deferrable: MetadataValue::Unavailable,
+                        initially_deferred: MetadataValue::Unavailable,
                     });
                     position
                 }
             };
-            if let Some(column) = decode::<Option<String>>(&row, "column_name")? {
+            if let Some(column) = row.column_name {
                 constraints[position].columns.push(column);
             }
-            if let Some(column) = decode::<Option<String>>(&row, "referenced_column")? {
+            if let Some(column) = row.referenced_column {
                 constraints[position].referenced_columns.push(column);
             }
         }
+        constraints
+    }
+}
 
-        Ok(Page::from_items(constraints, page, None))
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MysqlForeignKeyRow {
+    name: String,
+    database_name: String,
+    table_name: String,
+    column_name: Option<String>,
+    referenced_column: Option<String>,
+    on_update: Option<String>,
+    on_delete: Option<String>,
+}
+
+impl MysqlForeignKeyRow {
+    fn from_row(row: &MySqlRow) -> Result<Self, DatabaseError> {
+        Ok(Self {
+            name: decode(row, "name")?,
+            database_name: decode(row, "database_name")?,
+            table_name: decode(row, "table_name")?,
+            column_name: decode(row, "column_name")?,
+            referenced_column: decode(row, "referenced_column")?,
+            on_update: decode(row, "on_update")?,
+            on_delete: decode(row, "on_delete")?,
+        })
+    }
+
+    fn group(rows: Vec<Self>) -> Vec<DependencySummary> {
+        let mut foreign_keys: Vec<DependencySummary> = Vec::new();
+        let mut positions: HashMap<String, usize> = HashMap::new();
+        for row in rows {
+            let key = format!(
+                "{}\u{1f}{}\u{1f}{}",
+                row.database_name, row.table_name, row.name
+            );
+            let position = match positions.get(&key) {
+                Some(position) => *position,
+                None => {
+                    let position = foreign_keys.len();
+                    positions.insert(key, position);
+                    foreign_keys.push(DependencySummary {
+                        kind: DependencyKind::IncomingForeignKey,
+                        name: row.name,
+                        database: Some(row.database_name.clone()),
+                        schema: Some(row.database_name),
+                        table: Some(row.table_name),
+                        columns: Vec::new(),
+                        referenced_columns: Vec::new(),
+                        on_update: MetadataValue::available(row.on_update),
+                        on_delete: MetadataValue::available(row.on_delete),
+                        details: MetadataValue::Unavailable,
+                    });
+                    position
+                }
+            };
+            if let Some(column) = row.column_name {
+                foreign_keys[position].columns.push(column);
+            }
+            if let Some(column) = row.referenced_column {
+                foreign_keys[position].referenced_columns.push(column);
+            }
+        }
+        foreign_keys
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MysqlTriggerRow {
+    name: String,
+    database_name: String,
+    table_name: String,
+    timing: String,
+    event: String,
+}
+
+impl MysqlTriggerRow {
+    fn from_row(row: &MySqlRow, schema: &str) -> Result<DependencySummary, DatabaseError> {
+        let row = Self {
+            name: decode(row, "name")?,
+            database_name: decode(row, "database_name")?,
+            table_name: decode(row, "table_name")?,
+            timing: decode(row, "timing")?,
+            event: decode(row, "event")?,
+        };
+        Ok(DependencySummary {
+            kind: DependencyKind::Trigger,
+            name: row.name,
+            database: Some(row.database_name),
+            schema: Some(schema.to_string()),
+            table: Some(row.table_name),
+            columns: Vec::new(),
+            referenced_columns: Vec::new(),
+            on_update: MetadataValue::Unavailable,
+            on_delete: MetadataValue::Unavailable,
+            details: MetadataValue::available(format!("{} {}", row.timing, row.event)),
+        })
     }
 }
 
@@ -1118,6 +1551,20 @@ mod tests {
     }
 
     #[test]
+    fn permission_failures_are_scoped_without_driver_text_or_sql() {
+        let error = map_mysql_error(Some(1142), Some("42000")).scoped_permission("table", "users");
+        assert_eq!(error.kind, DatabaseErrorKind::Permission);
+        assert_eq!(
+            error.scope.as_ref().map(|scope| scope.name.as_str()),
+            Some("users")
+        );
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("SELECT"));
+        assert!(!debug.contains("information_schema"));
+        assert!(!debug.contains("super-secret-token"));
+    }
+
+    #[test]
     fn capability_flags_follow_the_reported_server_version() {
         let capabilities =
             DatabaseCapabilities::for_engine(DatabaseEngine::Mysql, Some("8.0.36-log"));
@@ -1148,6 +1595,294 @@ mod tests {
         let error = ssl_mode(&request).expect_err("unsupported mode");
         let debug = format!("{error:?}");
         assert!(!debug.contains("super-secret-token"));
+    }
+
+    fn fixture_column(name: &str, data_type: &str) -> MysqlColumnRecord {
+        MysqlColumnRecord {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            length: None,
+            precision: None,
+            scale: None,
+            nullable: false,
+            default_value: None,
+            ordinal_position: 1,
+            primary_key: false,
+            generated: false,
+            generation_expression: None,
+            auto_increment: false,
+            comment: String::new(),
+            collation: None,
+        }
+    }
+
+    #[test]
+    fn mysql_fixture_table_and_column_metadata_match_the_ddl() {
+        let summary = MysqlTableRecord {
+            database_name: "app".to_string(),
+            name: "users".to_string(),
+            table_type: "BASE TABLE".to_string(),
+            estimated_rows: Some(42),
+            size_bytes: Some(16_384),
+            engine: Some("InnoDB".to_string()),
+        }
+        .into_summary(MetadataValue::available("2026-01-02T03:04:05".to_string()));
+        assert_eq!(summary.database.as_deref(), Some("app"));
+        assert_eq!(summary.schema.as_deref(), Some("app"));
+        assert_eq!(summary.kind, TableKind::Table);
+        assert_eq!(summary.estimated_rows, MetadataValue::available(42));
+        assert_eq!(
+            summary.metadata_refreshed_at,
+            MetadataValue::available("2026-01-02T03:04:05".to_string())
+        );
+        assert_eq!(
+            summary.metadata.engine,
+            MetadataValue::available("InnoDB".to_string())
+        );
+
+        let id = MysqlColumnRecord {
+            name: "id".to_string(),
+            data_type: "bigint(20) unsigned".to_string(),
+            precision: Some(20),
+            scale: Some(0),
+            ordinal_position: 1,
+            primary_key: true,
+            auto_increment: true,
+            ..fixture_column("id", "bigint(20) unsigned")
+        }
+        .into_summary(true);
+        assert_eq!(
+            id.identity,
+            MetadataValue::available(ColumnIdentity::AutoIncrement)
+        );
+        assert!(id.primary_key);
+        assert_eq!(id.precision, MetadataValue::available(Some(20)));
+        assert_eq!(
+            id.default_value,
+            MetadataValue::<Option<String>>::available(None)
+        );
+
+        let email = MysqlColumnRecord {
+            name: "email".to_string(),
+            data_type: "varchar(255)".to_string(),
+            length: Some(255),
+            ordinal_position: 2,
+            comment: "Login address".to_string(),
+            collation: Some("utf8mb4_bin".to_string()),
+            ..fixture_column("email", "varchar(255)")
+        }
+        .into_summary(true);
+        assert_eq!(email.length, MetadataValue::available(Some(255)));
+        assert_eq!(
+            email.comment,
+            MetadataValue::available(Some("Login address".to_string()))
+        );
+        assert_eq!(
+            email.collation,
+            MetadataValue::available(Some("utf8mb4_bin".to_string()))
+        );
+
+        let status = MysqlColumnRecord {
+            name: "status".to_string(),
+            data_type: "varchar(16)".to_string(),
+            length: Some(16),
+            default_value: Some("'active'".to_string()),
+            ordinal_position: 3,
+            ..fixture_column("status", "varchar(16)")
+        }
+        .into_summary(true);
+        assert_eq!(
+            status.default_value,
+            MetadataValue::available(Some("'active'".to_string()))
+        );
+
+        let note = MysqlColumnRecord {
+            name: "note".to_string(),
+            data_type: "text".to_string(),
+            length: Some(65_535),
+            ordinal_position: 5,
+            nullable: true,
+            generated: true,
+            generation_expression: Some("concat('mail:',`email`)".to_string()),
+            ..fixture_column("note", "text")
+        }
+        .into_summary(true);
+        assert_eq!(note.generated, MetadataValue::available(true));
+        assert_eq!(
+            note.generation_expression,
+            MetadataValue::available(Some("concat('mail:',`email`)".to_string()))
+        );
+        assert_eq!(
+            note.default_value,
+            MetadataValue::<Option<String>>::available(None)
+        );
+
+        let old_server_note = MysqlColumnRecord {
+            name: "note".to_string(),
+            data_type: "text".to_string(),
+            generated: true,
+            generation_expression: Some("concat('mail:',`email`)".to_string()),
+            ..fixture_column("note", "text")
+        }
+        .into_summary(false);
+        assert_eq!(old_server_note.generated, MetadataValue::Unavailable);
+        assert_eq!(
+            old_server_note.generation_expression,
+            MetadataValue::Unavailable
+        );
+    }
+
+    #[test]
+    fn mysql_fixture_indexes_and_constraints_group_in_ordinal_order() {
+        let indexes = MysqlIndexRow::group(vec![
+            MysqlIndexRow {
+                name: "PRIMARY".to_string(),
+                column_name: Some("id".to_string()),
+                unique: true,
+                primary: true,
+                method: Some("BTREE".to_string()),
+            },
+            MysqlIndexRow {
+                name: "users_email_unique".to_string(),
+                column_name: Some("email".to_string()),
+                unique: true,
+                primary: false,
+                method: Some("BTREE".to_string()),
+            },
+            MysqlIndexRow {
+                name: "users_status_index".to_string(),
+                column_name: Some("status".to_string()),
+                unique: false,
+                primary: false,
+                method: Some("BTREE".to_string()),
+            },
+        ]);
+        assert_eq!(indexes.len(), 3);
+        assert!(indexes[0].primary);
+        assert!(indexes[1].unique);
+        assert_eq!(
+            indexes[2].predicate,
+            MetadataValue::<Option<String>>::available(None)
+        );
+
+        let constraints = MysqlConstraintRow::group(
+            vec![
+                MysqlConstraintRow {
+                    name: "PRIMARY".to_string(),
+                    kind: "PRIMARY KEY".to_string(),
+                    database_name: "app".to_string(),
+                    table_name: "users".to_string(),
+                    column_name: Some("id".to_string()),
+                    referenced_schema: None,
+                    referenced_table: None,
+                    referenced_column: None,
+                    on_update: None,
+                    on_delete: None,
+                    check_expression: None,
+                },
+                MysqlConstraintRow {
+                    name: "users_parent_fk".to_string(),
+                    kind: "FOREIGN KEY".to_string(),
+                    database_name: "app".to_string(),
+                    table_name: "users".to_string(),
+                    column_name: Some("parent_id".to_string()),
+                    referenced_schema: Some("app".to_string()),
+                    referenced_table: Some("users".to_string()),
+                    referenced_column: Some("id".to_string()),
+                    on_update: Some("CASCADE".to_string()),
+                    on_delete: Some("SET NULL".to_string()),
+                    check_expression: None,
+                },
+                MysqlConstraintRow {
+                    name: "users_balance_check".to_string(),
+                    kind: "CHECK".to_string(),
+                    database_name: "app".to_string(),
+                    table_name: "users".to_string(),
+                    column_name: None,
+                    referenced_schema: None,
+                    referenced_table: None,
+                    referenced_column: None,
+                    on_update: None,
+                    on_delete: None,
+                    check_expression: Some("`balance` >= 0".to_string()),
+                },
+            ],
+            true,
+        );
+        assert_eq!(constraints[0].kind, ConstraintKind::PrimaryKey);
+        let foreign_key = &constraints[1];
+        assert_eq!(foreign_key.kind, ConstraintKind::ForeignKey);
+        assert_eq!(
+            foreign_key.referenced_schema,
+            MetadataValue::available(Some("app".to_string()))
+        );
+        assert_eq!(
+            foreign_key.referenced_table,
+            MetadataValue::available(Some("users".to_string()))
+        );
+        assert_eq!(foreign_key.referenced_columns, ["id"]);
+        assert_eq!(
+            foreign_key.on_update,
+            MetadataValue::available(Some("CASCADE".to_string()))
+        );
+        assert_eq!(
+            foreign_key.on_delete,
+            MetadataValue::available(Some("SET NULL".to_string()))
+        );
+        assert_eq!(
+            constraints[2].check_expression,
+            MetadataValue::available(Some("`balance` >= 0".to_string()))
+        );
+        assert_eq!(constraints[2].deferrable, MetadataValue::Unavailable);
+
+        let old_checks = MysqlConstraintRow::group(
+            vec![MysqlConstraintRow {
+                name: "users_balance_check".to_string(),
+                kind: "CHECK".to_string(),
+                database_name: "app".to_string(),
+                table_name: "users".to_string(),
+                column_name: None,
+                referenced_schema: None,
+                referenced_table: None,
+                referenced_column: None,
+                on_update: None,
+                on_delete: None,
+                check_expression: None,
+            }],
+            false,
+        );
+        assert_eq!(old_checks[0].check_expression, MetadataValue::Unavailable);
+    }
+
+    #[test]
+    fn mysql_fixture_incoming_foreign_keys_keep_every_column() {
+        let foreign_keys = MysqlForeignKeyRow::group(vec![
+            MysqlForeignKeyRow {
+                name: "orders_user_fk".to_string(),
+                database_name: "app".to_string(),
+                table_name: "orders".to_string(),
+                column_name: Some("user_id".to_string()),
+                referenced_column: Some("id".to_string()),
+                on_update: Some("RESTRICT".to_string()),
+                on_delete: Some("CASCADE".to_string()),
+            },
+            MysqlForeignKeyRow {
+                name: "orders_user_fk".to_string(),
+                database_name: "app".to_string(),
+                table_name: "orders".to_string(),
+                column_name: Some("tenant_id".to_string()),
+                referenced_column: Some("tenant_id".to_string()),
+                on_update: Some("RESTRICT".to_string()),
+                on_delete: Some("CASCADE".to_string()),
+            },
+        ]);
+        assert_eq!(foreign_keys.len(), 1);
+        assert_eq!(foreign_keys[0].columns, ["user_id", "tenant_id"]);
+        assert_eq!(foreign_keys[0].referenced_columns, ["id", "tenant_id"]);
+        assert_eq!(
+            foreign_keys[0].on_delete,
+            MetadataValue::available(Some("CASCADE".to_string()))
+        );
     }
 
     // Live tests are opt-in. They are skipped unless the container fixture
@@ -1230,6 +1965,10 @@ mod tests {
             .expect("connect to fixture");
 
         adapter
+            .execute_for_test("DROP VIEW IF EXISTS serverdesk_probe_view")
+            .await
+            .expect("drop stale probe view");
+        adapter
             .execute_for_test("DROP TABLE IF EXISTS serverdesk_writable_probe")
             .await
             .expect("drop stale probe");
@@ -1250,6 +1989,26 @@ mod tests {
             )
             .await
             .expect("create probe view");
+        adapter
+            .execute_for_test(
+                "CREATE TABLE serverdesk_probe_child (\
+                    id BIGINT UNSIGNED NOT NULL PRIMARY KEY, \
+                    probe_id BIGINT UNSIGNED NOT NULL, \
+                    CONSTRAINT serverdesk_probe_child_fk FOREIGN KEY (probe_id) \
+                        REFERENCES serverdesk_writable_probe(id) \
+                        ON DELETE CASCADE ON UPDATE RESTRICT\
+                 )",
+            )
+            .await
+            .expect("create probe child table");
+        adapter
+            .execute_for_test(
+                "CREATE TRIGGER serverdesk_probe_trigger BEFORE INSERT \
+                 ON serverdesk_writable_probe FOR EACH ROW \
+                 SET @serverdesk_probe_touched = 1",
+            )
+            .await
+            .expect("create probe trigger");
 
         let scope = MetadataScope::new(Some(&fixture.database), None).expect("scope");
         let tables = adapter
@@ -1308,7 +2067,11 @@ mod tests {
             .expect("list columns");
         assert_eq!(columns.items.len(), 3);
         assert!(columns.items[0].primary_key);
-        assert!(columns.items[2].generated);
+        assert_eq!(
+            columns.items[0].identity,
+            MetadataValue::available(ColumnIdentity::AutoIncrement)
+        );
+        assert_eq!(columns.items[2].generated, MetadataValue::available(true));
 
         let indexes = adapter
             .list_indexes(&table, PageRequest::new(500, 0))
@@ -1328,6 +2091,34 @@ mod tests {
                 .any(|constraint| constraint.kind == ConstraintKind::PrimaryKey)
         );
 
+        let dependencies = adapter
+            .table_dependencies(&table, 50)
+            .await
+            .expect("table dependencies");
+        let foreign_keys = dependencies
+            .incoming_foreign_keys
+            .value()
+            .expect("incoming foreign keys");
+        assert!(foreign_keys.items.iter().any(|dependency| {
+            dependency.name == "serverdesk_probe_child_fk"
+                && dependency.table.as_deref() == Some("serverdesk_probe_child")
+                && dependency.columns == ["probe_id"]
+                && dependency.referenced_columns == ["id"]
+        }));
+        assert_eq!(dependencies.dependent_views, MetadataValue::Unavailable);
+        assert_eq!(dependencies.owned_sequences, MetadataValue::Unavailable);
+        let triggers = dependencies.triggers.value().expect("triggers");
+        assert!(
+            triggers
+                .items
+                .iter()
+                .any(|dependency| dependency.name == "serverdesk_probe_trigger")
+        );
+
+        adapter
+            .execute_for_test("DROP TABLE serverdesk_probe_child")
+            .await
+            .expect("drop probe child table");
         adapter
             .execute_for_test("DROP VIEW serverdesk_probe_view")
             .await

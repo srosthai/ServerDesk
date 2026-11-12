@@ -3,7 +3,11 @@ import { describe, expect, it, vi } from "vitest";
 import {
   databaseDiscoveryCommands,
   getObjectCounts,
+  getTableDependencies,
+  listColumns,
+  listConstraints,
   listDatabases,
+  listIndexes,
   listSchemas,
   listSequences,
   listTables,
@@ -12,12 +16,16 @@ import {
   refreshExplorerNode,
 } from "@/services/databaseDiscovery";
 import type {
+  DatabaseColumnSummary,
+  DatabaseConstraintSummary,
   DatabaseExplorerNodePayload,
+  DatabaseIndexSummary,
   DatabaseObjectCounts,
   DatabasePage,
   DatabaseSchemaSummary,
   DatabaseSequenceSummary,
   DatabaseSummary,
+  DatabaseTableDependencies,
   DatabaseTableSummary,
   DatabaseViewSummary,
 } from "@/types/contracts";
@@ -55,6 +63,7 @@ const table: DatabaseTableSummary = {
   name: "users",
   kind: "table",
   estimatedRows: { status: "available", value: 2 },
+  metadataRefreshedAt: unavailable,
   ...metadata,
   engine: { status: "available", value: "InnoDB" },
 };
@@ -75,6 +84,59 @@ const sequence: DatabaseSequenceSummary = {
   startValue: { status: "available", value: "1" },
   increment: { status: "available", value: "1" },
   ...metadata,
+};
+
+const column: DatabaseColumnSummary = {
+  name: "id",
+  dataType: "bigint",
+  length: { status: "available", value: null },
+  precision: { status: "available", value: 64 },
+  scale: { status: "available", value: 0 },
+  nullable: false,
+  defaultValue: { status: "available", value: null },
+  ordinalPosition: 1,
+  primaryKey: true,
+  identity: { status: "available", value: "always" },
+  generated: { status: "available", value: false },
+  generationExpression: { status: "available", value: null },
+  comment: { status: "available", value: null },
+  collation: { status: "available", value: null },
+};
+
+const index: DatabaseIndexSummary = {
+  name: "users_pkey",
+  columns: ["id"],
+  unique: true,
+  primary: true,
+  method: { status: "available", value: "btree" },
+  predicate: { status: "available", value: null },
+};
+
+const constraint: DatabaseConstraintSummary = {
+  name: "users_pkey",
+  kind: "primary_key",
+  columns: ["id"],
+  referencedSchema: { status: "available", value: null },
+  referencedTable: { status: "available", value: null },
+  referencedColumns: [],
+  onUpdate: { status: "available", value: null },
+  onDelete: { status: "available", value: null },
+  checkExpression: { status: "available", value: null },
+  deferrable: { status: "available", value: false },
+  initiallyDeferred: { status: "available", value: false },
+};
+
+const dependencies: DatabaseTableDependencies = {
+  incomingForeignKeys: {
+    status: "available",
+    value: { items: [], limit: 100, truncated: false },
+  },
+  dependentViews: {
+    status: "available",
+    value: { items: [], limit: 100, truncated: false },
+  },
+  ownedSequences: { status: "unavailable" },
+  triggers: { status: "available", value: { items: [], limit: 100, truncated: false } },
 };
 
 const counts: DatabaseObjectCounts = {
@@ -178,6 +240,59 @@ describe("database discovery service contract", () => {
       node,
       limit: null,
       offset: null,
+    });
+  });
+
+  it("loads bounded table details and dependencies from typed commands", async () => {
+    vi.mocked(invoke)
+      .mockResolvedValueOnce(page([column]))
+      .mockResolvedValueOnce(page([index]))
+      .mockResolvedValueOnce(page([constraint]))
+      .mockResolvedValueOnce(dependencies);
+
+    const tableRef = { database: "app", schema: "public", table: "users" };
+
+    await expect(listColumns("profile-1", tableRef, { limit: 50 })).resolves.toEqual(
+      page([column]),
+    );
+    expect(invoke).toHaveBeenNthCalledWith(1, databaseDiscoveryCommands.columns, {
+      profileId: "profile-1",
+      database: "app",
+      schema: "public",
+      table: "users",
+      limit: 50,
+      offset: null,
+    });
+
+    await expect(listIndexes("profile-1", tableRef)).resolves.toEqual(page([index]));
+    expect(invoke).toHaveBeenNthCalledWith(2, databaseDiscoveryCommands.indexes, {
+      profileId: "profile-1",
+      database: "app",
+      schema: "public",
+      table: "users",
+      limit: null,
+      offset: null,
+    });
+
+    await expect(listConstraints("profile-1", tableRef, { offset: 25 })).resolves.toEqual(
+      page([constraint]),
+    );
+    expect(invoke).toHaveBeenNthCalledWith(3, databaseDiscoveryCommands.constraints, {
+      profileId: "profile-1",
+      database: "app",
+      schema: "public",
+      table: "users",
+      limit: null,
+      offset: 25,
+    });
+
+    await expect(getTableDependencies("profile-1", tableRef, 10)).resolves.toEqual(dependencies);
+    expect(invoke).toHaveBeenNthCalledWith(4, databaseDiscoveryCommands.tableDependencies, {
+      profileId: "profile-1",
+      database: "app",
+      schema: "public",
+      table: "users",
+      limit: 10,
     });
   });
 
