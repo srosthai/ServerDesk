@@ -2,7 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { BroomIcon, ClipboardTextIcon, CopyIcon, SelectionAllIcon } from "@phosphor-icons/react";
+import {
+  readText as readSystemClipboard,
+  writeText as writeSystemClipboard,
+} from "@tauri-apps/plugin-clipboard-manager";
 import "@xterm/xterm/css/xterm.css";
+import { isTauriRuntime } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import type { TerminalSessionState } from "@/stores/terminalStore";
 import type { TerminalSize } from "@/types/contracts";
@@ -39,6 +44,15 @@ const toolbarButtonClass =
   "inline-flex h-6 items-center gap-1 rounded-sm px-1.5 text-[11px] text-[#a2b0a7] transition-colors outline-none hover:bg-white/10 hover:text-[#f1f5f2] focus-visible:ring-2 focus-visible:ring-[#f08a4b]/60 disabled:pointer-events-none disabled:opacity-40";
 
 async function copyToClipboard(value: string): Promise<boolean> {
+  if (isTauriRuntime()) {
+    try {
+      await writeSystemClipboard(value);
+      return true;
+    } catch {
+      // Fall through to browser APIs if the native clipboard is unavailable.
+    }
+  }
+
   if (navigator.clipboard?.writeText) {
     try {
       await navigator.clipboard.writeText(value);
@@ -65,6 +79,14 @@ async function copyToClipboard(value: string): Promise<boolean> {
 }
 
 async function readFromClipboard(): Promise<string | null> {
+  if (isTauriRuntime()) {
+    try {
+      return await readSystemClipboard();
+    } catch {
+      // Fall through to browser APIs if the native clipboard is unavailable.
+    }
+  }
+
   if (!navigator.clipboard?.readText) {
     return null;
   }
@@ -186,7 +208,7 @@ function TerminalView({
   const pasteClipboard = useCallback(async () => {
     const text = await readFromClipboard();
     if (text === null) {
-      setNotice("Clipboard access was denied. Use Ctrl+V to paste from the browser.");
+      setNotice("Clipboard access failed. Use Ctrl+V to paste from the keyboard.");
       return;
     }
     if (!text) {
@@ -277,6 +299,7 @@ function TerminalView({
     terminal.attachCustomKeyEventHandler((event) => {
       const key = event.key.toLowerCase();
       const copyModifier = (event.ctrlKey || event.metaKey) && event.shiftKey;
+      const pasteModifier = (event.ctrlKey || event.metaKey) && !event.shiftKey;
       const macCopy = event.metaKey && !event.ctrlKey && !event.shiftKey;
 
       if (event.type === "keydown" && (copyModifier || macCopy) && key === "c") {
@@ -287,7 +310,7 @@ function TerminalView({
         }
       }
 
-      if (event.type === "keydown" && copyModifier && key === "v") {
+      if (event.type === "keydown" && (copyModifier || pasteModifier) && key === "v") {
         event.preventDefault();
         actionRef.current?.paste();
         return false;
@@ -412,7 +435,7 @@ function TerminalView({
           onClick={() => {
             void pasteClipboard();
           }}
-          title="Paste from clipboard (Ctrl+Shift+V)"
+          title="Paste from clipboard (Ctrl+V or Ctrl+Shift+V)"
         >
           <ClipboardTextIcon aria-hidden="true" className="size-3.5" />
           Paste
