@@ -241,8 +241,31 @@ keeps no explorer cache.
 
 `src/services/databaseDiscovery.ts` is the only React module that invokes these
 commands. `src/stores/databaseExplorerStore.ts` caches one entry per
-profile/node key, tracks loading and typed error state per node, and replaces
-only the refreshed key. The tree UI is tracked separately in issue #166.
+profile/node key, tracks loading and typed error state per node, replaces only
+the refreshed key, and appends later pages to the same cached node.
+
+## Explorer tree UI
+
+`src/features/databases/DatabaseExplorerTree.tsx` renders the navigation tree.
+`databaseExplorerTreeModel.ts` builds a flat, virtualized row model from the
+profiles, connection snapshots, cached node entries, and expanded-row set.
+Connections are always present; databases, schemas, object groups, and leaves
+appear only after their parent is expanded and the matching discovery payload is
+cached. Expanding one row issues at most one `loadNode` request for that row.
+MySQL database nodes expose Tables/Views directly; PostgreSQL database nodes
+expose a Schemas group because one connection can only browse its connected
+catalog, and other database nodes explain that the active database must change
+first.
+
+The tree keeps at most one DOM window of rows mounted (plus the focused row),
+uses a fixed row height, and offers a Load more row for pages with `hasMore`.
+Row identifiers are built from the profile and object path, not array indexes,
+so a parent refresh preserves the selected child. Status rows for loading,
+empty, permission, connection, and generic metadata errors render under the
+affected node instead of replacing the workspace. Search filters the loaded
+branch set and keeps matching ancestors visible; it does not silently issue
+unbounded discovery requests. Roving tabindex plus Arrow/Home/End/Enter
+handling implement the ARIA tree keyboard model.
 
 ## Capability model
 

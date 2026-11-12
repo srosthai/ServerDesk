@@ -106,6 +106,50 @@ describe("database explorer store", () => {
     expect(loadExplorerNode).toHaveBeenCalledTimes(1);
   });
 
+  it("appends the next bounded page without replacing loaded rows", async () => {
+    const firstPage: DatabaseExplorerNodePayload = {
+      nodeKind: "databases",
+      payload: {
+        items: [database],
+        limit: 1,
+        offset: 0,
+        hasMore: true,
+        total: 2,
+      },
+    };
+    const secondPage: DatabaseExplorerNodePayload = {
+      nodeKind: "databases",
+      payload: {
+        items: [{ ...database, name: "analytics" }],
+        limit: 1,
+        offset: 1,
+        hasMore: false,
+        total: 2,
+      },
+    };
+    vi.mocked(loadExplorerNode).mockResolvedValueOnce(firstPage).mockResolvedValueOnce(secondPage);
+
+    await useDatabaseExplorerStore.getState().loadNode("profile-1", databasesNode);
+    const merged = await useDatabaseExplorerStore
+      .getState()
+      .loadMoreNode("profile-1", databasesNode);
+
+    expect(loadExplorerNode).toHaveBeenNthCalledWith(2, "profile-1", databasesNode, {
+      limit: 1,
+      offset: 1,
+    });
+    expect(merged?.nodeKind).toBe("databases");
+    if (merged?.nodeKind === "databases") {
+      expect(merged.payload.items.map((item) => item.name)).toEqual(["app", "analytics"]);
+      expect(merged.payload.hasMore).toBe(false);
+    }
+    const entry =
+      useDatabaseExplorerStore.getState().nodes[
+        databaseExplorerNodeKey("profile-1", databasesNode)
+      ];
+    expect(entry?.loadingMore).toBe(false);
+  });
+
   it("refreshes one node without replacing unrelated node state", async () => {
     const databasesKey = databaseExplorerNodeKey("profile-1", databasesNode);
     const tablesKey = databaseExplorerNodeKey("profile-1", tablesNode);
