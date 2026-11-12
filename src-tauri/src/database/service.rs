@@ -188,6 +188,17 @@ impl DatabaseConnectionRegistry {
         Ok(self.info(profile_id).await?.capabilities)
     }
 
+    /// Replaces the cached connection metadata after a set-active action.
+    pub(crate) async fn update_connection_info(
+        &self,
+        profile_id: &str,
+        info: DatabaseConnectionInfo,
+    ) {
+        if let Some(session) = self.connections.lock().await.get_mut(profile_id) {
+            session.info = info;
+        }
+    }
+
     /// Lists active profile ids in deterministic order.
     pub async fn connected_profiles(&self) -> Vec<String> {
         let mut profiles = self

@@ -23,6 +23,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0005_database_manager",
         include_str!("../../../migrations/0005_database_manager.sql"),
     ),
+    (
+        "0006_database_action_history",
+        include_str!("../../../migrations/0006_database_action_history.sql"),
+    ),
 ];
 
 pub(crate) fn run_migrations(connection: &mut Connection) -> Result<(), StorageError> {
@@ -63,7 +67,7 @@ mod tests {
             .pragma_update(None, "foreign_keys", "ON")
             .expect("enable foreign keys");
 
-        for (index, (name, sql)) in MIGRATIONS.iter().enumerate().take(4) {
+        for (index, (name, sql)) in MIGRATIONS.iter().enumerate().take(5) {
             connection
                 .execute_batch(sql)
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
@@ -72,17 +76,43 @@ mod tests {
                 .expect("set version");
         }
 
-        assert_eq!(user_version(&connection), 4);
+        assert_eq!(user_version(&connection), 5);
+
+        connection
+            .execute(
+                "INSERT INTO operation_history (
+                    id, category, operation, safe_summary, result, started_at, duration_ms
+                ) VALUES ('legacy-row', 'service', 'service-restart', 'Restarted nginx', 'success', 1, 5)",
+                [],
+            )
+            .expect("insert legacy history row");
 
         run_migrations(&mut connection).expect("upgrade existing database");
 
-        assert_eq!(user_version(&connection), 5);
+        assert_eq!(user_version(&connection), 6);
+        let preserved: String = connection
+            .query_row(
+                "SELECT category FROM operation_history WHERE id = 'legacy-row'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preserved history row");
+        assert_eq!(preserved, "service");
+
+        connection
+            .execute(
+                "INSERT INTO operation_history (
+                    id, category, operation, safe_summary, result, started_at, duration_ms
+                ) VALUES ('database-row', 'database', 'database-drop', 'Dropped app', 'success', 2, 6)",
+                [],
+            )
+            .expect("database category is accepted after upgrade");
 
         // The migration runner skips applied versions, but every object in the
         // latest migration is also guarded so a manual reapply is safe.
         connection
-            .execute_batch(MIGRATIONS[4].1)
-            .expect("reapply database manager migration");
-        assert_eq!(user_version(&connection), 5);
+            .execute_batch(MIGRATIONS[5].1)
+            .expect("reapply database action history migration");
+        assert_eq!(user_version(&connection), 6);
     }
 }

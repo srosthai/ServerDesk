@@ -24,8 +24,9 @@ use tokio::{
 
 use crate::storage::DatabaseEngine;
 
-use super::{POSTGRES_DIALECT, sql};
+use super::{POSTGRES_DIALECT, actions as engine_actions, sql};
 use crate::database::{
+    actions::{DatabaseDdlPreview, ValidatedDatabaseAction},
     capabilities::{DatabaseAction, DatabaseCapabilities, DatabaseVersion},
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
@@ -51,6 +52,8 @@ pub struct PostgresDatabaseAdapter {
     capabilities: DatabaseCapabilities,
     version: Option<DatabaseVersionInfo>,
     current_database: Option<String>,
+    read_only: bool,
+    connect_request: Option<DatabaseConnectRequest>,
     operation_timeout: Duration,
 }
 
@@ -68,6 +71,8 @@ impl PostgresDatabaseAdapter {
             capabilities: DatabaseCapabilities::unknown(DatabaseEngine::Postgresql),
             version: None,
             current_database: None,
+            read_only: false,
+            connect_request: None,
             operation_timeout: Duration::from_secs(10),
         }
     }
@@ -143,71 +148,23 @@ impl PostgresDatabaseAdapter {
         Ok((decode(&row, "version")?, decode(&row, "database_name")?))
     }
 
-    fn ensure_database_matches(&self, database: Option<&str>) -> Result<(), DatabaseError> {
-        if database.is_some_and(|database| self.current_database.as_deref() != Some(database)) {
-            return Err(
-                DatabaseError::validation(CROSS_DATABASE_MESSAGE).with_details(
-                    "PostgreSQL stores databases as separate catalogs; reconnect with the target \
-                 database selected before browsing its schemas.",
-                ),
-            );
-        }
-        Ok(())
-    }
-
-    fn schema_filter(&self, scope: &MetadataScope) -> Result<Option<String>, DatabaseError> {
-        self.ensure_database_matches(scope.database.as_ref().map(Identifier::as_str))?;
-        Ok(scope
-            .schema
-            .as_ref()
-            .map(|schema| schema.as_str().to_string()))
-    }
-
-    fn table_schema_filter(&self, table: &TableRef) -> Result<Option<String>, DatabaseError> {
-        self.ensure_database_matches(table.database.as_ref().map(Identifier::as_str))?;
-        Ok(table
-            .schema
-            .as_ref()
-            .map(|schema| schema.as_str().to_string()))
-    }
-}
-
-#[async_trait]
-impl DatabaseAdapter for PostgresDatabaseAdapter {
-    fn engine(&self) -> DatabaseEngine {
-        DatabaseEngine::Postgresql
-    }
-
-    fn capabilities(&self) -> &DatabaseCapabilities {
-        &self.capabilities
-    }
-
-    fn dialect(&self) -> &dyn SqlDialect {
-        &POSTGRES_DIALECT
-    }
-
-    fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::SeqCst)
-    }
-
-    async fn connect(
-        &mut self,
-        request: DatabaseConnectRequest,
-    ) -> Result<DatabaseConnectionInfo, DatabaseError> {
-        validate_connect_request(&request)?;
-        let ssl_mode = ssl_mode(&request)?;
+    /// Opens one authenticated read-only or read-write session and reads the
+    /// server identity. The caller owns the connection and can close it if a
+    /// later setup step fails.
+    async fn open_connection(
+        request: &DatabaseConnectRequest,
+    ) -> Result<
+        (
+            PgConnection,
+            DatabaseVersionInfo,
+            String,
+            DatabaseCapabilities,
+        ),
+        DatabaseError,
+    > {
+        validate_connect_request(request)?;
+        let ssl_mode = ssl_mode(request)?;
         let connect_timeout = request.connect_timeout;
-        self.operation_timeout = connect_timeout.max(Duration::from_secs(1));
-
-        // Replacing a live connection must not leave the previous driver
-        // session open after the new attempt fails.
-        if let Some(previous) = self.connection.get_mut().take() {
-            let _ = previous.close().await;
-        }
-        self.connected.store(false, Ordering::SeqCst);
-        self.version = None;
-        self.current_database = None;
-        self.capabilities = DatabaseCapabilities::unknown(DatabaseEngine::Postgresql);
 
         let mut options = PgConnectOptions::new()
             .host(request.host.trim())
@@ -268,9 +225,113 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
             raw: raw_version,
         };
 
+        Ok((connection, version, current_database, capabilities))
+    }
+
+    fn connection_info(&self) -> Result<DatabaseConnectionInfo, DatabaseError> {
+        let version = self
+            .version
+            .clone()
+            .ok_or_else(|| DatabaseError::internal("The database version was not recorded."))?;
+        Ok(DatabaseConnectionInfo {
+            engine: DatabaseEngine::Postgresql,
+            version,
+            database: self.current_database.clone(),
+            read_only: self.read_only,
+            capabilities: self.capabilities.snapshot(),
+        })
+    }
+
+    async fn execute_statement(&self, statement: &str) -> Result<(), DatabaseError> {
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::raw_sql(sqlx::AssertSqlSafe(statement.to_string())).execute(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
+    fn ensure_database_matches(&self, database: Option<&str>) -> Result<(), DatabaseError> {
+        if database.is_some_and(|database| self.current_database.as_deref() != Some(database)) {
+            return Err(
+                DatabaseError::validation(CROSS_DATABASE_MESSAGE).with_details(
+                    "PostgreSQL stores databases as separate catalogs; reconnect with the target \
+                 database selected before browsing its schemas.",
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    fn schema_filter(&self, scope: &MetadataScope) -> Result<Option<String>, DatabaseError> {
+        self.ensure_database_matches(scope.database.as_ref().map(Identifier::as_str))?;
+        Ok(scope
+            .schema
+            .as_ref()
+            .map(|schema| schema.as_str().to_string()))
+    }
+
+    fn table_schema_filter(&self, table: &TableRef) -> Result<Option<String>, DatabaseError> {
+        self.ensure_database_matches(table.database.as_ref().map(Identifier::as_str))?;
+        Ok(table
+            .schema
+            .as_ref()
+            .map(|schema| schema.as_str().to_string()))
+    }
+}
+
+#[async_trait]
+impl DatabaseAdapter for PostgresDatabaseAdapter {
+    fn engine(&self) -> DatabaseEngine {
+        DatabaseEngine::Postgresql
+    }
+
+    fn capabilities(&self) -> &DatabaseCapabilities {
+        &self.capabilities
+    }
+
+    fn dialect(&self) -> &dyn SqlDialect {
+        &POSTGRES_DIALECT
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    async fn connect(
+        &mut self,
+        request: DatabaseConnectRequest,
+    ) -> Result<DatabaseConnectionInfo, DatabaseError> {
+        self.operation_timeout = request.connect_timeout.max(Duration::from_secs(1));
+
+        // Replacing a live connection must not leave the previous driver
+        // session open after the new attempt fails.
+        if let Some(previous) = self.connection.get_mut().take() {
+            let _ = previous.close().await;
+        }
+        self.connected.store(false, Ordering::SeqCst);
+        self.version = None;
+        self.current_database = None;
+        self.read_only = false;
+        self.connect_request = None;
+        self.capabilities = DatabaseCapabilities::unknown(DatabaseEngine::Postgresql);
+
+        let (connection, version, current_database, capabilities) =
+            Self::open_connection(&request).await?;
+
         *self.connection.get_mut() = Some(connection);
         self.version = Some(version.clone());
         self.current_database = Some(current_database.clone());
+        self.read_only = request.read_only;
+        self.connect_request = Some(request);
         self.capabilities = capabilities.clone();
         self.connected.store(true, Ordering::SeqCst);
 
@@ -278,7 +339,7 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
             engine: DatabaseEngine::Postgresql,
             version,
             database: Some(current_database),
-            read_only: request.read_only,
+            read_only: self.read_only,
             capabilities: capabilities.snapshot(),
         })
     }
@@ -318,6 +379,8 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
         self.connected.store(false, Ordering::SeqCst);
         self.version = None;
         self.current_database = None;
+        self.read_only = false;
+        self.connect_request = None;
         self.capabilities = DatabaseCapabilities::unknown(DatabaseEngine::Postgresql);
 
         if let Some(connection) = self.connection.get_mut().take() {
@@ -368,6 +431,111 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
             .collect::<Result<Vec<_>, DatabaseError>>()?;
 
         Ok(Page::from_items(databases, page, None))
+    }
+
+    async fn database_summary(
+        &self,
+        database: &Identifier,
+    ) -> Result<Option<DatabaseSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseDatabases)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let row = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::DATABASE_SUMMARY)
+                .bind(database.as_str())
+                .fetch_optional(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+
+        row.as_ref()
+            .map(|row| {
+                let name: String = decode(row, "name")?;
+                let size_bytes = decode::<Option<i64>>(row, "size_bytes")?
+                    .and_then(|size| u64::try_from(size).ok());
+                Ok(DatabaseSummary {
+                    system: is_system_database(&name),
+                    name,
+                    metadata: ObjectMetadata {
+                        owner: decode::<Option<String>>(row, "owner")?.into(),
+                        encoding: decode::<Option<String>>(row, "encoding")?.into(),
+                        collation: decode::<Option<String>>(row, "collation")?.into(),
+                        size_bytes: size_bytes.into(),
+                        ..ObjectMetadata::default()
+                    },
+                })
+            })
+            .transpose()
+    }
+
+    async fn preview_database_action(
+        &self,
+        action: &ValidatedDatabaseAction,
+    ) -> Result<DatabaseDdlPreview, DatabaseError> {
+        self.require_connection()?;
+        self.require_capability(action.capability())?;
+
+        match action {
+            ValidatedDatabaseAction::Rename { name, .. }
+            | ValidatedDatabaseAction::Drop { name }
+                if self.current_database.as_deref() == Some(name.as_str()) =>
+            {
+                return Err(DatabaseError::validation(
+                    "PostgreSQL cannot rename or drop the database used by the current \
+                     connection. Set another database active first.",
+                ));
+            }
+            _ => {}
+        }
+
+        engine_actions::preview(action)
+    }
+
+    async fn execute_database_action(
+        &mut self,
+        action: &ValidatedDatabaseAction,
+    ) -> Result<Option<DatabaseConnectionInfo>, DatabaseError> {
+        self.require_connection()?;
+        self.require_capability(action.capability())?;
+        let preview = self.preview_database_action(action).await?;
+
+        match action {
+            ValidatedDatabaseAction::SetActive { name } => {
+                if self.current_database.as_deref() == Some(name.as_str()) {
+                    return self.connection_info().map(Some);
+                }
+
+                let mut request = self.connect_request.clone().ok_or_else(|| {
+                    DatabaseError::internal(
+                        "The PostgreSQL connection settings were not recorded for a reconnect.",
+                    )
+                })?;
+                request.database = Some(name.as_str().to_string());
+
+                // Open the replacement session before closing the old one. A
+                // failed switch leaves the current browsing context usable.
+                let (connection, version, current_database, capabilities) =
+                    Self::open_connection(&request).await?;
+                if let Some(previous) = self.connection.get_mut().take() {
+                    let _ = previous.close().await;
+                }
+
+                *self.connection.get_mut() = Some(connection);
+                self.version = Some(version);
+                self.current_database = Some(current_database);
+                self.capabilities = capabilities;
+                self.connect_request = Some(request);
+                self.connection_info().map(Some)
+            }
+            _ => {
+                for statement in &preview.statements {
+                    self.execute_statement(statement).await?;
+                }
+                Ok(None)
+            }
+        }
     }
 
     async fn list_schemas(&self, page: PageRequest) -> Result<Page<SchemaSummary>, DatabaseError> {
