@@ -9,7 +9,6 @@ import {
   HardDrivesIcon,
   InfoIcon,
   KeyIcon,
-  MagnifyingGlassIcon,
   PlugsIcon,
   PlusIcon,
   RowsIcon,
@@ -23,12 +22,13 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { EmptyState } from "@/components/ui/empty-state";
-import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
 import { ErrorState, LoadingState } from "@/components/ui/states";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { DatabaseConnectionList, EngineBadge } from "@/features/databases/DatabaseConnectionList";
+import { DatabaseExplorerTree } from "@/features/databases/DatabaseExplorerTree";
+import type { DatabaseExplorerSelection } from "@/features/databases/databaseExplorerTreeModel";
 import { DatabaseProfileDialog } from "@/features/databases/DatabaseProfileDialog";
 import {
   DATABASE_ENGINE_LABELS,
@@ -313,6 +313,9 @@ function DatabaseWorkspaceTopBar({
   connectionState,
   selectedProfile,
   selectedState,
+  selectedDatabase,
+  selectedSchema,
+  selectedObject,
   refreshing,
   onRefresh,
   onAddConnection,
@@ -321,6 +324,9 @@ function DatabaseWorkspaceTopBar({
   connectionState: ConnectionState;
   selectedProfile: DatabaseProfile | null;
   selectedState: DatabaseConnectionState;
+  selectedDatabase: string | null;
+  selectedSchema: string | null;
+  selectedObject: { label: string; kind: string } | null;
   refreshing: boolean;
   onRefresh: () => void;
   onAddConnection: () => void;
@@ -335,9 +341,34 @@ function DatabaseWorkspaceTopBar({
           <h2 className="text-[13px] font-semibold tracking-[-0.01em] text-foreground">
             Database workspace
           </h2>
-          <p className="text-[10px] text-muted-foreground">
-            MySQL and PostgreSQL over loopback SSH tunnels
-          </p>
+          <div
+            aria-label="Selected database and schema"
+            className="mt-0.5 flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] text-muted-foreground"
+          >
+            <span className="inline-flex max-w-44 items-center gap-1 rounded-sm border border-border bg-muted/40 px-1.5 py-0.5">
+              <DatabaseIcon className="size-3 shrink-0" aria-hidden="true" />
+              <span className="shrink-0">DB</span>
+              <span className="truncate font-mono text-foreground">
+                {selectedDatabase ?? "none"}
+              </span>
+            </span>
+            <span aria-hidden="true">/</span>
+            <span className="inline-flex max-w-44 items-center gap-1 rounded-sm border border-border bg-muted/40 px-1.5 py-0.5">
+              <TreeStructureIcon className="size-3 shrink-0" aria-hidden="true" />
+              <span className="shrink-0">Schema</span>
+              <span className="truncate font-mono text-foreground">{selectedSchema ?? "none"}</span>
+            </span>
+            {selectedObject ? (
+              <>
+                <span aria-hidden="true">/</span>
+                <span className="inline-flex max-w-52 items-center gap-1 rounded-sm border border-border bg-muted/40 px-1.5 py-0.5">
+                  <TableIcon className="size-3 shrink-0" aria-hidden="true" />
+                  <span className="shrink-0 capitalize">{selectedObject.kind}</span>
+                  <span className="truncate font-mono text-foreground">{selectedObject.label}</span>
+                </span>
+              </>
+            ) : null}
+          </div>
         </div>
         <StatusBadge
           state={activeServer ? connectionState : "disconnected"}
@@ -403,7 +434,10 @@ function DatabaseExplorerRail({
   profileStatus,
   snapshots,
   selectedProfileId,
-  onSelect,
+  selection,
+  onSelectProfile,
+  onSelectionChange,
+  onConnectProfile,
   onAddConnection,
   onRetry,
 }: {
@@ -413,32 +447,17 @@ function DatabaseExplorerRail({
   profileStatus: "idle" | "loading" | "ready" | "error";
   snapshots: Record<string, DatabaseConnectionSnapshot>;
   selectedProfileId: string | null;
-  onSelect: (profileId: string) => void;
+  selection: DatabaseExplorerSelection | null;
+  onSelectProfile: (profileId: string) => void;
+  onSelectionChange: (selection: DatabaseExplorerSelection | null) => void;
+  onConnectProfile: (profile: DatabaseProfile) => void;
   onAddConnection: () => void;
   onRetry: () => void;
 }) {
-  const [query, setQuery] = useState("");
-  const normalizedQuery = query.trim().toLowerCase();
-  const filtered = profiles.filter((profile) => {
-    if (!normalizedQuery) {
-      return true;
-    }
-    return [
-      profile.name,
-      DATABASE_ENGINE_LABELS[profile.engine],
-      profile.host,
-      String(profile.port),
-      profile.databaseName ?? "",
-    ]
-      .join(" ")
-      .toLowerCase()
-      .includes(normalizedQuery);
-  });
-
   return (
     <aside
       aria-label="Database explorer"
-      className="flex min-w-0 flex-col border-b border-border bg-muted/20 lg:border-r lg:border-b-0"
+      className="flex min-h-0 min-w-0 flex-col border-b border-border bg-muted/15 lg:border-r lg:border-b-0"
     >
       <div className="border-b border-border px-3 py-3">
         <div className="flex items-center justify-between gap-2">
@@ -460,142 +479,44 @@ function DatabaseExplorerRail({
             </Button>
           </div>
         </div>
-        <label htmlFor="database-connection-search" className="sr-only">
-          Search database connections
-        </label>
-        <div className="relative mt-2">
-          <MagnifyingGlassIcon
-            className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground"
-            aria-hidden="true"
-          />
-          <Input
-            id="database-connection-search"
-            type="search"
-            value={query}
-            onChange={(event) => setQuery(event.currentTarget.value)}
-            placeholder="Search connections"
-            className="h-8 pl-8 text-[12px]"
-          />
-        </div>
-      </div>
 
-      <div className="border-b border-border px-3 py-3">
-        <p className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
-          Active server
-        </p>
-        <div className="mt-1.5 flex min-w-0 items-center gap-2">
-          <span className="grid size-7 shrink-0 place-items-center rounded-sm border border-border bg-card text-muted-foreground">
+        <div className="mt-2 flex min-w-0 items-center gap-2 rounded-md border border-border bg-card/60 px-2 py-1.5">
+          <span className="grid size-6 shrink-0 place-items-center rounded-sm border border-border bg-card text-muted-foreground">
             <HardDrivesIcon className="size-3.5" aria-hidden="true" />
           </span>
-          <div className="min-w-0">
-            <p className="truncate text-[12px] font-medium text-foreground">
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-[11px] font-medium text-foreground">
               {activeServer?.name ?? "No server selected"}
             </p>
-            <p className="truncate font-mono text-[10px] text-muted-foreground">
+            <p className="truncate font-mono text-[9px] text-muted-foreground">
               {activeServer
                 ? `${activeServer.username}@${activeServer.host}:${activeServer.port}`
                 : "Choose a profile to begin"}
             </p>
           </div>
+          <StatusBadge
+            state={activeServer ? connectionState : "disconnected"}
+            label={activeServer ? sshStateLabel(connectionState) : "No server"}
+          />
         </div>
-        <StatusBadge
-          className="mt-2"
-          state={activeServer ? connectionState : "disconnected"}
-          label={activeServer ? sshStateLabel(connectionState) : "No server"}
-        />
       </div>
 
-      <div className="min-h-40 flex-1 overflow-y-auto px-3 py-3">
-        <div className="flex items-center justify-between gap-2">
-          <h3 className="text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
-            Connections
-          </h3>
-          {profiles.length > 0 ? (
-            <span className="text-[10px] text-muted-foreground">{filtered.length} shown</span>
-          ) : null}
-        </div>
-
-        {profileStatus === "loading" || (profileStatus === "idle" && activeServer) ? (
-          <div className="mt-2.5">
-            <LoadingState rows={3} />
-          </div>
-        ) : null}
-
-        {profileStatus === "error" ? (
-          <div className="mt-2 rounded-md border border-destructive/30 bg-destructive/8 px-2.5 py-2">
-            <p className="text-[11px] font-medium text-destructive">Could not load connections</p>
-            <Button variant="ghost" size="sm" className="mt-1 h-7 px-1.5" onClick={onRetry}>
-              Try again
-            </Button>
-          </div>
-        ) : null}
-
-        {profileStatus === "ready" && profiles.length === 0 ? (
-          <div className="mt-2 flex items-start gap-2 rounded-md border border-dashed border-border px-2.5 py-3">
-            <PlugsIcon
-              className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
-              aria-hidden="true"
-            />
-            <div className="min-w-0">
-              <p className="text-[11px] font-medium text-foreground">No saved connections</p>
-              <p className="mt-0.5 text-[10px] leading-4 text-muted-foreground">
-                Add a profile from the workspace toolbar.
-              </p>
-            </div>
-          </div>
-        ) : null}
-
-        {profileStatus === "ready" && profiles.length > 0 && filtered.length === 0 ? (
-          <p className="mt-2 rounded-md border border-dashed border-border px-2.5 py-3 text-[10px] leading-4 text-muted-foreground">
-            No connections match this search.
-          </p>
-        ) : null}
-
-        {filtered.length > 0 ? (
-          <ul className="mt-2 space-y-1">
-            {filtered.map((profile) => {
-              const snapshot = snapshots[profile.id];
-              const state = snapshot?.state ?? "disconnected";
-              const selected = profile.id === selectedProfileId;
-
-              return (
-                <li key={profile.id}>
-                  <button
-                    type="button"
-                    onClick={() => onSelect(profile.id)}
-                    aria-pressed={selected}
-                    className={cn(
-                      "w-full rounded-sm border px-2 py-1.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/40",
-                      selected
-                        ? "border-primary/40 bg-card text-foreground"
-                        : "border-transparent text-muted-foreground hover:border-border hover:bg-card/60 hover:text-foreground",
-                    )}
-                  >
-                    <span className="flex min-w-0 items-center gap-1.5">
-                      <span
-                        aria-hidden="true"
-                        className={cn("size-1.5 shrink-0 rounded-full", profileStateColor(state))}
-                      />
-                      <span className="truncate text-[11px] font-medium">{profile.name}</span>
-                    </span>
-                    <span className="mt-0.5 flex min-w-0 items-center gap-1 pl-3 text-[10px] text-muted-foreground">
-                      <span className="shrink-0">{DATABASE_ENGINE_LABELS[profile.engine]}</span>
-                      <span aria-hidden="true">·</span>
-                      <span className="truncate font-mono">
-                        {formatDatabaseEndpoint(profile.host, profile.port, profile.socket)}
-                      </span>
-                    </span>
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        ) : null}
-      </div>
+      <DatabaseExplorerTree
+        profiles={profiles}
+        profileStatus={profileStatus}
+        snapshots={snapshots}
+        selectedProfileId={selectedProfileId}
+        selection={selection}
+        onSelectProfile={onSelectProfile}
+        onSelectionChange={onSelectionChange}
+        onConnectProfile={onConnectProfile}
+        onAddConnection={onAddConnection}
+        onRetryProfiles={onRetry}
+      />
 
       <div className="border-t border-border px-3 py-2">
-        <p className="text-[10px] text-muted-foreground">
-          Object tree arrives with the explorer. Tunnels use 127.0.0.1 only.
+        <p className="text-[10px] leading-4 text-muted-foreground">
+          Metadata loads one node at a time. Tunnels use 127.0.0.1 only.
         </p>
       </div>
     </aside>
@@ -701,6 +622,9 @@ function DatabaseManagerPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [requestedProfileId, setRequestedProfileId] = useState<string | null>(null);
+  const [explorerSelection, setExplorerSelection] = useState<DatabaseExplorerSelection | null>(
+    null,
+  );
   const [dialog, setDialog] = useState<
     { mode: "create" } | { mode: "edit"; profile: DatabaseProfile } | null
   >(null);
@@ -717,6 +641,26 @@ function DatabaseManagerPage() {
   const selectedProfileId = selectedProfile?.id ?? null;
   const selectedSnapshot = selectedProfile ? snapshots[selectedProfile.id] : undefined;
   const selectedTestResult = selectedProfile ? testResults[selectedProfile.id] : undefined;
+  const activeExplorerSelection =
+    explorerSelection?.profileId === selectedProfileId ? explorerSelection : null;
+  const selectedDatabase =
+    activeExplorerSelection?.database ??
+    selectedSnapshot?.databaseName ??
+    selectedProfile?.databaseName ??
+    null;
+  const selectedSchema =
+    activeExplorerSelection?.schema ??
+    (selectedProfile?.engine === "mysql" ? selectedDatabase : null);
+  const selectedObject =
+    activeExplorerSelection &&
+    (activeExplorerSelection.kind === "table" ||
+      activeExplorerSelection.kind === "view" ||
+      activeExplorerSelection.kind === "sequence")
+      ? {
+          label: activeExplorerSelection.objectName ?? activeExplorerSelection.label,
+          kind: activeExplorerSelection.kind,
+        }
+      : null;
   const profilesRecord = profiles.length > 0 ? snapshots : EMPTY_SNAPSHOTS;
   const testResultsRecord = profiles.length > 0 ? testResults : EMPTY_TEST_RESULTS;
   const busyRecord = profiles.length > 0 ? busy : EMPTY_BUSY;
@@ -916,12 +860,15 @@ function DatabaseManagerPage() {
           connectionState={connectionState}
           selectedProfile={selectedProfile}
           selectedState={selectedSnapshot?.state ?? "disconnected"}
+          selectedDatabase={selectedDatabase}
+          selectedSchema={selectedSchema}
+          selectedObject={selectedObject}
           refreshing={refreshing}
           onRefresh={() => void handleRefresh()}
           onAddConnection={openCreateDialog}
         />
 
-        <div className="grid min-h-[30rem] lg:grid-cols-[13.5rem_minmax(0,1fr)]">
+        <div className="grid min-h-[30rem] lg:grid-cols-[17rem_minmax(0,1fr)]">
           <DatabaseExplorerRail
             activeServer={activeServer}
             connectionState={connectionState}
@@ -929,7 +876,10 @@ function DatabaseManagerPage() {
             profileStatus={profileStatus}
             snapshots={profilesRecord}
             selectedProfileId={selectedProfileId}
-            onSelect={setRequestedProfileId}
+            selection={activeExplorerSelection}
+            onSelectProfile={setRequestedProfileId}
+            onSelectionChange={setExplorerSelection}
+            onConnectProfile={(profile) => void handleConnect(profile)}
             onAddConnection={openCreateDialog}
             onRetry={() => {
               if (activeServer) {

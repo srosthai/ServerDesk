@@ -7,6 +7,7 @@ import type {
   DatabaseDiscoveryPage,
   DatabaseExplorerNode,
   DatabaseExplorerNodePayload,
+  DatabasePage,
 } from "@/types/contracts";
 
 export type DatabaseExplorerNodeStatus = "idle" | "loading" | "ready" | "error";
@@ -17,6 +18,8 @@ export type DatabaseExplorerNodeEntry = {
   error?: CommandError;
   errorMessage?: string;
   updatedAt?: number;
+  loadingMore?: boolean;
+  loadMoreError?: string;
 };
 
 type DatabaseExplorerStore = {
@@ -27,6 +30,10 @@ type DatabaseExplorerStore = {
     profileId: string,
     node: DatabaseExplorerNode,
     page?: DatabaseDiscoveryPage,
+  ) => Promise<DatabaseExplorerNodePayload | null>;
+  loadMoreNode: (
+    profileId: string,
+    node: DatabaseExplorerNode,
   ) => Promise<DatabaseExplorerNodePayload | null>;
   refreshNode: (
     profileId: string,
@@ -60,6 +67,53 @@ function payloadMatchesNode(
   payload: DatabaseExplorerNodePayload,
 ): boolean {
   return payload.nodeKind === node.kind;
+}
+
+function mergePage<T>(current: DatabasePage<T>, next: DatabasePage<T>): DatabasePage<T> {
+  return {
+    ...current,
+    items: [...current.items, ...next.items],
+    hasMore: next.hasMore,
+    total: next.total ?? current.total,
+  };
+}
+
+function appendPage(
+  current: DatabaseExplorerNodePayload,
+  next: DatabaseExplorerNodePayload,
+): DatabaseExplorerNodePayload | null {
+  if (current.nodeKind !== next.nodeKind || current.nodeKind === "objectCounts") {
+    return null;
+  }
+
+  switch (current.nodeKind) {
+    case "databases":
+      return next.nodeKind === "databases"
+        ? { nodeKind: "databases", payload: mergePage(current.payload, next.payload) }
+        : null;
+    case "schemas":
+      return next.nodeKind === "schemas"
+        ? { nodeKind: "schemas", payload: mergePage(current.payload, next.payload) }
+        : null;
+    case "tables":
+      return next.nodeKind === "tables"
+        ? { nodeKind: "tables", payload: mergePage(current.payload, next.payload) }
+        : null;
+    case "views":
+      return next.nodeKind === "views"
+        ? { nodeKind: "views", payload: mergePage(current.payload, next.payload) }
+        : null;
+    case "sequences":
+      return next.nodeKind === "sequences"
+        ? { nodeKind: "sequences", payload: mergePage(current.payload, next.payload) }
+        : null;
+    default:
+      return null;
+  }
+}
+
+function firstPage(payload: DatabaseExplorerNodePayload): DatabasePage<unknown> | null {
+  return payload.nodeKind === "objectCounts" ? null : payload.payload;
 }
 
 export const useDatabaseExplorerStore = create<DatabaseExplorerStore>((set, get) => ({
@@ -145,6 +199,80 @@ export const useDatabaseExplorerStore = create<DatabaseExplorerStore>((set, get)
         },
         error: message,
         commandError,
+      }));
+      return null;
+    }
+  },
+
+  loadMoreNode: async (profileId, node) => {
+    const key = databaseExplorerNodeKey(profileId, node);
+    const existing = get().nodes[key];
+    if (!existing?.payload || existing.loadingMore) {
+      return existing?.payload ?? null;
+    }
+    const page = firstPage(existing.payload);
+    if (!page?.hasMore) {
+      return existing.payload;
+    }
+    if (!isTauriRuntime()) {
+      return existing.payload;
+    }
+
+    set((state) => ({
+      nodes: {
+        ...state.nodes,
+        [key]: {
+          ...state.nodes[key],
+          loadingMore: true,
+          loadMoreError: undefined,
+        },
+      },
+    }));
+
+    try {
+      const next = await loadExplorerNode(profileId, node, {
+        limit: page.limit,
+        offset: page.offset + page.items.length,
+      });
+      if (!payloadMatchesNode(node, next)) {
+        throw {
+          code: "internal",
+          message: "The database returned metadata for a different explorer node.",
+        } satisfies CommandError;
+      }
+      const merged = appendPage(existing.payload, next);
+      if (!merged) {
+        throw {
+          code: "internal",
+          message: "The database returned a different page type for this explorer node.",
+        } satisfies CommandError;
+      }
+      set((state) => ({
+        nodes: {
+          ...state.nodes,
+          [key]: {
+            ...state.nodes[key],
+            status: "ready",
+            payload: merged,
+            loadingMore: false,
+            loadMoreError: undefined,
+            updatedAt: Date.now(),
+          },
+        },
+      }));
+      return merged;
+    } catch (error) {
+      const commandError = commandErrorFor(error);
+      const message = commandError?.message ?? getCommandErrorMessage(error);
+      set((state) => ({
+        nodes: {
+          ...state.nodes,
+          [key]: {
+            ...state.nodes[key],
+            loadingMore: false,
+            loadMoreError: message,
+          },
+        },
       }));
       return null;
     }
