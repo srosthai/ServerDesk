@@ -46,6 +46,32 @@ if (tauriConfig.identifier !== "com.serverdesk.app") {
   fail(`unexpected bundle identifier ${JSON.stringify(tauriConfig.identifier)}`);
 }
 
+if (tauriConfig.bundle?.createUpdaterArtifacts !== true) {
+  fail(
+    "bundle.createUpdaterArtifacts must be true so release builds produce signed updater artifacts",
+  );
+}
+
+const updaterConfig = tauriConfig.plugins?.updater;
+if (!updaterConfig || typeof updaterConfig.pubkey !== "string") {
+  fail("plugins.updater.pubkey is missing");
+}
+const updaterPublicKey = Buffer.from(updaterConfig.pubkey, "base64").toString("utf8");
+if (!updaterPublicKey.includes("minisign public key")) {
+  fail("plugins.updater.pubkey is not a valid minisign public key");
+}
+if (updaterConfig.requireSignedVersion !== true) {
+  fail("plugins.updater.requireSignedVersion must be enabled");
+}
+const expectedUpdateEndpoint =
+  "https://github.com/srosthai/ServerDesk/releases/latest/download/latest.json";
+if (
+  !Array.isArray(updaterConfig.endpoints) ||
+  updaterConfig.endpoints[0] !== expectedUpdateEndpoint
+) {
+  fail(`plugins.updater.endpoints must start with ${expectedUpdateEndpoint}`);
+}
+
 const iconFiles = tauriConfig.bundle?.icon ?? [];
 if (iconFiles.length === 0) {
   fail("the Tauri bundle does not list any icon files");

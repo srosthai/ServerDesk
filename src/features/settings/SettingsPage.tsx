@@ -1,4 +1,3 @@
-import type { ReactNode } from "react";
 import type { Icon } from "@phosphor-icons/react";
 import {
   ArrowCounterClockwiseIcon,
@@ -23,6 +22,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
+import { SettingsSection } from "@/features/settings/SettingsSection";
+import { UpdateSettingsSection } from "@/features/settings/UpdateSettingsSection";
 import { MIN_MONITORING_INTERVAL_SECONDS } from "@/lib/preferences";
 import { cn } from "@/lib/utils";
 import { usePreferencesStore } from "@/stores/preferencesStore";
@@ -58,26 +59,6 @@ const themeOptions: ThemeOption[] = [
 
 const intervalOptions = [5, 10, 15, 30, 60, 120, 300];
 
-function SettingsSection({
-  title,
-  description,
-  children,
-}: {
-  title: string;
-  description: string;
-  children: ReactNode;
-}) {
-  return (
-    <section className="grid gap-4 border-t border-border pt-6 md:grid-cols-[200px_minmax(0,1fr)] md:gap-10">
-      <div>
-        <h2 className="text-[14px] font-semibold tracking-[-0.01em]">{title}</h2>
-        <p className="mt-1 text-[12px] leading-relaxed text-muted-foreground">{description}</p>
-      </div>
-      <div className="min-w-0">{children}</div>
-    </section>
-  );
-}
-
 function SettingsPage() {
   const preferences = usePreferencesStore((state) => state.preferences);
   const status = usePreferencesStore((state) => state.status);
@@ -95,7 +76,7 @@ function SettingsPage() {
     <div className="max-w-4xl space-y-8">
       <PageHeader
         title="Settings"
-        description="Appearance, monitoring cadence, and local application preferences."
+        description="Appearance, monitoring cadence, local preferences, and application updates."
         actions={
           <Button variant="secondary" size="sm" onClick={reset}>
             <ArrowCounterClockwiseIcon className="size-3.5" aria-hidden="true" />
@@ -229,6 +210,8 @@ function SettingsPage() {
           ) : null}
         </div>
       </SettingsSection>
+
+      <UpdateSettingsSection />
 
       <Separator />
 
