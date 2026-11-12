@@ -14,6 +14,7 @@ import {
   testDatabaseProfile,
 } from "@/services/databaseProfiles";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { databaseExplorerNodeKey, useDatabaseExplorerStore } from "@/stores/databaseExplorerStore";
 import { useDatabaseProfileStore } from "@/stores/databaseProfileStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useServerStore } from "@/stores/serverStore";
@@ -21,6 +22,7 @@ import type {
   ConnectionSnapshot,
   DatabaseCapabilities,
   DatabaseConnectionSnapshot,
+  DatabaseExplorerNodePayload,
   DatabaseProfile,
   DatabaseTestResult,
   ServerProfile,
@@ -219,6 +221,7 @@ describe("DatabaseManagerPage", () => {
       error: null,
       commandError: null,
     });
+    useDatabaseExplorerStore.setState({ nodes: {}, error: null, commandError: null });
     usePreferencesStore.setState({
       preferences: { ...DEFAULT_PREFERENCES },
       status: "unavailable",
@@ -422,6 +425,64 @@ describe("DatabaseManagerPage", () => {
 
     expect(screen.getByRole("tab", { name: "Structure" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("heading", { name: "No table selected" })).toBeInTheDocument();
+  });
+
+  it("shows the selected database and schema in the workspace header", async () => {
+    const user = userEvent.setup();
+    const unavailable = { status: "unavailable" } as const;
+    const metadata = {
+      owner: unavailable,
+      encoding: unavailable,
+      collation: unavailable,
+      sizeBytes: unavailable,
+      engine: unavailable,
+    };
+    const databasesPayload: DatabaseExplorerNodePayload = {
+      nodeKind: "databases",
+      payload: {
+        items: [{ name: "app", system: false, ...metadata }],
+        limit: 100,
+        offset: 0,
+        hasMore: false,
+        total: 1,
+      },
+    };
+    const schemasPayload: DatabaseExplorerNodePayload = {
+      nodeKind: "schemas",
+      payload: {
+        items: [{ name: "public", system: false, ...metadata }],
+        limit: 100,
+        offset: 0,
+        hasMore: false,
+        total: 1,
+      },
+    };
+    useDatabaseExplorerStore.setState({
+      nodes: {
+        [databaseExplorerNodeKey(profile.id, { kind: "databases" })]: {
+          status: "ready",
+          payload: databasesPayload,
+        },
+        [databaseExplorerNodeKey(profile.id, { kind: "schemas" })]: {
+          status: "ready",
+          payload: schemasPayload,
+        },
+      },
+      error: null,
+      commandError: null,
+    });
+    useConnectedServer();
+    useProfileStore();
+    renderPage();
+
+    await user.click(screen.getByRole("treeitem", { name: /^Primary/ }));
+    await user.click(await screen.findByRole("treeitem", { name: /^app/ }));
+    await user.click(await screen.findByRole("treeitem", { name: /^Schemas/ }));
+    await user.click(await screen.findByRole("treeitem", { name: /^public/ }));
+
+    const context = screen.getByLabelText("Selected database and schema");
+    expect(within(context).getByText("app")).toBeInTheDocument();
+    expect(within(context).getByText("public")).toBeInTheDocument();
   });
 
   it("shows a loading placeholder while server profiles load", () => {
