@@ -162,6 +162,8 @@ pub fn run() {
             commands::connections::get_connection_state,
             commands::connections::test_server_connection,
             commands::database::capabilities::get_database_capabilities,
+            commands::database::actions::preview_database_action,
+            commands::database::actions::run_database_action,
             commands::database::discovery::list_database_databases,
             commands::database::discovery::list_database_schemas,
             commands::database::discovery::list_database_tables,

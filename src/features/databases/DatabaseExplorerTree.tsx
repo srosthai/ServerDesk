@@ -10,6 +10,7 @@ import {
 import {
   ArrowClockwiseIcon,
   CaretRightIcon,
+  CheckCircleIcon,
   CircleNotchIcon,
   DatabaseIcon,
   EyeIcon,
@@ -17,8 +18,11 @@ import {
   ListNumbersIcon,
   LockKeyIcon,
   MagnifyingGlassIcon,
+  PencilSimpleIcon,
   PlugsIcon,
+  PlusIcon,
   TableIcon,
+  TrashIcon,
   TreeStructureIcon,
   WarningCircleIcon,
   WifiSlashIcon,
@@ -52,6 +56,10 @@ type DatabaseExplorerTreeProps = {
   onConnectProfile: (profile: DatabaseProfile) => void;
   onAddConnection: () => void;
   onRetryProfiles: () => void;
+  onCreateDatabase?: (profile: DatabaseProfile) => void;
+  onSetActiveDatabase?: (profile: DatabaseProfile, database: string) => void;
+  onRenameDatabase?: (profile: DatabaseProfile, database: string) => void;
+  onDropDatabase?: (profile: DatabaseProfile, database: string) => void;
 };
 
 const ROW_HEIGHT = 32;
@@ -215,6 +223,10 @@ function DatabaseExplorerTree({
   onConnectProfile,
   onAddConnection,
   onRetryProfiles,
+  onCreateDatabase,
+  onSetActiveDatabase,
+  onRenameDatabase,
+  onDropDatabase,
 }: DatabaseExplorerTreeProps) {
   const nodes = useDatabaseExplorerStore((state) => state.nodes);
   const loadNode = useDatabaseExplorerStore((state) => state.loadNode);
@@ -548,6 +560,22 @@ function DatabaseExplorerTree({
     [loadMore, loadNode, onConnectProfile, profiles],
   );
 
+  const handleDatabaseAction = useCallback(
+    (
+      row: DatabaseExplorerRow,
+      callback: ((profile: DatabaseProfile, database: string) => void) | undefined,
+    ) => {
+      if (!callback || !row.database) {
+        return;
+      }
+      const profile = profiles.find((entry) => entry.id === row.profileId);
+      if (profile) {
+        callback(profile, row.database);
+      }
+    },
+    [profiles],
+  );
+
   const effectiveViewport = viewportHeight > 0 ? viewportHeight : FALLBACK_VIEWPORT_HEIGHT;
   const totalHeight = rows.length * ROW_HEIGHT;
   const startIndex = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
@@ -689,6 +717,31 @@ function DatabaseExplorerTree({
                 return null;
               }
 
+              const rowProfile = profiles.find((entry) => entry.id === row.profileId);
+              const rowConnected = snapshots[row.profileId]?.state === "connected";
+              const rowReadOnly = row.readOnly === true;
+              const createDisabled = !rowConnected || rowReadOnly;
+              const createTitle = !rowConnected
+                ? "Connect the profile before creating a database."
+                : rowReadOnly
+                  ? "This connection profile is read-only. Create requires a writable profile."
+                  : `Create a database on ${row.profileName}`;
+              const renameDisabled = !rowConnected || rowReadOnly || row.databaseRename !== true;
+              const renameTitle =
+                row.databaseRename !== true
+                  ? `${row.engine === "mysql" ? "MySQL" : "This engine"} does not support renaming a database safely. Create a new database and migrate its data instead.`
+                  : rowReadOnly
+                    ? "This connection profile is read-only. Rename requires a writable profile."
+                    : !rowConnected
+                      ? "Connect the profile before renaming a database."
+                      : `Rename ${row.database ?? "database"}`;
+              const dropDisabled = !rowConnected || rowReadOnly;
+              const dropTitle = rowReadOnly
+                ? "This connection profile is read-only. Drop requires a writable profile."
+                : !rowConnected
+                  ? "Connect the profile before dropping a database."
+                  : `Drop ${row.database ?? "database"}`;
+
               if (row.kind === "status") {
                 return (
                   <div
@@ -776,6 +829,74 @@ function DatabaseExplorerTree({
                     <span className="shrink-0 text-[9px] tabular-nums text-muted-foreground">
                       {row.count}
                     </span>
+                  ) : null}
+                  {row.kind === "connection" && onCreateDatabase && rowProfile ? (
+                    <button
+                      type="button"
+                      aria-label={`Create database on ${rowProfile.name}`}
+                      title={createTitle}
+                      disabled={createDisabled}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onCreateDatabase(rowProfile);
+                      }}
+                      className="grid size-6 shrink-0 place-items-center rounded-sm text-muted-foreground opacity-0 outline-none transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:opacity-100 disabled:opacity-40"
+                    >
+                      <PlusIcon className="size-3" aria-hidden="true" />
+                    </button>
+                  ) : null}
+                  {row.kind === "database" ? (
+                    <>
+                      {!row.active && onSetActiveDatabase ? (
+                        <button
+                          type="button"
+                          aria-label={`Set ${row.database ?? "database"} active`}
+                          title={
+                            rowConnected
+                              ? `Set ${row.database ?? "database"} as the active browsing and SQL context`
+                              : "Connect the profile before changing the active database."
+                          }
+                          disabled={!rowConnected}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            handleDatabaseAction(row, onSetActiveDatabase);
+                          }}
+                          className="grid size-6 shrink-0 place-items-center rounded-sm text-muted-foreground opacity-0 outline-none transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:opacity-100 disabled:opacity-40"
+                        >
+                          <CheckCircleIcon className="size-3" aria-hidden="true" />
+                        </button>
+                      ) : null}
+                      {onRenameDatabase ? (
+                        <button
+                          type="button"
+                          aria-label={`Rename ${row.database ?? "database"}`}
+                          title={renameTitle}
+                          disabled={renameDisabled}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            handleDatabaseAction(row, onRenameDatabase);
+                          }}
+                          className="grid size-6 shrink-0 place-items-center rounded-sm text-muted-foreground opacity-0 outline-none transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:opacity-100 disabled:opacity-40"
+                        >
+                          <PencilSimpleIcon className="size-3" aria-hidden="true" />
+                        </button>
+                      ) : null}
+                      {onDropDatabase ? (
+                        <button
+                          type="button"
+                          aria-label={`Drop ${row.database ?? "database"}`}
+                          title={dropTitle}
+                          disabled={dropDisabled}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            handleDatabaseAction(row, onDropDatabase);
+                          }}
+                          className="grid size-6 shrink-0 place-items-center rounded-sm text-muted-foreground opacity-0 outline-none transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-destructive/10 hover:text-destructive focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:opacity-100 disabled:opacity-40"
+                        >
+                          <TrashIcon className="size-3" aria-hidden="true" />
+                        </button>
+                      ) : null}
+                    </>
                   ) : null}
                   {row.discoveryNode ? (
                     <button

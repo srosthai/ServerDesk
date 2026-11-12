@@ -27,8 +27,12 @@ import { ErrorState, LoadingState } from "@/components/ui/states";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { DatabaseConnectionList, EngineBadge } from "@/features/databases/DatabaseConnectionList";
+import { DatabaseActionDialog } from "@/features/databases/DatabaseActionDialog";
 import { DatabaseExplorerTree } from "@/features/databases/DatabaseExplorerTree";
-import type { DatabaseExplorerSelection } from "@/features/databases/databaseExplorerTreeModel";
+import {
+  databaseRowId,
+  type DatabaseExplorerSelection,
+} from "@/features/databases/databaseExplorerTreeModel";
 import { DatabaseProfileDialog } from "@/features/databases/DatabaseProfileDialog";
 import {
   DATABASE_ENGINE_LABELS,
@@ -37,15 +41,20 @@ import {
   formatLatency,
 } from "@/features/databases/databaseProfileForm";
 import { useActiveServer } from "@/hooks/useActiveServer";
+import { getCommandErrorMessage } from "@/lib/errors";
 import { isTauriRuntime } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
+import { dropDatabase, previewDatabaseAction, setActiveDatabase } from "@/services/databaseActions";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { useDatabaseExplorerStore } from "@/stores/databaseExplorerStore";
 import { useDatabaseProfileStore } from "@/stores/databaseProfileStore";
 import { useServerStore } from "@/stores/serverStore";
 import type {
   ConnectionState,
+  DatabaseActionResult,
   DatabaseConnectionSnapshot,
   DatabaseConnectionState,
+  DatabaseDdlPreview,
   DatabaseProfile,
   DatabaseTestResult,
   DatabaseTunnelSnapshot,
@@ -440,6 +449,10 @@ function DatabaseExplorerRail({
   onConnectProfile,
   onAddConnection,
   onRetry,
+  onCreateDatabase,
+  onSetActiveDatabase,
+  onRenameDatabase,
+  onDropDatabase,
 }: {
   activeServer: ServerProfile | null;
   connectionState: ConnectionState;
@@ -453,6 +466,10 @@ function DatabaseExplorerRail({
   onConnectProfile: (profile: DatabaseProfile) => void;
   onAddConnection: () => void;
   onRetry: () => void;
+  onCreateDatabase: (profile: DatabaseProfile) => void;
+  onSetActiveDatabase: (profile: DatabaseProfile, database: string) => void;
+  onRenameDatabase: (profile: DatabaseProfile, database: string) => void;
+  onDropDatabase: (profile: DatabaseProfile, database: string) => void;
 }) {
   return (
     <aside
@@ -512,11 +529,17 @@ function DatabaseExplorerRail({
         onConnectProfile={onConnectProfile}
         onAddConnection={onAddConnection}
         onRetryProfiles={onRetry}
+        onCreateDatabase={onCreateDatabase}
+        onSetActiveDatabase={onSetActiveDatabase}
+        onRenameDatabase={onRenameDatabase}
+        onDropDatabase={onDropDatabase}
       />
 
       <div className="border-t border-border px-3 py-2">
         <p className="text-[10px] leading-4 text-muted-foreground">
-          Metadata loads one node at a time. Tunnels use 127.0.0.1 only.
+          {selection?.kind === "database" && selection.engine === "mysql"
+            ? "MySQL does not support renaming a database safely. Create a new database and migrate its data instead."
+            : "Metadata loads one node at a time. Tunnels use 127.0.0.1 only."}
         </p>
       </div>
     </aside>
@@ -630,6 +653,18 @@ function DatabaseManagerPage() {
   >(null);
   const [deleteTarget, setDeleteTarget] = useState<DatabaseProfile | null>(null);
   const [deletePending, setDeletePending] = useState(false);
+  const [databaseAction, setDatabaseAction] = useState<
+    | { mode: "create"; profile: DatabaseProfile }
+    | { mode: "rename"; profile: DatabaseProfile; database: string }
+    | null
+  >(null);
+  const [dropTarget, setDropTarget] = useState<{
+    profile: DatabaseProfile;
+    database: string;
+    preview: DatabaseDdlPreview;
+  } | null>(null);
+  const [dropPending, setDropPending] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const workspaceState = workspaceStateFor({
     serverStatus,
@@ -699,6 +734,116 @@ function DatabaseManagerPage() {
   function openEditDialog(profile: DatabaseProfile) {
     setRequestedProfileId(profile.id);
     setDialog({ mode: "edit", profile });
+  }
+
+  function selectDatabaseContext(profile: DatabaseProfile, database: string) {
+    setRequestedProfileId(profile.id);
+    setExplorerSelection({
+      id: databaseRowId(profile.id, database),
+      profileId: profile.id,
+      kind: "database",
+      label: database,
+      engine: profile.engine,
+      database,
+      schema: null,
+      objectName: null,
+    });
+  }
+
+  async function refreshDatabaseExplorer(profileId: string): Promise<boolean> {
+    const payload = await useDatabaseExplorerStore.getState().refreshNode(profileId, {
+      kind: "databases",
+    });
+    return payload !== null;
+  }
+
+  async function applyActionResult(result: DatabaseActionResult, profile: DatabaseProfile) {
+    setActionError(null);
+    const refreshed = await refreshDatabaseExplorer(profile.id);
+
+    if (result.verified) {
+      setNotice(result.verification);
+    } else {
+      setNotice(null);
+      setActionError(
+        result.verificationError ??
+          result.verification ??
+          "The action finished, but metadata verification did not confirm the result.",
+      );
+      return;
+    }
+
+    if (!refreshed) {
+      setActionError(
+        "The database action was verified, but the explorer could not refresh. Use Refresh to reload the tree.",
+      );
+    }
+  }
+
+  async function handleSetActiveDatabase(profile: DatabaseProfile, database: string) {
+    setActionError(null);
+    setNotice(null);
+    try {
+      const result = await setActiveDatabase(profile.id, database);
+      if (result.verified) {
+        selectDatabaseContext(profile, database);
+        await refreshConnectionState(profile.id);
+        await applyActionResult(result, profile);
+      } else {
+        await applyActionResult(result, profile);
+      }
+    } catch (error) {
+      setActionError(getCommandErrorMessage(error));
+    }
+  }
+
+  async function openDropDialog(profile: DatabaseProfile, database: string) {
+    setActionError(null);
+    try {
+      const preview = await previewDatabaseAction(profile.id, { kind: "drop", name: database });
+      setDropTarget({ profile, database, preview });
+    } catch (error) {
+      setActionError(getCommandErrorMessage(error));
+    }
+  }
+
+  async function handleDropDatabase() {
+    if (!dropTarget) {
+      return;
+    }
+
+    setDropPending(true);
+    setActionError(null);
+    try {
+      const result = await dropDatabase(dropTarget.profile.id, dropTarget.database);
+      const dropped = dropTarget.database;
+      if (activeExplorerSelection?.database === dropped) {
+        setExplorerSelection(null);
+      }
+      await applyActionResult(result, dropTarget.profile);
+      setDropTarget(null);
+    } catch (error) {
+      setActionError(getCommandErrorMessage(error));
+      setDropTarget(null);
+    } finally {
+      setDropPending(false);
+    }
+  }
+
+  async function handleStructureCompleted(
+    result: DatabaseActionResult,
+    action:
+      | { mode: "create"; profile: DatabaseProfile }
+      | { mode: "rename"; profile: DatabaseProfile; database: string },
+  ) {
+    if (result.verified) {
+      if (action.mode === "create") {
+        selectDatabaseContext(action.profile, result.database);
+      } else if (activeExplorerSelection?.database === action.database) {
+        selectDatabaseContext(action.profile, result.database);
+      }
+    }
+    await applyActionResult(result, action.profile);
   }
 
   async function handleRefresh() {
@@ -780,6 +925,9 @@ function DatabaseManagerPage() {
   const deleteServer = deleteTarget
     ? (servers.find((server) => server.id === deleteTarget.serverId) ?? null)
     : null;
+  const dropServer = dropTarget
+    ? (servers.find((server) => server.id === dropTarget.profile.serverId) ?? null)
+    : null;
 
   return (
     <div className="space-y-5">
@@ -830,6 +978,22 @@ function DatabaseManagerPage() {
             <AlertDescription>{databaseError}</AlertDescription>
           </div>
           <Button variant="ghost" size="sm" onClick={clearDatabaseError}>
+            Dismiss
+          </Button>
+        </Alert>
+      ) : null}
+
+      {actionError ? (
+        <Alert variant="destructive">
+          <WarningCircleIcon
+            className="mt-0.5 size-4 shrink-0 text-destructive"
+            aria-hidden="true"
+          />
+          <div className="flex-1">
+            <AlertTitle>Database action failed</AlertTitle>
+            <AlertDescription>{actionError}</AlertDescription>
+          </div>
+          <Button variant="ghost" size="sm" onClick={() => setActionError(null)}>
             Dismiss
           </Button>
         </Alert>
@@ -886,6 +1050,14 @@ function DatabaseManagerPage() {
                 void fetchProfiles(activeServer.id);
               }
             }}
+            onCreateDatabase={(profile) => setDatabaseAction({ mode: "create", profile })}
+            onSetActiveDatabase={(profile, database) =>
+              void handleSetActiveDatabase(profile, database)
+            }
+            onRenameDatabase={(profile, database) =>
+              setDatabaseAction({ mode: "rename", profile, database })
+            }
+            onDropDatabase={(profile, database) => void openDropDialog(profile, database)}
           />
 
           <div className="min-w-0">
@@ -997,6 +1169,73 @@ function DatabaseManagerPage() {
           }}
         />
       ) : null}
+
+      {databaseAction ? (
+        <DatabaseActionDialog
+          key={`${databaseAction.mode}-${databaseAction.profile.id}-${
+            databaseAction.mode === "rename" ? databaseAction.database : "new"
+          }`}
+          open
+          mode={databaseAction.mode}
+          profile={databaseAction.profile}
+          database={databaseAction.mode === "rename" ? databaseAction.database : null}
+          onOpenChange={(open) => {
+            if (!open) {
+              setDatabaseAction(null);
+            }
+          }}
+          onCompleted={(result) => void handleStructureCompleted(result, databaseAction)}
+        />
+      ) : null}
+
+      <ConfirmDialog
+        open={dropTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !dropPending) {
+            setDropTarget(null);
+          }
+        }}
+        title={`Drop database ${dropTarget?.database ?? ""}?`}
+        description="This permanently removes the database and every object and row inside it. The action is not reversible."
+        confirmLabel="Drop database"
+        details={
+          dropTarget
+            ? [
+                {
+                  label: "Server",
+                  value: dropServer
+                    ? `${dropServer.name} (${dropServer.host})`
+                    : dropTarget.profile.serverId,
+                },
+                {
+                  label: "Engine",
+                  value: DATABASE_ENGINE_LABELS[dropTarget.profile.engine],
+                },
+                { label: "Database", value: dropTarget.database },
+                {
+                  label: "Action",
+                  value: `DROP DATABASE ${dropTarget.database} (permanent deletion)`,
+                },
+                { label: "Profile", value: dropTarget.profile.name },
+              ]
+            : undefined
+        }
+        preview={
+          dropTarget
+            ? {
+                label: "Generated DDL",
+                text: dropTarget.preview.ddl,
+              }
+            : null
+        }
+        warningTitle="This permanently deletes the database."
+        warningDescription={
+          dropTarget?.preview.warnings.join(" ") ??
+          "Every table, view, and row in this database will be removed."
+        }
+        onConfirm={() => void handleDropDatabase()}
+        pending={dropPending}
+      />
 
       <ConfirmDialog
         open={deleteTarget !== null}

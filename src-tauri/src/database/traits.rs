@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::storage::DatabaseEngine;
 
 use super::{
+    actions::{DatabaseDdlPreview, ValidatedDatabaseAction},
     capabilities::{CapabilitySnapshot, DatabaseAction, DatabaseCapabilities, DatabaseVersion},
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
@@ -329,6 +330,11 @@ pub trait DatabaseAdapter: Send + Sync {
 
     fn is_connected(&self) -> bool;
 
+    /// True when the current session was opened in read-only mode. Structure
+    /// actions are rejected before SQL runs; metadata browsing remains
+    /// available.
+    fn is_read_only(&self) -> bool;
+
     async fn connect(
         &mut self,
         request: DatabaseConnectRequest,
@@ -344,6 +350,26 @@ pub trait DatabaseAdapter: Send + Sync {
         &self,
         page: PageRequest,
     ) -> Result<Page<DatabaseSummary>, DatabaseError>;
+
+    /// Re-reads one database summary after a lifecycle action. `None` means
+    /// the engine does not list the database.
+    async fn database_summary(
+        &self,
+        database: &Identifier,
+    ) -> Result<Option<DatabaseSummary>, DatabaseError>;
+
+    /// Generates engine-specific DDL and safe warnings without executing it.
+    async fn preview_database_action(
+        &self,
+        action: &ValidatedDatabaseAction,
+    ) -> Result<DatabaseDdlPreview, DatabaseError>;
+
+    /// Executes one validated lifecycle action. Only set-active returns updated
+    /// connection metadata; create, rename, and drop return `None`.
+    async fn execute_database_action(
+        &mut self,
+        action: &ValidatedDatabaseAction,
+    ) -> Result<Option<DatabaseConnectionInfo>, DatabaseError>;
 
     async fn list_schemas(&self, page: PageRequest) -> Result<Page<SchemaSummary>, DatabaseError>;
 

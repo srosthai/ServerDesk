@@ -426,7 +426,7 @@ fn query_history_and_snippets_survive_a_restart_with_filters() {
 
     {
         let database = Database::open(&path).expect("reopen database");
-        assert_eq!(database.schema_version().expect("schema version"), 5);
+        assert_eq!(database.schema_version().expect("schema version"), 6);
 
         let connection = database
             .get_database_connection(&connection_id)
