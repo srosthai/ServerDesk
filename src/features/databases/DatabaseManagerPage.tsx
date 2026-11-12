@@ -1,21 +1,26 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import type { Icon } from "@phosphor-icons/react";
 import {
   ArrowClockwiseIcon,
+  BroomIcon,
+  CheckCircleIcon,
   CircleNotchIcon,
   CodeIcon,
   DatabaseIcon,
   HardDrivesIcon,
   InfoIcon,
   KeyIcon,
+  ListChecksIcon,
   PlugsIcon,
+  PlayIcon,
   PlusIcon,
   RowsIcon,
   TableIcon,
   TreeStructureIcon,
-  WrenchIcon,
   WarningCircleIcon,
+  WrenchIcon,
+  XIcon,
 } from "@phosphor-icons/react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -48,6 +53,12 @@ import { dropDatabase, previewDatabaseAction, setActiveDatabase } from "@/servic
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useDatabaseExplorerStore } from "@/stores/databaseExplorerStore";
 import { useDatabaseProfileStore } from "@/stores/databaseProfileStore";
+import {
+  useDatabaseWorkspaceStore,
+  type DatabaseWorkspaceTab,
+  type DatabaseWorkspaceTaskStatus,
+  type DatabaseWorkspaceView,
+} from "@/stores/databaseWorkspaceStore";
 import { useServerStore } from "@/stores/serverStore";
 import type {
   ConnectionState,
@@ -64,7 +75,7 @@ import type {
 type WorkspaceState = "loading" | "error" | "empty" | "no-server" | "ready";
 
 type DatabaseTab = {
-  value: string;
+  value: DatabaseWorkspaceView;
   label: string;
   icon: Icon;
   emptyTitle: string;
@@ -614,6 +625,359 @@ function DatabaseWorkspaceStatusBar({
   );
 }
 
+function DatabaseWorkspaceTabBar({
+  tabs,
+  activeTabId,
+  snapshots,
+  onActivate,
+  onClose,
+}: {
+  tabs: DatabaseWorkspaceTab[];
+  activeTabId: string | null;
+  snapshots: Record<string, DatabaseConnectionSnapshot>;
+  onActivate: (profileId: string) => void;
+  onClose: (profileId: string) => void;
+}) {
+  if (tabs.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="flex items-center gap-2 border-b border-border bg-muted/20 px-2 pt-1.5">
+      <div
+        role="tablist"
+        aria-label="Open database connections"
+        className="flex min-w-0 flex-1 items-end gap-1 overflow-x-auto"
+      >
+        {tabs.map((tab) => {
+          const state = snapshots[tab.profileId]?.state ?? "disconnected";
+          const active = tab.profileId === activeTabId;
+          return (
+            <div
+              key={tab.profileId}
+              className={cn(
+                "flex shrink-0 items-center rounded-t-md border border-b-0",
+                active
+                  ? "border-border bg-card text-foreground shadow-sm"
+                  : "border-transparent bg-muted/30 text-muted-foreground hover:bg-muted/50",
+              )}
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={active}
+                aria-label={`${tab.name} (${DATABASE_ENGINE_LABELS[tab.engine]}) workspace tab`}
+                onClick={() => onActivate(tab.profileId)}
+                className="flex min-w-0 items-center gap-1.5 rounded-tl-md py-1.5 pr-1.5 pl-2.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+              >
+                <span
+                  aria-hidden="true"
+                  className={cn("size-1.5 shrink-0 rounded-full", profileStateColor(state))}
+                />
+                <span className="max-w-36 truncate text-[12px] font-medium">{tab.name}</span>
+                <span className="text-[9px] font-medium tracking-wide text-muted-foreground uppercase">
+                  {DATABASE_ENGINE_LABELS[tab.engine]}
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => onClose(tab.profileId)}
+                aria-label={`Close ${tab.name} workspace tab`}
+                title={`Close ${tab.name}, disconnect its tunnel, and clear its tasks`}
+                className="mr-1 grid size-5 shrink-0 place-items-center rounded-sm text-muted-foreground outline-none hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40"
+              >
+                <XIcon className="size-3" aria-hidden="true" />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+      <span className="hidden shrink-0 pr-1 text-[10px] text-muted-foreground sm:block">
+        {tabs.length} open
+      </span>
+    </div>
+  );
+}
+
+function DatabaseWorkspaceTabHeader({
+  tab,
+  snapshot,
+  server,
+}: {
+  tab: DatabaseWorkspaceTab;
+  snapshot: DatabaseConnectionSnapshot | undefined;
+  server: ServerProfile | null;
+}) {
+  const state = snapshot?.state ?? "disconnected";
+  const selection = tab.selection;
+  const database = selection?.database ?? snapshot?.databaseName ?? tab.databaseName;
+  const schema = selection?.schema ?? (tab.engine === "mysql" ? database : null);
+  const object =
+    selection &&
+    (selection.kind === "table" || selection.kind === "view" || selection.kind === "sequence")
+      ? (selection.objectName ?? selection.label)
+      : null;
+
+  return (
+    <div
+      aria-label="Workspace tab header"
+      className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-border bg-muted/15 px-4 py-2"
+    >
+      <div className="flex min-w-0 items-center gap-2">
+        <span className="grid size-7 shrink-0 place-items-center rounded-md border border-border bg-card text-muted-foreground">
+          <DatabaseIcon className="size-3.5" aria-hidden="true" />
+        </span>
+        <div className="min-w-0">
+          <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+            <h2 className="max-w-52 truncate text-[13px] font-semibold tracking-[-0.01em] text-foreground">
+              {tab.name}
+            </h2>
+            <EngineBadge engine={tab.engine} />
+            <StatusBadge state={state} label={databaseConnectionStateLabel(state)} />
+            {tab.readOnly ? <Badge variant="warning">Read-only</Badge> : null}
+          </div>
+          <p className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">
+            {server?.name ?? tab.serverId} ·{" "}
+            {formatDatabaseEndpoint(tab.host, tab.port, tab.socket)}
+          </p>
+        </div>
+      </div>
+
+      <div
+        aria-label="Workspace tab context"
+        className="flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] text-muted-foreground"
+      >
+        <span className="inline-flex max-w-44 items-center gap-1 rounded-sm border border-border bg-card px-1.5 py-0.5">
+          <DatabaseIcon className="size-3 shrink-0" aria-hidden="true" />
+          <span className="shrink-0">DB</span>
+          <span className="truncate font-mono text-foreground">{database ?? "none"}</span>
+        </span>
+        <span aria-hidden="true">/</span>
+        <span className="inline-flex max-w-44 items-center gap-1 rounded-sm border border-border bg-card px-1.5 py-0.5">
+          <TreeStructureIcon className="size-3 shrink-0" aria-hidden="true" />
+          <span className="shrink-0">Schema</span>
+          <span className="truncate font-mono text-foreground">{schema ?? "none"}</span>
+        </span>
+        {object ? (
+          <>
+            <span aria-hidden="true">/</span>
+            <span className="inline-flex max-w-52 items-center gap-1 rounded-sm border border-border bg-card px-1.5 py-0.5">
+              <TableIcon className="size-3 shrink-0" aria-hidden="true" />
+              <span className="truncate font-mono text-foreground">{object}</span>
+            </span>
+          </>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function SqlResultPanel({ tab }: { tab: DatabaseWorkspaceTab }) {
+  const result = tab.sqlResult;
+  if (!result) {
+    return (
+      <EmptyState
+        icon={<RowsIcon className="size-4" aria-hidden="true" />}
+        title="No query results yet"
+        description={`Results, errors, and execution time stay with the ${tab.name} tab when you switch connections.`}
+      />
+    );
+  }
+
+  return (
+    <div
+      role="region"
+      aria-label={`SQL results for ${tab.name}`}
+      className="overflow-hidden rounded-md border border-border bg-card"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-muted/20 px-3 py-2">
+        <p className="flex items-center gap-1.5 text-[11px] font-medium text-foreground">
+          {result.error ? (
+            <WarningCircleIcon className="size-3.5 text-destructive" aria-hidden="true" />
+          ) : (
+            <CheckCircleIcon className="size-3.5 text-success" aria-hidden="true" />
+          )}
+          {result.error ? "Query failed" : "Query finished"}
+          <span className="font-normal text-muted-foreground">
+            {result.affectedRows !== null
+              ? `${result.affectedRows} row${result.affectedRows === 1 ? "" : "s"} affected`
+              : `${result.rows.length} row${result.rows.length === 1 ? "" : "s"}`}
+          </span>
+        </p>
+        <p className="font-mono text-[10px] text-muted-foreground">
+          {result.durationMs} ms · {new Date(result.executedAt).toLocaleTimeString()}
+        </p>
+      </div>
+      {result.error ? (
+        <p className="px-3 py-2.5 text-[11px] leading-5 text-destructive">{result.error}</p>
+      ) : result.columns.length === 0 ? (
+        <p className="px-3 py-2.5 text-[11px] text-muted-foreground">No result columns.</p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full border-collapse text-left text-[11px]">
+            <thead className="bg-muted/20 text-[10px] tracking-wide text-muted-foreground uppercase">
+              <tr>
+                {result.columns.map((column) => (
+                  <th key={column} className="border-b border-border px-2.5 py-1.5 font-medium">
+                    {column}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {result.rows.map((row, index) => (
+                <tr key={index} className="border-b border-border last:border-0">
+                  {row.map((value, columnIndex) => (
+                    <td
+                      key={columnIndex}
+                      className="max-w-64 truncate px-2.5 py-1.5 font-mono text-foreground"
+                      title={value}
+                    >
+                      {value === "" ? <span className="text-muted-foreground">empty</span> : value}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <p className="border-t border-border px-3 py-1.5 font-mono text-[10px] text-muted-foreground">
+        {result.statement}
+      </p>
+    </div>
+  );
+}
+
+function DatabaseSqlWorkspace({
+  tab,
+  snapshot,
+}: {
+  tab: DatabaseWorkspaceTab;
+  snapshot: DatabaseConnectionSnapshot | undefined;
+}) {
+  const setSqlDraft = useDatabaseWorkspaceStore((state) => state.setSqlDraft);
+  const setSqlResult = useDatabaseWorkspaceStore((state) => state.setSqlResult);
+  const connected = snapshot?.state === "connected";
+
+  return (
+    <div className="space-y-3">
+      <div className="overflow-hidden rounded-md border border-border bg-card">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2">
+          <div className="flex items-center gap-2">
+            <CodeIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
+            <h3 className="text-[12px] font-semibold text-foreground">SQL editor</h3>
+            <EngineBadge engine={tab.engine} />
+            <Badge variant={connected ? "success" : "outline"}>
+              {connected ? "Connected" : "Disconnected"}
+            </Badge>
+            {tab.readOnly ? <Badge variant="warning">Read-only</Badge> : null}
+          </div>
+          <span className="font-mono text-[10px] text-muted-foreground">{tab.name}</span>
+        </div>
+        <textarea
+          id={`database-sql-editor-${tab.profileId}`}
+          aria-label={`SQL editor for ${tab.name}`}
+          value={tab.sqlDraft}
+          onChange={(event) => setSqlDraft(tab.profileId, event.target.value)}
+          spellCheck={false}
+          placeholder="SELECT current_database(), current_user;"
+          className="min-h-40 w-full resize-y bg-transparent p-3 font-mono text-[12px] leading-5 text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:ring-2 focus-visible:ring-ring/30"
+        />
+        <div className="flex flex-wrap items-center gap-2 border-t border-border bg-muted/15 px-3 py-2">
+          <Button
+            size="sm"
+            disabled
+            title="SQL execution is added with the query milestone; this editor owns the draft and result state now."
+          >
+            <PlayIcon className="size-3.5" aria-hidden="true" />
+            Run
+          </Button>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => {
+              setSqlDraft(tab.profileId, "");
+              setSqlResult(tab.profileId, null);
+            }}
+            disabled={tab.sqlDraft.length === 0 && tab.sqlResult === null}
+          >
+            <BroomIcon className="size-3.5" aria-hidden="true" />
+            Clear
+          </Button>
+          <span className="text-[10px] text-muted-foreground">
+            {connected
+              ? "Draft and results are scoped to this connection tab."
+              : "Connect this profile before running queries."}
+          </span>
+        </div>
+      </div>
+      <SqlResultPanel tab={tab} />
+    </div>
+  );
+}
+
+function DatabaseOperationsWorkspace({ tab }: { tab: DatabaseWorkspaceTab }) {
+  const taskTone: Record<DatabaseWorkspaceTaskStatus, string> = {
+    running: "text-warning",
+    succeeded: "text-success",
+    failed: "text-destructive",
+    cancelled: "text-muted-foreground",
+  };
+  const TaskIcon = ListChecksIcon;
+
+  return (
+    <div className="space-y-3">
+      <div className="rounded-md border border-border bg-card">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2">
+          <div className="flex items-center gap-2">
+            <TaskIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
+            <h3 className="text-[12px] font-semibold text-foreground">Background tasks</h3>
+          </div>
+          <span className="text-[10px] text-muted-foreground">
+            Scoped to {tab.name} · cleared when this tab closes
+          </span>
+        </div>
+        {tab.tasks.length === 0 ? (
+          <p className="px-3 py-3 text-[11px] leading-5 text-muted-foreground">
+            No imports, exports, backups, or restores are running for this connection. Imports and
+            backups attach here and are released with the tab.
+          </p>
+        ) : (
+          <ul className="divide-y divide-border">
+            {tab.tasks.map((task) => (
+              <li
+                key={task.id}
+                className="flex flex-wrap items-center justify-between gap-2 px-3 py-2"
+              >
+                <span className="min-w-0">
+                  <span className="block truncate text-[11px] font-medium text-foreground">
+                    {task.label}
+                  </span>
+                  {task.detail ? (
+                    <span className="block truncate text-[10px] text-muted-foreground">
+                      {task.detail}
+                    </span>
+                  ) : null}
+                </span>
+                <span className={cn("text-[10px] font-medium capitalize", taskTone[task.status])}>
+                  {task.status}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <EmptyState
+        icon={<WrenchIcon className="size-4" aria-hidden="true" />}
+        title="No operations queued"
+        description="Imports, exports, backups, and restores will report progress and cancellation from this connection tab."
+      />
+    </div>
+  );
+}
+
 function DatabaseManagerPage() {
   const servers = useServerStore((state) => state.servers);
   const serverStatus = useServerStore((state) => state.status);
@@ -644,10 +1008,6 @@ function DatabaseManagerPage() {
 
   const [refreshing, setRefreshing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  const [requestedProfileId, setRequestedProfileId] = useState<string | null>(null);
-  const [explorerSelection, setExplorerSelection] = useState<DatabaseExplorerSelection | null>(
-    null,
-  );
   const [dialog, setDialog] = useState<
     { mode: "create" } | { mode: "edit"; profile: DatabaseProfile } | null
   >(null);
@@ -666,26 +1026,41 @@ function DatabaseManagerPage() {
   const [dropPending, setDropPending] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
+  const workspaceTabs = useDatabaseWorkspaceStore((state) => state.tabs);
+  const workspaceOrder = useDatabaseWorkspaceStore((state) => state.order);
+  const activeTabId = useDatabaseWorkspaceStore((state) => state.activeTabId);
+  const openWorkspaceTab = useDatabaseWorkspaceStore((state) => state.openTab);
+  const closeWorkspaceTab = useDatabaseWorkspaceStore((state) => state.closeTab);
+  const activateWorkspaceTab = useDatabaseWorkspaceStore((state) => state.activateTab);
+  const setWorkspaceView = useDatabaseWorkspaceStore((state) => state.setActiveView);
+  const setWorkspaceSelection = useDatabaseWorkspaceStore((state) => state.setSelection);
+  const autoOpenedTab = useRef(false);
+
   const workspaceState = workspaceStateFor({
     serverStatus,
     serverCount: servers.length,
     activeServer,
   });
-  const selectedProfile =
-    profiles.find((profile) => profile.id === requestedProfileId) ?? profiles[0] ?? null;
-  const selectedProfileId = selectedProfile?.id ?? null;
-  const selectedSnapshot = selectedProfile ? snapshots[selectedProfile.id] : undefined;
-  const selectedTestResult = selectedProfile ? testResults[selectedProfile.id] : undefined;
-  const activeExplorerSelection =
-    explorerSelection?.profileId === selectedProfileId ? explorerSelection : null;
+  const activeTab = activeTabId ? (workspaceTabs[activeTabId] ?? null) : null;
+  // Profiles are cached per server. An active tab from another server keeps
+  // its own identity even when the current explorer cannot list it.
+  const activeTabProfile = activeTab
+    ? (profiles.find((profile) => profile.id === activeTab.profileId) ?? null)
+    : null;
+  const selectedProfile = activeTab ? activeTabProfile : (profiles[0] ?? null);
+  const selectedProfileId = activeTab?.profileId ?? selectedProfile?.id ?? null;
+  const selectedSnapshot = selectedProfileId ? snapshots[selectedProfileId] : undefined;
+  const selectedTestResult = selectedProfileId ? testResults[selectedProfileId] : undefined;
+  const activeExplorerSelection = activeTab?.selection ?? null;
   const selectedDatabase =
     activeExplorerSelection?.database ??
     selectedSnapshot?.databaseName ??
     selectedProfile?.databaseName ??
+    activeTab?.databaseName ??
     null;
+  const selectedEngine = selectedProfile?.engine ?? activeTab?.engine ?? null;
   const selectedSchema =
-    activeExplorerSelection?.schema ??
-    (selectedProfile?.engine === "mysql" ? selectedDatabase : null);
+    activeExplorerSelection?.schema ?? (selectedEngine === "mysql" ? selectedDatabase : null);
   const selectedObject =
     activeExplorerSelection &&
     (activeExplorerSelection.kind === "table" ||
@@ -727,18 +1102,32 @@ function DatabaseManagerPage() {
     }
   }, [profiles, refreshConnectionState]);
 
+  useEffect(() => {
+    if (autoOpenedTab.current) {
+      return;
+    }
+    if (activeTabId) {
+      autoOpenedTab.current = true;
+      return;
+    }
+    if (profileStatus === "ready" && profiles.length > 0) {
+      autoOpenedTab.current = true;
+      openWorkspaceTab(profiles[0]);
+    }
+  }, [activeTabId, openWorkspaceTab, profileStatus, profiles]);
+
   function openCreateDialog() {
     setDialog({ mode: "create" });
   }
 
   function openEditDialog(profile: DatabaseProfile) {
-    setRequestedProfileId(profile.id);
+    openWorkspaceTab(profile);
     setDialog({ mode: "edit", profile });
   }
 
   function selectDatabaseContext(profile: DatabaseProfile, database: string) {
-    setRequestedProfileId(profile.id);
-    setExplorerSelection({
+    openWorkspaceTab(profile);
+    setWorkspaceSelection(profile.id, {
       id: databaseRowId(profile.id, database),
       profileId: profile.id,
       kind: "database",
@@ -748,6 +1137,37 @@ function DatabaseManagerPage() {
       schema: null,
       objectName: null,
     });
+  }
+
+  function handleOpenWorkspace(profile: DatabaseProfile) {
+    openWorkspaceTab(profile);
+  }
+
+  function handleActivateWorkspaceTab(profileId: string) {
+    const profile = profiles.find((entry) => entry.id === profileId);
+    if (profile) {
+      openWorkspaceTab(profile);
+      return;
+    }
+    activateWorkspaceTab(profileId);
+  }
+
+  function handleSelectExplorerProfile(profileId: string) {
+    const profile = profiles.find((entry) => entry.id === profileId);
+    if (profile) {
+      openWorkspaceTab(profile);
+    }
+  }
+
+  function handleWorkspaceSelectionChange(selection: DatabaseExplorerSelection | null) {
+    if (!selection) {
+      return;
+    }
+    const profile = profiles.find((entry) => entry.id === selection.profileId);
+    if (profile) {
+      openWorkspaceTab(profile);
+    }
+    setWorkspaceSelection(selection.profileId, selection);
   }
 
   async function refreshDatabaseExplorer(profileId: string): Promise<boolean> {
@@ -817,8 +1237,9 @@ function DatabaseManagerPage() {
     try {
       const result = await dropDatabase(dropTarget.profile.id, dropTarget.database);
       const dropped = dropTarget.database;
-      if (activeExplorerSelection?.database === dropped) {
-        setExplorerSelection(null);
+      const tab = useDatabaseWorkspaceStore.getState().tabs[dropTarget.profile.id];
+      if (tab?.selection?.database === dropped) {
+        setWorkspaceSelection(dropTarget.profile.id, null);
       }
       await applyActionResult(result, dropTarget.profile);
       setDropTarget(null);
@@ -837,9 +1258,10 @@ function DatabaseManagerPage() {
       | { mode: "rename"; profile: DatabaseProfile; database: string },
   ) {
     if (result.verified) {
+      const tab = useDatabaseWorkspaceStore.getState().tabs[action.profile.id];
       if (action.mode === "create") {
         selectDatabaseContext(action.profile, result.database);
-      } else if (activeExplorerSelection?.database === action.database) {
+      } else if (tab?.selection?.database === action.database) {
         selectDatabaseContext(action.profile, result.database);
       }
     }
@@ -874,15 +1296,16 @@ function DatabaseManagerPage() {
 
   async function handleConnect(profile: DatabaseProfile) {
     setNotice(null);
+    openWorkspaceTab(profile);
     const connected = await connectProfile(profile.id);
     if (connected) {
-      setRequestedProfileId(profile.id);
       setNotice(`Connected to ${profile.name} through the SSH tunnel.`);
     }
   }
 
   async function handleReconnect(profile: DatabaseProfile) {
     setNotice(null);
+    openWorkspaceTab(profile);
     const connected = await reconnectProfile(profile.id);
     if (connected) {
       setNotice(`Reconnected ${profile.name} through the SSH tunnel.`);
@@ -895,6 +1318,30 @@ function DatabaseManagerPage() {
     if (disconnected) {
       setNotice(`Disconnected ${profile.name}. The loopback tunnel was closed.`);
     }
+  }
+
+  async function handleCloseWorkspace(profileId: string) {
+    const tab = useDatabaseWorkspaceStore.getState().tabs[profileId];
+    if (!tab) {
+      return;
+    }
+    const snapshot = useDatabaseProfileStore.getState().snapshots[profileId];
+    const live = snapshot !== undefined && snapshot.state !== "disconnected";
+
+    // Removing the tab clears selection, SQL text, results, and background
+    // task records for that connection only. Cached explorer nodes are scoped
+    // by profile id, so resetting one cannot touch another connection's tree.
+    closeWorkspaceTab(profileId);
+    useDatabaseExplorerStore.getState().resetProfile(profileId);
+
+    if (isTauriRuntime()) {
+      // The command is idempotent and also closes a tunnel that exists without
+      // a live adapter, so closing a tab always releases loopback ports.
+      await disconnectProfile(profileId);
+    }
+    setNotice(
+      `${tab.name} workspace closed. ${live ? "Its tunnel and background tasks were closed." : "No live tunnel was open."}`,
+    );
   }
 
   async function handleTest(profile: DatabaseProfile) {
@@ -917,6 +1364,8 @@ function DatabaseManagerPage() {
     setDeletePending(false);
 
     if (deleted) {
+      closeWorkspaceTab(deleteTarget.id);
+      useDatabaseExplorerStore.getState().resetProfile(deleteTarget.id);
       setNotice(`Deleted ${deleteTarget.name}. The remote database was not changed.`);
       setDeleteTarget(null);
     }
@@ -930,7 +1379,7 @@ function DatabaseManagerPage() {
     : null;
 
   return (
-    <div className="space-y-5">
+    <div className="mx-auto w-full max-w-[80rem] space-y-5">
       <PageHeader
         title="Databases"
         description="Manage MySQL and PostgreSQL connection profiles on your servers. Every session uses a loopback SSH tunnel and keeps passwords in the OS credential store."
@@ -1032,6 +1481,16 @@ function DatabaseManagerPage() {
           onAddConnection={openCreateDialog}
         />
 
+        <DatabaseWorkspaceTabBar
+          tabs={workspaceOrder
+            .map((profileId) => workspaceTabs[profileId])
+            .filter((tab): tab is DatabaseWorkspaceTab => tab !== undefined)}
+          activeTabId={activeTabId}
+          snapshots={snapshots}
+          onActivate={handleActivateWorkspaceTab}
+          onClose={(profileId) => void handleCloseWorkspace(profileId)}
+        />
+
         <div className="grid min-h-[30rem] lg:grid-cols-[17rem_minmax(0,1fr)]">
           <DatabaseExplorerRail
             activeServer={activeServer}
@@ -1041,8 +1500,8 @@ function DatabaseManagerPage() {
             snapshots={profilesRecord}
             selectedProfileId={selectedProfileId}
             selection={activeExplorerSelection}
-            onSelectProfile={setRequestedProfileId}
-            onSelectionChange={setExplorerSelection}
+            onSelectProfile={handleSelectExplorerProfile}
+            onSelectionChange={handleWorkspaceSelectionChange}
             onConnectProfile={(profile) => void handleConnect(profile)}
             onAddConnection={openCreateDialog}
             onRetry={() => {
@@ -1061,72 +1520,141 @@ function DatabaseManagerPage() {
           />
 
           <div className="min-w-0">
-            <Tabs defaultValue="overview" className="min-h-full gap-0">
-              <div className="overflow-x-auto border-b border-border px-3 py-2">
-                <TabsList aria-label="Database workspace views">
+            {activeTab ? (
+              <>
+                <DatabaseWorkspaceTabHeader
+                  tab={activeTab}
+                  snapshot={selectedSnapshot}
+                  server={servers.find((server) => server.id === activeTab.serverId) ?? null}
+                />
+                <Tabs
+                  value={activeTab.activeView}
+                  onValueChange={(value) =>
+                    setWorkspaceView(activeTab.profileId, value as DatabaseWorkspaceView)
+                  }
+                  className="min-h-full gap-0"
+                >
+                  <div className="overflow-x-auto border-b border-border px-3 py-2">
+                    <TabsList
+                      aria-label={`Database workspace views for ${activeTab.name} (${DATABASE_ENGINE_LABELS[activeTab.engine]})`}
+                    >
+                      {databaseTabs.map((tab) => {
+                        const TabIcon = tab.icon;
+                        return (
+                          <TabsTrigger
+                            key={tab.value}
+                            value={tab.value}
+                            className="gap-1.5"
+                            title={`${tab.label} · ${activeTab.name} · ${DATABASE_ENGINE_LABELS[activeTab.engine]}`}
+                          >
+                            <TabIcon className="size-3.5" aria-hidden="true" />
+                            {tab.label}
+                          </TabsTrigger>
+                        );
+                      })}
+                    </TabsList>
+                  </div>
+
                   {databaseTabs.map((tab) => {
                     const TabIcon = tab.icon;
                     return (
-                      <TabsTrigger key={tab.value} value={tab.value} className="gap-1.5">
-                        <TabIcon className="size-3.5" aria-hidden="true" />
-                        {tab.label}
-                      </TabsTrigger>
+                      <TabsContent key={tab.value} value={tab.value} className="p-4">
+                        {workspaceState !== "ready" ? (
+                          <WorkspaceStatePanel
+                            state={workspaceState}
+                            error={serverError}
+                            onRetry={() => void fetchServers()}
+                          />
+                        ) : tab.value === "overview" ? (
+                          <DatabaseConnectionList
+                            profiles={profiles}
+                            servers={servers}
+                            snapshots={profilesRecord}
+                            testResults={testResultsRecord}
+                            busy={busyRecord}
+                            selectedProfileId={selectedProfileId}
+                            sshConnected={sshConnected}
+                            onOpen={handleOpenWorkspace}
+                            onConnect={(profile) => void handleConnect(profile)}
+                            onReconnect={(profile) => void handleReconnect(profile)}
+                            onDisconnect={(profile) => void handleDisconnect(profile)}
+                            onTest={(profile) => void handleTest(profile)}
+                            onEdit={openEditDialog}
+                            onDelete={setDeleteTarget}
+                            onAdd={openCreateDialog}
+                          />
+                        ) : tab.value === "sql" ? (
+                          <DatabaseSqlWorkspace tab={activeTab} snapshot={selectedSnapshot} />
+                        ) : tab.value === "operations" ? (
+                          <DatabaseOperationsWorkspace tab={activeTab} />
+                        ) : (
+                          <EmptyState
+                            icon={<TabIcon className="size-4" aria-hidden="true" />}
+                            title={tab.emptyTitle}
+                            description={
+                              activeExplorerSelection?.objectName
+                                ? `${activeTab.name} · ${activeExplorerSelection.database ?? activeTab.databaseName ?? "database"}${
+                                    activeExplorerSelection.schema
+                                      ? ` / ${activeExplorerSelection.schema}`
+                                      : ""
+                                  } / ${activeExplorerSelection.objectName}. ${tab.emptyDescription}`
+                                : `${activeTab.name} is selected. ${tab.emptyDescription}`
+                            }
+                            action={
+                              profiles.length === 0 ? (
+                                <Button size="sm" onClick={openCreateDialog}>
+                                  <PlusIcon className="size-3.5" aria-hidden="true" />
+                                  Add connection
+                                </Button>
+                              ) : undefined
+                            }
+                          />
+                        )}
+                      </TabsContent>
                     );
                   })}
-                </TabsList>
+                </Tabs>
+              </>
+            ) : (
+              <div>
+                <div className="border-b border-border px-4 py-3">
+                  <h2 className="text-[13px] font-semibold tracking-[-0.01em] text-foreground">
+                    No open database tabs
+                  </h2>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">
+                    Open a saved connection to keep its explorer, SQL draft, and results in their
+                    own workspace tab.
+                  </p>
+                </div>
+                <div className="p-4">
+                  {workspaceState !== "ready" ? (
+                    <WorkspaceStatePanel
+                      state={workspaceState}
+                      error={serverError}
+                      onRetry={() => void fetchServers()}
+                    />
+                  ) : (
+                    <DatabaseConnectionList
+                      profiles={profiles}
+                      servers={servers}
+                      snapshots={profilesRecord}
+                      testResults={testResultsRecord}
+                      busy={busyRecord}
+                      selectedProfileId={null}
+                      sshConnected={sshConnected}
+                      onOpen={handleOpenWorkspace}
+                      onConnect={(profile) => void handleConnect(profile)}
+                      onReconnect={(profile) => void handleReconnect(profile)}
+                      onDisconnect={(profile) => void handleDisconnect(profile)}
+                      onTest={(profile) => void handleTest(profile)}
+                      onEdit={openEditDialog}
+                      onDelete={setDeleteTarget}
+                      onAdd={openCreateDialog}
+                    />
+                  )}
+                </div>
               </div>
-
-              {databaseTabs.map((tab) => {
-                const TabIcon = tab.icon;
-                return (
-                  <TabsContent key={tab.value} value={tab.value} className="p-4">
-                    {workspaceState !== "ready" ? (
-                      <WorkspaceStatePanel
-                        state={workspaceState}
-                        error={serverError}
-                        onRetry={() => void fetchServers()}
-                      />
-                    ) : tab.value === "overview" ? (
-                      <DatabaseConnectionList
-                        profiles={profiles}
-                        servers={servers}
-                        snapshots={profilesRecord}
-                        testResults={testResultsRecord}
-                        busy={busyRecord}
-                        selectedProfileId={selectedProfileId}
-                        sshConnected={sshConnected}
-                        onSelect={setRequestedProfileId}
-                        onConnect={(profile) => void handleConnect(profile)}
-                        onReconnect={(profile) => void handleReconnect(profile)}
-                        onDisconnect={(profile) => void handleDisconnect(profile)}
-                        onTest={(profile) => void handleTest(profile)}
-                        onEdit={openEditDialog}
-                        onDelete={setDeleteTarget}
-                        onAdd={openCreateDialog}
-                      />
-                    ) : (
-                      <EmptyState
-                        icon={<TabIcon className="size-4" aria-hidden="true" />}
-                        title={tab.emptyTitle}
-                        description={
-                          selectedProfile
-                            ? `${selectedProfile.name} is selected. ${tab.emptyDescription}`
-                            : `${tab.emptyDescription} Add a connection profile to begin.`
-                        }
-                        action={
-                          profiles.length === 0 ? (
-                            <Button size="sm" onClick={openCreateDialog}>
-                              <PlusIcon className="size-3.5" aria-hidden="true" />
-                              Add connection
-                            </Button>
-                          ) : undefined
-                        }
-                      />
-                    )}
-                  </TabsContent>
-                );
-              })}
-            </Tabs>
+            )}
           </div>
         </div>
 
@@ -1159,7 +1687,9 @@ function DatabaseManagerPage() {
             }
           }}
           onSaved={(saved) => {
-            setRequestedProfileId(saved.id);
+            if (saved.serverId === activeServerId) {
+              openWorkspaceTab(saved);
+            }
             const savedServer = servers.find((server) => server.id === saved.serverId);
             setNotice(
               savedServer && savedServer.id !== activeServerId
