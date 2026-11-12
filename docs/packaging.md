@@ -11,6 +11,8 @@ ServerDesk ships as native desktop installers built from this repository. The Ta
 | Debian/Ubuntu          | `.deb`, `.AppImage`                | Native package or portable AppImage | Built on Ubuntu 22.04 for glibc 2.35 compatibility.                                |
 | Fedora/RHEL-compatible | `.rpm`, `.AppImage`                | Native package or portable AppImage | RPM requires RPM-based packaging tools on the build host.                          |
 
+Release builds also produce Tauri updater artifacts: a signed AppImage archive on Linux, the signed NSIS installer on Windows, and a signed universal app archive on macOS. The release includes a generated `latest.json` manifest and `.sig` files. See [updates.md](updates.md) for signing, the release manifest, platform support, and rollback limits.
+
 An MSI is intentionally not produced. The NSIS installer is the supported Windows format because it supports the uninstall hook used to remove credentials. Adding an MSI later requires an equivalent WiX custom action before it should be treated as a supported installer.
 
 ## Identity and version metadata
@@ -86,10 +88,13 @@ Prerequisites are Node.js 20 or newer, stable Rust, and the Tauri dependencies f
 ```bash
 npm ci
 npm run check:versions
+export TAURI_SIGNING_PRIVATE_KEY=/home/dev/.config/serverdesk-updater/serverdesk-updater.key
 npm run tauri build -- --bundles deb,rpm,appimage   # Linux
 npm run tauri build -- --bundles nsis               # Windows
 npm run tauri build -- --target universal-apple-darwin --bundles app,dmg  # macOS
 ```
+
+`bundle.createUpdaterArtifacts` is enabled, so bundle builds require the updater private key and fail rather than producing unsigned updater artifacts. The key path is local-only and must not be committed. On Windows, set `TAURI_SIGNING_PRIVATE_KEY` in the shell environment to the key contents or a readable path as supported by the Tauri CLI. See [updates.md](updates.md#signing-key-storage) for key storage and rotation.
 
 Platform-specific bundle settings live in:
 
@@ -183,12 +188,12 @@ Windows Authenticode signing is not configured. Unsigned NSIS installers trigger
 3. Merge the change through `dev`, `production`, and `main`.
 4. Create and push a tag such as `v0.1.0` from `main`.
 5. The workflow builds:
-   - Ubuntu 22.04: DEB, RPM, and AppImage, then smoke-tests the release binary in Xvfb against a clean data directory.
-   - macOS 15 Intel: universal `.app` and DMG, signed and notarized when the Apple secrets exist.
-   - Windows: NSIS installer.
-6. The publish job downloads all artifacts and creates a draft GitHub release. Review the artifacts, confirm signing status, and publish the draft manually.
+   - Ubuntu 22.04: DEB, RPM, and AppImage, plus the signed AppImage updater artifact and `.sig` files, then smoke-tests the release binary in Xvfb against a clean data directory.
+   - macOS 15 Intel: universal `.app`, DMG, updater app archive, and `.sig` files, signed and notarized when the Apple secrets exist.
+   - Windows: NSIS installer and its updater signature.
+6. The publish job downloads all artifacts, copies the signed updater artifacts into one directory, generates `latest.json` with `scripts/latest-json.mjs`, writes `SHA256SUMS`, and creates a draft GitHub release. Review the artifacts, confirm signing status, and publish the draft manually as the latest non-prerelease release.
 
-The workflow uses `GITHUB_TOKEN` only to create the draft release. It does not publish automatically and it does not store build artifacts in the repository.
+The workflow uses `GITHUB_TOKEN` only to create the draft release. It does not publish automatically and it does not store build artifacts in the repository. The updater signing key is supplied as the `TAURI_SIGNING_PRIVATE_KEY` repository secret; it has no password in the production configuration. `latest.json`, its required platform keys, and the AppImage-only Linux limitation are documented in [updates.md](updates.md).
 
 ## Verification
 
@@ -219,6 +224,15 @@ rpm -qip target/release/bundle/rpm/*.rpm
 ```
 
 Check that the package installs `/usr/bin/serverdesk`, a desktop entry, and the icon, and that the version matches `0.1.0`.
+
+### Updater artifact checks
+
+```bash
+ls -l src-tauri/target/release/bundle/appimage/*.AppImage*
+cat src-tauri/target/release/bundle/appimage/*.sig
+```
+
+The Linux bundle directory must contain the AppImage, the updater signature, and either a signed AppImage or a signed compressed AppImage archive when the bundler emits one. The manifest generator accepts both forms; its tests use the fixtures under `scripts/fixtures/latest-json/`, and the release workflow runs it against the downloaded flat release directory. A production manifest is never generated from a single-platform local bundle.
 
 ### Credential cleanup check
 
@@ -259,6 +273,8 @@ Known limitations:
 - macOS DMG has no uninstall hook; the documented purge step is required before deleting the app.
 - MSI is not shipped. Only NSIS installers include automatic Windows credential cleanup.
 - The macOS `.app` is not signed for App Store distribution and has no sandbox entitlements.
-- No auto-updater is configured. Releases are manual downloads.
-- AppImages built on Ubuntu 22.04 require glibc 2.35 or newer and FUSE 2 (or the extract-and-run flag).
-- Windows builds are unsigned and may show SmartScreen warnings.
+- In-app updates are supported for AppImage, NSIS, and the macOS app bundle. DEB and RPM installs are detected but require the system package manager. The `v0.1.0` release predates the updater and cannot install `v0.1.1` in place.
+- There is no automatic rollback. Keep previous installers and a database backup if a downgrade is required.
+- macOS updates require a signed, notarized app for reliable Gatekeeper behavior; unsigned builds are test-only.
+- AppImages built on Ubuntu 22.04 require glibc 2.35 or newer and FUSE 2 (or the extract-and-run flag). Extract-and-run installs are not self-updatable.
+- Windows builds are unsigned and may show SmartScreen warnings. The updater minisign signature does not replace Authenticode.

@@ -157,6 +157,17 @@ Uninstall from **Settings > Apps > Installed apps > ServerDesk**. The uninstalle
 runs `serverdesk.exe --purge-data` before removing program files. If cleanup
 fails, it keeps the local data directory so the purge can be retried.
 
+## Updates
+
+Installed builds check for signed updates on startup and when you select **Check for updates** in **Settings**. Successful checks are throttled to once every six hours; the update badge in the topbar opens the update panel when a newer version is available.
+
+- **AppImage:** ServerDesk can download, verify, and install an AppImage update in place, then relaunch.
+- **DEB and RPM:** ServerDesk detects available versions but does not replace package-manager installs. Use `apt` or `dnf` with the new package from [GitHub Releases](https://github.com/srosthai/ServerDesk/releases).
+- **Windows:** The NSIS installer supports in-app updates. The app may close while the installer runs.
+- **macOS:** The app bundle supports in-app updates when the release is signed and notarized.
+
+Browser previews and development builds never check for updates. The signing key, `latest.json`, platform limitations, and rollback process are documented in [updates.md](updates.md).
+
 ## Add and connect to a server
 
 1. Start ServerDesk. There is no sign-in.
@@ -205,10 +216,7 @@ Windows. The database files are restricted to the owning user (`0600`) on Unix.
 [packaging.md](packaging.md) lists the exact credential entry names and data
 files.
 
-There is no auto-updater and no telemetry. Install a newer release over the
-existing application to upgrade. See [security.md](security.md) for the privacy
-model and [troubleshooting.md](troubleshooting.md) if credentials cannot be
-saved or read.
+Installed desktop builds can check GitHub Releases for signed updates. The check contacts only the release endpoint, never sends server inventory or credentials, and can be skipped while offline. There is no telemetry. See [updates.md](updates.md) for the update model and [security.md](security.md) for the privacy model. Install a newer release manually if an update check fails.
 
 ## Uninstall and cleanup
 

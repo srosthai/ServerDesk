@@ -1,0 +1,4 @@
+What changed in ServerDesk 0.1.1
+
+- Added signed in-app updates.
+- Fixed a terminal layout issue.

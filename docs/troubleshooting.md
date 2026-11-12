@@ -259,6 +259,52 @@ happen after a manual keychain cleanup or restoring the app-data directory on a
 new machine. Edit the server profile and enter the password or private key
 again, then test the connection.
 
+## Update problems
+
+### The update check says the device is offline
+
+ServerDesk skips startup checks while the operating system reports no network
+connection. Manual checks show an offline error instead of silently doing
+nothing. Reconnect and select **Check for updates** again.
+
+### The update server cannot be reached
+
+A proxy, firewall, DNS failure, or missing release manifest can block the check.
+Confirm that
+`https://github.com/srosthai/ServerDesk/releases/latest/download/latest.json`
+opens in a browser. If GitHub is reachable but ServerDesk is not, check the
+system proxy settings. Install the release manually if the update check keeps
+failing; the current installation is not changed by a failed check.
+
+### The update signature was rejected
+
+ServerDesk refuses an update whose minisign signature is missing, corrupt, or
+signed by a different key. Do not bypass this prompt. Download the installer
+from the official GitHub Releases page and verify `SHA256SUMS`. If a release
+continues to fail signature verification, report it rather than installing it.
+
+### The update is not permitted
+
+The desktop capability may be missing from the build, or the OS may block the
+replacement. Confirm that the installed package came from this repository and
+that the app is running as your normal desktop user. On Linux, DEB and RPM
+installs intentionally do not self-update; use the package manager.
+
+### The update installed but ServerDesk did not reopen
+
+Quit ServerDesk completely and open it again. If the version still does not
+change, reinstall from the latest release. On AppImage, check that the
+AppImage file and its directory are writable by your user. On macOS, confirm
+that the app is Developer ID signed and notarized; Gatekeeper can block an
+unsigned replacement.
+
+### A DEB or RPM update is available but there is no install button
+
+This is intentional. Package-manager installs cannot be replaced safely behind
+the package manager's back. Select **Open download page**, then install the
+`.deb` or `.rpm` with `apt` or `dnf`. The full platform matrix is in
+[updates.md](updates.md#platform-support).
+
 ## Packaging and startup problems
 
 ### The Linux app fails to start because WebKitGTK is missing
