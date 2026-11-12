@@ -332,6 +332,29 @@ branch set and keeps matching ancestors visible; it does not silently issue
 unbounded discovery requests. Roving tabindex plus Arrow/Home/End/Enter
 handling implement the ARIA tree keyboard model.
 
+## Workspace tabs
+
+`src/stores/databaseWorkspaceStore.ts` owns one tab per open database profile.
+Each tab stores its active workspace view, selected database/schema/object,
+SQL draft, last result document, and background-task records. Tabs are keyed by
+profile id and kept in an explicit order; switching or closing a tab never
+copies fields into another connection.
+
+The Database Manager renders the open connections as a tab strip above the
+workspace. Every connection tab shows the profile name and engine, and the
+workspace header for the Overview, Structure, Data, SQL, Indexes, and
+Operations views repeats the connection name, engine, endpoint, connection
+state, and selected database/schema. A tab opens from the connection list, the
+explorer, or Connect; connecting another profile leaves existing tabs open.
+
+Closing a tab removes only that profile's tab state and explorer cache, then
+disconnects the profile. The disconnect command closes the adapter and its
+loopback tunnel even when no live adapter remains. Disconnecting without
+closing keeps the tab's context so a later connect or reconnect can restore the
+selected database, SQL draft, and last results. The explorer remains scoped by
+profile id, so neither disconnect nor close can mutate another connection's
+tree.
+
 ## Capability model
 
 `DatabaseCapabilities` combines:
@@ -598,7 +621,11 @@ port. The live path has been exercised against a PostgreSQL 18 container.
   table with an unusually large number of index columns is not independently
   paged inside one call.
 - Real query execution, transactions, cancellation, streaming, and row editing
-  are follow-up work.
+  are follow-up work. The SQL tab owns a per-connection draft and result panel,
+  but its Run action stays disabled until the query commands land.
+- Workspace tabs live in frontend memory for the current application run. The
+  selected database, SQL draft, and result document are restored across
+  reconnect, not across an application restart.
 - Capability checks are only as accurate as the server version string. An
   unknown version disables version-dependent actions rather than guessing.
 - The standalone capability command accepts an engine and raw version for

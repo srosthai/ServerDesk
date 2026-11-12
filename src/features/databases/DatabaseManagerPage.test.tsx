@@ -18,6 +18,7 @@ import {
 import { useConnectionStore } from "@/stores/connectionStore";
 import { databaseExplorerNodeKey, useDatabaseExplorerStore } from "@/stores/databaseExplorerStore";
 import { useDatabaseProfileStore } from "@/stores/databaseProfileStore";
+import { useDatabaseWorkspaceStore } from "@/stores/databaseWorkspaceStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useServerStore } from "@/stores/serverStore";
 import type {
@@ -111,6 +112,24 @@ const profile: DatabaseProfile = {
   lastUsedAt: 1_700_000_000,
 };
 
+const analyticsProfile: DatabaseProfile = {
+  id: "profile-2",
+  serverId: server.id,
+  name: "Analytics",
+  engine: "mysql",
+  host: "127.0.0.1",
+  port: 3306,
+  socket: null,
+  databaseName: "metrics",
+  username: "reporting",
+  hasCredential: true,
+  readOnly: false,
+  sslMode: null,
+  createdAt: 2,
+  updatedAt: 2,
+  lastUsedAt: null,
+};
+
 const capabilities: DatabaseCapabilities = {
   engine: "postgresql",
   version: "16.2.0",
@@ -169,6 +188,55 @@ const disconnectedSnapshot: DatabaseConnectionSnapshot = {
   readOnly: true,
   databaseName: "app",
   changedAt: 12,
+};
+
+const analyticsCapabilities: DatabaseCapabilities = {
+  ...capabilities,
+  engine: "mysql",
+  flags: {
+    ...capabilities.flags,
+    schemas: false,
+    sequences: false,
+    databaseRename: false,
+  },
+};
+
+const analyticsConnectedSnapshot: DatabaseConnectionSnapshot = {
+  profileId: analyticsProfile.id,
+  serverId: server.id,
+  name: analyticsProfile.name,
+  engine: analyticsProfile.engine,
+  state: "connected",
+  readOnly: false,
+  databaseName: "metrics",
+  version: { version: "8.4.2", raw: "MySQL 8.4.2" },
+  capabilities: analyticsCapabilities,
+  tunnel: {
+    profileId: analyticsProfile.id,
+    serverId: server.id,
+    state: "active",
+    localHost: "127.0.0.1",
+    localPort: 52342,
+    remoteHost: "127.0.0.1",
+    remotePort: 3306,
+    openedAt: 1,
+  },
+  changedAt: 11,
+};
+
+const analyticsDisconnectedSnapshot: DatabaseConnectionSnapshot = {
+  ...analyticsConnectedSnapshot,
+  state: "disconnected",
+  tunnel: undefined,
+  changedAt: 13,
+};
+
+const interruptedSnapshot: DatabaseConnectionSnapshot = {
+  ...connectedSnapshot,
+  state: "error",
+  tunnel: undefined,
+  error: { code: "connection", message: "The tunnel was interrupted." },
+  changedAt: 14,
 };
 
 function databaseSummary(name: string): DatabaseSummary {
@@ -277,6 +345,50 @@ function useLoadedDatabases() {
   });
 }
 
+function useTwoProfiles() {
+  useProfileStore({
+    profiles: { [server.id]: [profile, analyticsProfile] },
+    snapshots: {
+      [profile.id]: connectedSnapshot,
+      [analyticsProfile.id]: analyticsConnectedSnapshot,
+    },
+    connectionStates: {
+      [profile.id]: "connected",
+      [analyticsProfile.id]: "connected",
+    },
+    testResults: {},
+  });
+}
+
+function useTwoDatabaseNodes() {
+  const analyticsDatabasesPayload: DatabaseExplorerNodePayload = {
+    nodeKind: "databases",
+    payload: {
+      items: [databaseSummary("metrics")],
+      limit: 100,
+      offset: 0,
+      hasMore: false,
+      total: 1,
+    },
+  };
+  useDatabaseExplorerStore.setState({
+    nodes: {
+      [databaseExplorerNodeKey(profile.id, { kind: "databases" })]: {
+        status: "ready",
+        payload: databasesPayload,
+        updatedAt: 1,
+      },
+      [databaseExplorerNodeKey(analyticsProfile.id, { kind: "databases" })]: {
+        status: "ready",
+        payload: analyticsDatabasesPayload,
+        updatedAt: 1,
+      },
+    },
+    error: null,
+    commandError: null,
+  });
+}
+
 describe("DatabaseManagerPage", () => {
   beforeEach(() => {
     enableTauriRuntime();
@@ -299,6 +411,7 @@ describe("DatabaseManagerPage", () => {
       commandError: null,
     });
     useDatabaseExplorerStore.setState({ nodes: {}, error: null, commandError: null });
+    useDatabaseWorkspaceStore.setState({ tabs: {}, order: [], activeTabId: null });
     usePreferencesStore.setState({
       preferences: { ...DEFAULT_PREFERENCES },
       status: "unavailable",
@@ -311,7 +424,11 @@ describe("DatabaseManagerPage", () => {
       ...connectedSnapshot,
       changedAt: 20,
     });
-    vi.mocked(disconnectDatabaseProfile).mockResolvedValue(disconnectedSnapshot);
+    vi.mocked(disconnectDatabaseProfile).mockImplementation((id) =>
+      Promise.resolve(
+        id === analyticsProfile.id ? analyticsDisconnectedSnapshot : disconnectedSnapshot,
+      ),
+    );
     vi.mocked(testDatabaseProfile).mockResolvedValue(testResult);
     vi.mocked(deleteDatabaseProfile).mockResolvedValue(undefined);
     vi.mocked(previewDatabaseAction).mockReset();
@@ -707,6 +824,256 @@ describe("DatabaseManagerPage", () => {
         "MySQL does not support renaming a database safely. Create a new database and migrate its data instead.",
       ),
     ).toBeInTheDocument();
+  });
+
+  it("opens multiple database connections concurrently and shows identity and engine in each tab", async () => {
+    const user = userEvent.setup();
+    useConnectedServer();
+    useTwoProfiles();
+    renderPage();
+
+    const primaryTab = screen.getByRole("tab", {
+      name: "Primary (PostgreSQL) workspace tab",
+    });
+    expect(primaryTab).toHaveAttribute("aria-selected", "true");
+    expect(
+      within(screen.getByLabelText("Workspace tab header")).getByText("Primary"),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByLabelText("Workspace tab header")).getByText("PostgreSQL"),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Workspace tab header")).toHaveTextContent(
+      /Production · 127\.0\.0\.1:5432/,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Open Analytics workspace" }));
+
+    expect(screen.getByRole("tab", { name: "Analytics (MySQL) workspace tab" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(primaryTab).toBeInTheDocument();
+    expect(useDatabaseWorkspaceStore.getState().order).toEqual([profile.id, analyticsProfile.id]);
+    const header = screen.getByLabelText("Workspace tab header");
+    expect(header).toHaveTextContent("Analytics");
+    expect(header).toHaveTextContent("MySQL");
+    expect(header).toHaveTextContent("127.0.0.1:3306");
+
+    const sqlView = screen.getByRole("tab", { name: "SQL" });
+    expect(sqlView).toHaveAttribute("title", "SQL · Analytics · MySQL");
+
+    await user.click(primaryTab);
+    expect(screen.getByRole("tab", { name: "SQL" })).toHaveAttribute(
+      "title",
+      "SQL · Primary · PostgreSQL",
+    );
+  });
+
+  it("keeps SQL drafts and active workspace views scoped to each connection", async () => {
+    const user = userEvent.setup();
+    useConnectedServer();
+    useTwoProfiles();
+    renderPage();
+
+    await user.click(screen.getByRole("button", { name: "Open Analytics workspace" }));
+    await user.click(screen.getByRole("tab", { name: "SQL" }));
+
+    const analyticsEditor = screen.getByLabelText("SQL editor for Analytics");
+    await user.type(analyticsEditor, "select * from metrics");
+
+    await user.click(screen.getByRole("tab", { name: "Primary (PostgreSQL) workspace tab" }));
+    // The primary tab was still on Overview, so its own view state is restored.
+    expect(screen.queryByLabelText("SQL editor for Primary")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("tab", { name: "SQL" }));
+
+    const primaryEditor = screen.getByLabelText("SQL editor for Primary");
+    expect(primaryEditor).toHaveValue("");
+    await user.type(primaryEditor, "select * from users");
+
+    await user.click(screen.getByRole("tab", { name: "Analytics (MySQL) workspace tab" }));
+    expect(screen.getByLabelText("SQL editor for Analytics")).toHaveValue("select * from metrics");
+
+    useDatabaseWorkspaceStore.getState().setSqlResult(profile.id, {
+      statement: "select * from users",
+      columns: ["id"],
+      rows: [["1"]],
+      affectedRows: null,
+      durationMs: 4,
+      error: null,
+      executedAt: 10,
+    });
+    useDatabaseWorkspaceStore.getState().setSqlResult(analyticsProfile.id, {
+      statement: "select * from metrics",
+      columns: ["visits"],
+      rows: [["42"]],
+      affectedRows: null,
+      durationMs: 6,
+      error: null,
+      executedAt: 11,
+    });
+
+    expect(
+      await screen.findByRole("region", { name: "SQL results for Analytics" }),
+    ).toHaveTextContent("visits");
+    await user.click(screen.getByRole("tab", { name: "Primary (PostgreSQL) workspace tab" }));
+    expect(
+      await screen.findByRole("region", { name: "SQL results for Primary" }),
+    ).toHaveTextContent("id");
+    expect(
+      screen.queryByRole("region", { name: "SQL results for Analytics" }),
+    ).not.toBeInTheDocument();
+
+    const state = useDatabaseWorkspaceStore.getState();
+    expect(state.tabs[profile.id].sqlDraft).toBe("select * from users");
+    expect(state.tabs[profile.id].activeView).toBe("sql");
+    expect(state.tabs[profile.id].sqlResult?.columns).toEqual(["id"]);
+    expect(state.tabs[analyticsProfile.id].sqlDraft).toBe("select * from metrics");
+    expect(state.tabs[analyticsProfile.id].activeView).toBe("sql");
+    expect(state.tabs[analyticsProfile.id].sqlResult?.columns).toEqual(["visits"]);
+  });
+
+  it("keeps selected database context scoped to each connection", async () => {
+    const user = userEvent.setup();
+    useConnectedServer();
+    useTwoProfiles();
+    useTwoDatabaseNodes();
+    renderPage();
+
+    await user.click(screen.getByRole("treeitem", { name: /^Primary/ }));
+    await user.click(await screen.findByRole("treeitem", { name: /^app/ }));
+
+    let header = screen.getByLabelText("Workspace tab header");
+    expect(within(header).getByText("app")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Open Analytics workspace" }));
+    await user.click(screen.getByRole("treeitem", { name: /^Analytics/ }));
+    await user.click(await screen.findByRole("treeitem", { name: /^metrics/ }));
+
+    header = screen.getByLabelText("Workspace tab header");
+    expect(within(header).getByText("Analytics")).toBeInTheDocument();
+    // MySQL uses the database as its schema, so the context shows it twice.
+    expect(within(header).getAllByText("metrics")).toHaveLength(2);
+
+    await user.click(screen.getByRole("tab", { name: "Primary (PostgreSQL) workspace tab" }));
+    header = screen.getByLabelText("Workspace tab header");
+    expect(within(header).getByText("Primary")).toBeInTheDocument();
+    expect(within(header).getByText("app")).toBeInTheDocument();
+    expect(within(header).queryByText("metrics")).not.toBeInTheDocument();
+  });
+
+  it("closes one connection tab, disconnects only it, and clears only its state", async () => {
+    const user = userEvent.setup();
+    useConnectedServer();
+    useTwoProfiles();
+    useTwoDatabaseNodes();
+    renderPage();
+
+    await user.click(screen.getByRole("button", { name: "Open Analytics workspace" }));
+    useDatabaseWorkspaceStore.getState().addTask(profile.id, {
+      id: "primary-task",
+      label: "Export app",
+      status: "running",
+      startedAt: 1,
+    });
+    useDatabaseWorkspaceStore.getState().addTask(analyticsProfile.id, {
+      id: "analytics-task",
+      label: "Export metrics",
+      status: "running",
+      startedAt: 1,
+    });
+
+    await user.click(screen.getByRole("button", { name: "Close Primary workspace tab" }));
+
+    await waitFor(() => {
+      expect(disconnectDatabaseProfile).toHaveBeenCalledWith(profile.id);
+    });
+    expect(disconnectDatabaseProfile).not.toHaveBeenCalledWith(analyticsProfile.id);
+
+    const state = useDatabaseWorkspaceStore.getState();
+    expect(state.tabs[profile.id]).toBeUndefined();
+    expect(state.tabs[analyticsProfile.id]).toMatchObject({ name: "Analytics" });
+    expect(state.tabs[analyticsProfile.id].tasks).toHaveLength(1);
+    expect(state.order).toEqual([analyticsProfile.id]);
+    expect(state.activeTabId).toBe(analyticsProfile.id);
+
+    const nodes = useDatabaseExplorerStore.getState().nodes;
+    expect(nodes[databaseExplorerNodeKey(profile.id, { kind: "databases" })]).toBeUndefined();
+    expect(
+      nodes[databaseExplorerNodeKey(analyticsProfile.id, { kind: "databases" })],
+    ).toBeDefined();
+    expect(await screen.findByText(/Primary workspace closed/)).toBeInTheDocument();
+  });
+
+  it("disconnects only the affected connection and preserves its tab context", async () => {
+    const user = userEvent.setup();
+    useConnectedServer();
+    useTwoProfiles();
+    renderPage();
+
+    await user.click(screen.getByRole("button", { name: "Open Analytics workspace" }));
+    useDatabaseWorkspaceStore.getState().setActiveView(profile.id, "sql");
+    useDatabaseWorkspaceStore.getState().setSqlDraft(profile.id, "select * from users");
+
+    await user.click(screen.getByRole("button", { name: "Disconnect Primary" }));
+
+    await waitFor(() => {
+      expect(disconnectDatabaseProfile).toHaveBeenCalledWith(profile.id);
+    });
+    const profileState = useDatabaseProfileStore.getState();
+    expect(profileState.snapshots[profile.id].state).toBe("disconnected");
+    expect(profileState.snapshots[analyticsProfile.id].state).toBe("connected");
+    expect(useDatabaseWorkspaceStore.getState().tabs[profile.id]).toMatchObject({
+      activeView: "sql",
+      sqlDraft: "select * from users",
+    });
+    expect(useDatabaseWorkspaceStore.getState().tabs[analyticsProfile.id]).toMatchObject({
+      activeView: "overview",
+    });
+    expect(useDatabaseWorkspaceStore.getState().activeTabId).toBe(analyticsProfile.id);
+
+    await user.click(screen.getByRole("tab", { name: "Primary (PostgreSQL) workspace tab" }));
+    expect(screen.getByLabelText("SQL editor for Primary")).toHaveValue("select * from users");
+    expect(screen.getByLabelText("Workspace tab header")).toHaveTextContent("DB disconnected");
+  });
+
+  it("reconnects one connection without disturbing another tab or its context", async () => {
+    const user = userEvent.setup();
+    useConnectedServer();
+    vi.mocked(getDatabaseConnectionState).mockImplementation((id) =>
+      Promise.resolve(id === profile.id ? interruptedSnapshot : analyticsConnectedSnapshot),
+    );
+    useProfileStore({
+      profiles: { [server.id]: [profile, analyticsProfile] },
+      snapshots: {
+        [profile.id]: interruptedSnapshot,
+        [analyticsProfile.id]: analyticsConnectedSnapshot,
+      },
+      connectionStates: { [profile.id]: "error", [analyticsProfile.id]: "connected" },
+      testResults: {},
+    });
+    renderPage();
+
+    await user.click(screen.getByRole("button", { name: "Open Analytics workspace" }));
+    useDatabaseWorkspaceStore.getState().setActiveView(profile.id, "sql");
+    useDatabaseWorkspaceStore.getState().setSqlDraft(profile.id, "select current_user");
+
+    await user.click(screen.getByRole("button", { name: "Reconnect Primary" }));
+
+    await waitFor(() => {
+      expect(reconnectDatabaseProfile).toHaveBeenCalledWith(profile.id);
+    });
+    const state = useDatabaseProfileStore.getState();
+    expect(state.snapshots[profile.id].state).toBe("connected");
+    expect(state.snapshots[analyticsProfile.id].state).toBe("connected");
+    expect(useDatabaseWorkspaceStore.getState().activeTabId).toBe(profile.id);
+    expect(useDatabaseWorkspaceStore.getState().tabs[profile.id]).toMatchObject({
+      activeView: "sql",
+      sqlDraft: "select current_user",
+    });
+    expect(useDatabaseWorkspaceStore.getState().tabs[analyticsProfile.id].activeView).toBe(
+      "overview",
+    );
+    expect(screen.getByLabelText("SQL editor for Primary")).toHaveValue("select current_user");
   });
 
   it("shows a loading placeholder while server profiles load", () => {
