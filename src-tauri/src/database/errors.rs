@@ -8,7 +8,7 @@ use std::fmt;
 
 use serde::Serialize;
 
-use crate::core::{AppError, ErrorCode, redaction::sanitize_text_bounded};
+use crate::core::{AppError, ErrorCode, ErrorScope, redaction::sanitize_text_bounded};
 
 const MAX_MESSAGE_LENGTH: usize = 2_000;
 const MAX_DETAILS_LENGTH: usize = 4_000;
@@ -82,6 +82,10 @@ pub struct DatabaseError {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<String>,
+    /// The database object the failure belongs to. Metadata commands set this
+    /// so a permission error can stay attached to one table or schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ErrorScope>,
 }
 
 impl DatabaseError {
@@ -90,12 +94,35 @@ impl DatabaseError {
             kind,
             message: sanitize_text_bounded(&message.into(), MAX_MESSAGE_LENGTH),
             details: None,
+            scope: None,
         }
     }
 
     pub fn with_details(mut self, details: impl Into<String>) -> Self {
         self.details = Some(sanitize_text_bounded(&details.into(), MAX_DETAILS_LENGTH));
         self
+    }
+
+    pub fn with_scope(mut self, object: impl Into<String>, name: impl Into<String>) -> Self {
+        self.scope = Some(ErrorScope::new(object, name));
+        self
+    }
+
+    /// Adds an object scope without changing the error kind. Adapters use this
+    /// for metadata reads, which can fail for an object the explorer has not
+    /// even rendered yet.
+    pub fn scoped_to(self, object: impl Into<String>, name: impl Into<String>) -> Self {
+        self.with_scope(object, name)
+    }
+
+    /// Adds an object scope only when the failure is a permission error. Query
+    /// and connection errors are not object-specific.
+    pub fn scoped_permission(self, object: impl Into<String>, name: impl Into<String>) -> Self {
+        if self.kind == DatabaseErrorKind::Permission {
+            self.with_scope(object, name)
+        } else {
+            self
+        }
     }
 
     pub fn tunnel(message: impl Into<String>) -> Self {
@@ -167,8 +194,12 @@ impl From<DatabaseError> for AppError {
         };
 
         let app_error = AppError::new(code, error.message);
-        match error.details {
+        let app_error = match error.details {
             Some(details) => app_error.with_details(details),
+            None => app_error,
+        };
+        match error.scope {
+            Some(scope) => app_error.with_scope(scope.object, scope.name),
             None => app_error,
         }
     }

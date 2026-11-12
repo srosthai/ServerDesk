@@ -39,6 +39,7 @@ const table: DatabaseTableSummary = {
   name: "users",
   kind: "table",
   estimatedRows: unavailable,
+  metadataRefreshedAt: unavailable,
   ...metadata,
 };
 

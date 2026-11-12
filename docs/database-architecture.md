@@ -78,6 +78,7 @@ same adapter contract.
 - engine-specific DDL previews for create, rename, drop, and set-active;
 - lifecycle execution and read-only detection;
 - table, view, sequence, column, index, and constraint metadata;
+- bounded dependency inventories for one table before destructive changes;
 - bounded object counts for one explorer node;
 - capability checks through `require_capability`;
 - connection checks through `require_connection`.
@@ -102,15 +103,58 @@ materialized views unavailable.
 
 Database and schema summaries report owner, encoding, collation, size, and
 engine where the engine exposes them. Tables report estimated rows plus owner,
-size, and storage engine/access method. Views report owner, size, and whether
-they are materialized. PostgreSQL sequences report data type, start value, and
+size, storage engine/access method, and the server-reported statistics refresh
+time where available. Views report owner, size, and whether they are
+materialized. PostgreSQL sequences report data type, start value, and
 increment. MySQL does not expose sequences; the command returns a typed
 `capability` error and its object count is unavailable.
+
+Table statistics refresh time comes from `pg_stat_user_tables` on PostgreSQL
+and `mysql.innodb_table_stats.last_update` on MySQL. Most MySQL application
+accounts cannot read the statistics table, so that optional query is separate
+from the table list and its failure becomes `Unavailable`; a table listing never
+fails because the account cannot read statistics metadata.
+
+Columns report name, engine type, character length, numeric/temporal precision,
+scale, nullability, default, primary-key membership, identity kind,
+generated-column status and expression, ordinal position, comment, and
+collation. `MetadataValue<Option<T>>` distinguishes "no value for this type"
+from "the engine could not report it". For example, a numeric column has
+`length: available(null)` and a MySQL 5.7 server reports generated-column
+metadata as `unavailable`.
+
+Indexes report name, ordered columns, uniqueness, primary status, access method,
+and partial-index predicate where the engine supports one. Constraints report
+primary key, unique, foreign key, check, and other constraints with ordered
+columns, referenced schema/table/columns, update/delete actions, check
+expression, and deferrability. MySQL reports deferrability as unavailable.
+PostgreSQL check expressions contain `pg_get_constraintdef` output; MySQL check
+expressions contain `CHECK_CLAUSE` from `information_schema.CHECK_CONSTRAINTS`.
+
+`get_database_table_dependencies` returns bounded groups for incoming foreign keys,
+dependent views/materialized views, owned sequences, and triggers. Each group is
+capped by the same page limit, and each group is independently `available` or
+`unavailable`. MySQL reports incoming foreign keys and triggers; MariaDB 11.4
+does not expose `information_schema.VIEW_TABLE_USAGE`, and MySQL has no owned
+sequences, so those groups are explicitly unavailable instead of being guessed
+from view definition text.
+
+Table, column, index, and constraint catalogs are server-paginated. MySQL
+selects one page of index or constraint names in a derived table before reading
+their column rows, so a table with a very wide index cannot make one metadata
+call unbounded. PostgreSQL applies `LIMIT`/`OFFSET` directly to its index and
+constraint queries.
 
 PostgreSQL size lookups are gated with `has_table_privilege` /
 `has_sequence_privilege`. A restricted account sees the object but receives an
 unavailable size instead of a guessed value or a failed list. Any permission
 error the engine does raise is still mapped to the typed `permission` code.
+
+Metadata reads attach a typed object scope to permission failures. A failure
+while reading one table's columns returns `code: "permission"` with
+`scope: { "object": "table", "name": "users" }`, so the explorer can keep the
+error on that object instead of replacing the whole workspace. The scope and
+message contain no SQL, driver text, connection string, or credential.
 
 `DatabaseConnectRequest` carries the endpoint, username, read-only flag, SSL
 mode, timeout, and a `DatabasePassword` whose debug output is always
@@ -276,16 +320,20 @@ database.
 
 `src-tauri/src/commands/database/discovery.rs` owns metadata browsing:
 
-| Command                          | Purpose                                           |
-| -------------------------------- | ------------------------------------------------- |
-| `list_database_databases`        | Bounded database list                             |
-| `list_database_schemas`          | Bounded schema list                               |
-| `list_database_tables`           | Bounded base-table list for one scope             |
-| `list_database_views`            | Bounded view/materialized-view list for one scope |
-| `list_database_sequences`        | Bounded sequence list; MySQL returns `capability` |
-| `get_database_object_counts`     | One-row table/view/sequence counts for one scope  |
-| `load_database_explorer_node`    | Lazy load one typed explorer node                 |
-| `refresh_database_explorer_node` | Refresh exactly that node and no siblings         |
+| Command                           | Purpose                                           |
+| --------------------------------- | ------------------------------------------------- |
+| `list_database_databases`         | Bounded database list                             |
+| `list_database_schemas`           | Bounded schema list                               |
+| `list_database_tables`            | Bounded base-table list for one scope             |
+| `list_database_views`             | Bounded view/materialized-view list for one scope |
+| `list_database_sequences`         | Bounded sequence list; MySQL returns `capability` |
+| `list_database_columns`           | Bounded column metadata for one table             |
+| `list_database_indexes`           | Bounded index metadata for one table              |
+| `list_database_constraints`       | Bounded constraint metadata for one table         |
+| `get_database_table_dependencies` | Bounded dependency inventory for one table        |
+| `get_database_object_counts`      | One-row table/view/sequence counts for one scope  |
+| `load_database_explorer_node`     | Lazy load one typed explorer node                 |
+| `refresh_database_explorer_node`  | Refresh exactly that node and no siblings         |
 
 Explorer requests are tagged by kind:
 
@@ -557,11 +605,13 @@ SERVERDESK_TEST_MYSQL_PASSWORD=apppass \
 ```
 
 The fixture tests cover connect, ping, version, capability flags, read-only
-write rejection, writable probe-table metadata, typed authentication failure,
-database create/set-active/drop verification, read-only lifecycle permission
-denial, the unsupported rename explanation, and the unavailable-host path. They
-bind no public port; the container mapping is explicit `127.0.0.1`. The live
-path has been exercised against both MariaDB 11.4 and MySQL 8.4 containers.
+write rejection, writable probe-table metadata, column identity/generated
+fields, bounded index and constraint metadata, incoming-foreign-key and trigger
+dependencies, typed authentication failure, database create/set-active/drop
+verification, read-only lifecycle permission denial, the unsupported rename
+explanation, and the unavailable-host path. They bind no public port; the
+container mapping is explicit `127.0.0.1`. The live path has been exercised
+against both MariaDB 11.4 and MySQL 8.4 containers.
 
 ### Live PostgreSQL fixture
 
@@ -595,12 +645,14 @@ SERVERDESK_TEST_POSTGRES_PASSWORD=apppass \
 ```
 
 The fixture tests cover connect, ping, version, capability flags, database and
-schema listing, schema-scoped table metadata, cross-database rejection,
-read-only write rejection, identity/generated column detection, index and
-constraint metadata, create/rename/set-active/drop verification, read-only
-lifecycle permission denial, active-catalog rename rejection, typed
-authentication failure, and the unavailable-host path. They bind no public
-port. The live path has been exercised against a PostgreSQL 18 container.
+schema listing, schema-scoped table metadata, statistics refresh time,
+cross-database rejection, read-only write rejection, identity/generated column
+detection, column length/precision/collation, index and constraint metadata,
+incoming foreign keys, dependent views, owned sequences, triggers,
+create/rename/set-active/drop verification, read-only lifecycle permission
+denial, active-catalog rename rejection, typed authentication failure, and the
+unavailable-host path. They bind no public port. The live path has been
+exercised against a PostgreSQL 18 container.
 
 ## Current limitations
 
@@ -615,11 +667,21 @@ port. The live path has been exercised against a PostgreSQL 18 container.
 - MySQL has no safe database rename operation. The explorer disables rename
   and explains that a new database plus data migration is required.
 - MySQL table row counts are engine estimates (`TABLE_ROWS`); they are not exact.
+- PostgreSQL `reltuples` can remain `-1` until the table is analyzed, so a
+  freshly created table reports estimated rows and statistics refresh time as
+  unavailable rather than zero.
 - PostgreSQL size metadata requires a privilege check and is unavailable to
   accounts that cannot read the relation.
-- MySQL index and constraint rows are grouped after the metadata query, so a
-  table with an unusually large number of index columns is not independently
-  paged inside one call.
+- MySQL statistics refresh time requires access to `mysql.innodb_table_stats`
+  and is usually unavailable to application accounts.
+- MySQL/MariaDB view dependencies are unavailable because
+  `information_schema.VIEW_TABLE_USAGE` is not portable across supported
+  servers. Incoming foreign keys and triggers remain available.
+- PostgreSQL and MySQL report generated/identity metadata as unavailable on
+  versions that predate those column concepts.
+- Index column expressions are reported in the same ordered `columns` list as
+  plain columns; the first version does not separately type expression versus
+  column entries.
 - Real query execution, transactions, cancellation, streaming, and row editing
   are follow-up work. The SQL tab owns a per-connection draft and result panel,
   but its Run action stays disabled until the query commands land.

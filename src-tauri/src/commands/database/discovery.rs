@@ -10,9 +10,10 @@ use tauri::State;
 use crate::{
     core::AppError,
     database::{
-        DatabaseConnectionRegistry, DatabaseDiscoveryService, DatabaseSummary, ExplorerNode,
-        ExplorerNodePayload, MetadataScope, ObjectCounts, Page, PageRequest, SchemaSummary,
-        SequenceSummary, TableSummary, ViewSummary,
+        ColumnSummary, ConstraintSummary, DEFAULT_PAGE_LIMIT, DatabaseConnectionRegistry,
+        DatabaseDiscoveryService, DatabaseSummary, ExplorerNode, ExplorerNodePayload, IndexSummary,
+        MAX_PAGE_LIMIT, MetadataScope, ObjectCounts, Page, PageRequest, SchemaSummary,
+        SequenceSummary, TableDependencies, TableRef, TableSummary, ViewSummary,
     },
 };
 
@@ -22,6 +23,18 @@ fn page(limit: Option<u32>, offset: Option<u64>) -> PageRequest {
 
 fn scope(database: Option<String>, schema: Option<String>) -> Result<MetadataScope, AppError> {
     MetadataScope::new(database.as_deref(), schema.as_deref()).map_err(AppError::from)
+}
+
+fn table_ref(
+    database: Option<String>,
+    schema: Option<String>,
+    table: String,
+) -> Result<TableRef, AppError> {
+    TableRef::new(database.as_deref(), schema.as_deref(), &table).map_err(AppError::from)
+}
+
+fn dependency_limit(limit: Option<u32>) -> u32 {
+    limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT)
 }
 
 /// Lists databases (MySQL schemas are databases too).
@@ -109,6 +122,74 @@ pub async fn get_database_object_counts(
     let scope = scope(database, schema)?;
     DatabaseDiscoveryService::new(connections.inner())
         .object_counts(&profile_id, &scope)
+        .await
+}
+
+/// Lists one bounded page of columns for a table.
+#[tauri::command]
+pub async fn list_database_columns(
+    connections: State<'_, DatabaseConnectionRegistry>,
+    profile_id: String,
+    database: Option<String>,
+    schema: Option<String>,
+    table: String,
+    limit: Option<u32>,
+    offset: Option<u64>,
+) -> Result<Page<ColumnSummary>, AppError> {
+    let table = table_ref(database, schema, table)?;
+    DatabaseDiscoveryService::new(connections.inner())
+        .columns(&profile_id, &table, page(limit, offset))
+        .await
+}
+
+/// Lists one bounded page of indexes for a table.
+#[tauri::command]
+pub async fn list_database_indexes(
+    connections: State<'_, DatabaseConnectionRegistry>,
+    profile_id: String,
+    database: Option<String>,
+    schema: Option<String>,
+    table: String,
+    limit: Option<u32>,
+    offset: Option<u64>,
+) -> Result<Page<IndexSummary>, AppError> {
+    let table = table_ref(database, schema, table)?;
+    DatabaseDiscoveryService::new(connections.inner())
+        .indexes(&profile_id, &table, page(limit, offset))
+        .await
+}
+
+/// Lists one bounded page of primary, unique, foreign-key, and check
+/// constraints for a table.
+#[tauri::command]
+pub async fn list_database_constraints(
+    connections: State<'_, DatabaseConnectionRegistry>,
+    profile_id: String,
+    database: Option<String>,
+    schema: Option<String>,
+    table: String,
+    limit: Option<u32>,
+    offset: Option<u64>,
+) -> Result<Page<ConstraintSummary>, AppError> {
+    let table = table_ref(database, schema, table)?;
+    DatabaseDiscoveryService::new(connections.inner())
+        .constraints(&profile_id, &table, page(limit, offset))
+        .await
+}
+
+/// Returns the bounded dependency inventory used before destructive changes.
+#[tauri::command]
+pub async fn get_database_table_dependencies(
+    connections: State<'_, DatabaseConnectionRegistry>,
+    profile_id: String,
+    database: Option<String>,
+    schema: Option<String>,
+    table: String,
+    limit: Option<u32>,
+) -> Result<TableDependencies, AppError> {
+    let table = table_ref(database, schema, table)?;
+    DatabaseDiscoveryService::new(connections.inner())
+        .table_dependencies(&profile_id, &table, dependency_limit(limit))
         .await
 }
 
