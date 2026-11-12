@@ -21,4 +21,4 @@ pub mod services;
 pub mod ssh;
 pub mod terminal;
 
-pub use error::{AppError, ErrorCode};
+pub use error::{AppError, ErrorCode, ErrorScope};

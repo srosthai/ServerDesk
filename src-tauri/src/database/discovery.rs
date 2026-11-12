@@ -14,7 +14,8 @@ use super::{
     pagination::{Page, PageRequest},
     service::DatabaseConnectionRegistry,
     traits::{
-        DatabaseSummary, MetadataScope, ObjectCounts, SchemaSummary, SequenceSummary, TableSummary,
+        ColumnSummary, ConstraintSummary, DatabaseSummary, IndexSummary, MetadataScope,
+        ObjectCounts, SchemaSummary, SequenceSummary, TableDependencies, TableRef, TableSummary,
         ViewSummary,
     },
 };
@@ -203,6 +204,62 @@ impl<'a> DatabaseDiscoveryService<'a> {
         adapter.object_counts(scope).await.map_err(AppError::from)
     }
 
+    pub async fn columns(
+        &self,
+        profile_id: &str,
+        table: &TableRef,
+        page: PageRequest,
+    ) -> Result<Page<ColumnSummary>, AppError> {
+        let adapter = self.connections.adapter(profile_id).await?;
+        let adapter = adapter.lock().await;
+        adapter
+            .list_columns(table, page)
+            .await
+            .map_err(AppError::from)
+    }
+
+    pub async fn indexes(
+        &self,
+        profile_id: &str,
+        table: &TableRef,
+        page: PageRequest,
+    ) -> Result<Page<IndexSummary>, AppError> {
+        let adapter = self.connections.adapter(profile_id).await?;
+        let adapter = adapter.lock().await;
+        adapter
+            .list_indexes(table, page)
+            .await
+            .map_err(AppError::from)
+    }
+
+    pub async fn constraints(
+        &self,
+        profile_id: &str,
+        table: &TableRef,
+        page: PageRequest,
+    ) -> Result<Page<ConstraintSummary>, AppError> {
+        let adapter = self.connections.adapter(profile_id).await?;
+        let adapter = adapter.lock().await;
+        adapter
+            .list_constraints(table, page)
+            .await
+            .map_err(AppError::from)
+    }
+
+    pub async fn table_dependencies(
+        &self,
+        profile_id: &str,
+        table: &TableRef,
+        limit: u32,
+    ) -> Result<TableDependencies, AppError> {
+        let adapter = self.connections.adapter(profile_id).await?;
+        let adapter = adapter.lock().await;
+        adapter
+            .table_dependencies(table, limit)
+            .await
+            .map_err(AppError::from)
+    }
+
     /// Loads exactly one explorer node. This is also the single-node refresh
     /// path: no other node is read or cached by the backend.
     pub async fn load_node(
@@ -363,6 +420,7 @@ mod tests {
             name: "users".to_string(),
             kind: TableKind::Table,
             estimated_rows: MetadataValue::available(12),
+            metadata_refreshed_at: MetadataValue::Unavailable,
             metadata: ObjectMetadata {
                 owner: MetadataValue::available("app".to_string()),
                 engine: MetadataValue::Unavailable,

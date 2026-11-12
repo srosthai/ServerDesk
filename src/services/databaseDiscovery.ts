@@ -1,14 +1,18 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  DatabaseColumnSummary,
+  DatabaseConstraintSummary,
   DatabaseDiscoveryPage,
   DatabaseDiscoveryScope,
   DatabaseExplorerNode,
   DatabaseExplorerNodePayload,
+  DatabaseIndexSummary,
   DatabaseObjectCounts,
   DatabasePage,
   DatabaseSchemaSummary,
   DatabaseSequenceSummary,
   DatabaseSummary,
+  DatabaseTableDependencies,
   DatabaseTableSummary,
   DatabaseViewSummary,
 } from "@/types/contracts";
@@ -19,6 +23,10 @@ export const databaseDiscoveryCommands = {
   tables: "list_database_tables",
   views: "list_database_views",
   sequences: "list_database_sequences",
+  columns: "list_database_columns",
+  indexes: "list_database_indexes",
+  constraints: "list_database_constraints",
+  tableDependencies: "get_database_table_dependencies",
   objectCounts: "get_database_object_counts",
   loadNode: "load_database_explorer_node",
   refreshNode: "refresh_database_explorer_node",
@@ -37,6 +45,10 @@ function scopeArgs(scope: DatabaseDiscoveryScope = {}) {
     schema: scope.schema ?? null,
   };
 }
+
+export type DatabaseTableRef = DatabaseDiscoveryScope & {
+  table: string;
+};
 
 export function listDatabases(
   profileId: string,
@@ -91,6 +103,62 @@ export function listSequences(
     profileId,
     ...scopeArgs(scope),
     ...pageArgs(page),
+  });
+}
+
+/** Loads one bounded page of columns for a table. */
+export function listColumns(
+  profileId: string,
+  table: DatabaseTableRef,
+  page: DatabaseDiscoveryPage = {},
+): Promise<DatabasePage<DatabaseColumnSummary>> {
+  return invoke<DatabasePage<DatabaseColumnSummary>>(databaseDiscoveryCommands.columns, {
+    profileId,
+    ...scopeArgs(table),
+    table: table.table,
+    ...pageArgs(page),
+  });
+}
+
+/** Loads one bounded page of indexes for a table. */
+export function listIndexes(
+  profileId: string,
+  table: DatabaseTableRef,
+  page: DatabaseDiscoveryPage = {},
+): Promise<DatabasePage<DatabaseIndexSummary>> {
+  return invoke<DatabasePage<DatabaseIndexSummary>>(databaseDiscoveryCommands.indexes, {
+    profileId,
+    ...scopeArgs(table),
+    table: table.table,
+    ...pageArgs(page),
+  });
+}
+
+/** Loads one bounded page of constraints for a table. */
+export function listConstraints(
+  profileId: string,
+  table: DatabaseTableRef,
+  page: DatabaseDiscoveryPage = {},
+): Promise<DatabasePage<DatabaseConstraintSummary>> {
+  return invoke<DatabasePage<DatabaseConstraintSummary>>(databaseDiscoveryCommands.constraints, {
+    profileId,
+    ...scopeArgs(table),
+    table: table.table,
+    ...pageArgs(page),
+  });
+}
+
+/** Returns the bounded dependency inventory used before destructive changes. */
+export function getTableDependencies(
+  profileId: string,
+  table: DatabaseTableRef,
+  limit?: number,
+): Promise<DatabaseTableDependencies> {
+  return invoke<DatabaseTableDependencies>(databaseDiscoveryCommands.tableDependencies, {
+    profileId,
+    ...scopeArgs(table),
+    table: table.table,
+    limit: limit ?? null,
   });
 }
 

@@ -42,10 +42,11 @@ pub use pagination::{
 pub use postgres::PostgresDatabaseAdapter;
 pub use service::{DEFAULT_DATABASE_CONNECT_TIMEOUT, DatabaseConnectionRegistry};
 pub use traits::{
-    ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter, DatabaseConnectRequest,
-    DatabaseConnectionInfo, DatabasePassword, DatabasePing, DatabaseSummary, DatabaseVersionInfo,
-    IndexSummary, MetadataScope, MetadataValue, ObjectCounts, ObjectMetadata, SchemaSummary,
-    SequenceSummary, TableKind, TableRef, TableSummary, ViewKind, ViewSummary,
+    ColumnIdentity, ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter,
+    DatabaseConnectRequest, DatabaseConnectionInfo, DatabasePassword, DatabasePing,
+    DatabaseSummary, DatabaseVersionInfo, DependencyKind, DependencySummary, IndexSummary,
+    MetadataScope, MetadataValue, ObjectCounts, ObjectMetadata, SchemaSummary, SequenceSummary,
+    TableDependencies, TableKind, TableRef, TableSummary, ViewKind, ViewSummary,
 };
 
 use crate::storage::DatabaseEngine;

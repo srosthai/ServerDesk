@@ -16,13 +16,14 @@ use super::{
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
     mysql,
-    pagination::{Page, PageRequest},
+    pagination::{Bounded, Page, PageRequest},
     postgres,
     traits::{
-        ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter, DatabaseConnectRequest,
-        DatabaseConnectionInfo, DatabasePing, DatabaseSummary, DatabaseVersionInfo, IndexSummary,
-        MetadataScope, MetadataValue, ObjectCounts, ObjectMetadata, SchemaSummary, SequenceSummary,
-        TableKind, TableRef, TableSummary, ViewKind, ViewSummary,
+        ColumnIdentity, ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter,
+        DatabaseConnectRequest, DatabaseConnectionInfo, DatabasePing, DatabaseSummary,
+        DatabaseVersionInfo, DependencyKind, DependencySummary, IndexSummary, MetadataScope,
+        MetadataValue, ObjectCounts, ObjectMetadata, SchemaSummary, SequenceSummary,
+        TableDependencies, TableKind, TableRef, TableSummary, ViewKind, ViewSummary,
     },
 };
 
@@ -49,6 +50,7 @@ pub struct FakeDatabaseAdapter {
     columns: Vec<ColumnSummary>,
     indexes: Vec<IndexSummary>,
     constraints: Vec<ConstraintSummary>,
+    dependencies: TableDependencies,
     detail_table: String,
 }
 
@@ -94,6 +96,7 @@ impl FakeDatabaseAdapter {
             columns: fixtures.columns,
             indexes: fixtures.indexes,
             constraints: fixtures.constraints,
+            dependencies: fixtures.dependencies,
             detail_table: fixtures.detail_table,
         }
     }
@@ -555,6 +558,42 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
 
         Ok(Self::paginate(&self.constraints, page))
     }
+
+    async fn table_dependencies(
+        &self,
+        table: &TableRef,
+        limit: u32,
+    ) -> Result<TableDependencies, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseTables)?;
+        self.require_connection()?;
+
+        let limit = limit.clamp(1, crate::database::MAX_PAGE_LIMIT) as usize;
+        if !self
+            .tables
+            .iter()
+            .any(|summary| Self::table_matches(summary, table) && summary.name == self.detail_table)
+        {
+            return Ok(TableDependencies {
+                incoming_foreign_keys: MetadataValue::available(Bounded::new(Vec::new(), limit)),
+                dependent_views: MetadataValue::available(Bounded::new(Vec::new(), limit)),
+                owned_sequences: MetadataValue::available(Bounded::new(Vec::new(), limit)),
+                triggers: MetadataValue::available(Bounded::new(Vec::new(), limit)),
+            });
+        }
+
+        let bound = |value: &MetadataValue<Bounded<DependencySummary>>| -> MetadataValue<
+            Bounded<DependencySummary>,
+        > {
+            value.clone().map(|group| Bounded::new(group.items, limit))
+        };
+
+        Ok(TableDependencies {
+            incoming_foreign_keys: bound(&self.dependencies.incoming_foreign_keys),
+            dependent_views: bound(&self.dependencies.dependent_views),
+            owned_sequences: bound(&self.dependencies.owned_sequences),
+            triggers: bound(&self.dependencies.triggers),
+        })
+    }
 }
 
 struct FakeFixtures {
@@ -566,6 +605,7 @@ struct FakeFixtures {
     columns: Vec<ColumnSummary>,
     indexes: Vec<IndexSummary>,
     constraints: Vec<ConstraintSummary>,
+    dependencies: TableDependencies,
     detail_table: String,
 }
 
@@ -622,6 +662,7 @@ fn mysql_fixtures() -> FakeFixtures {
                 name: "users".to_string(),
                 kind: TableKind::Table,
                 estimated_rows: MetadataValue::available(2),
+                metadata_refreshed_at: MetadataValue::available("2026-01-02T03:04:05".to_string()),
                 metadata: ObjectMetadata {
                     size_bytes: MetadataValue::available(16_384),
                     engine: MetadataValue::available("InnoDB".to_string()),
@@ -634,6 +675,7 @@ fn mysql_fixtures() -> FakeFixtures {
                 name: "orders".to_string(),
                 kind: TableKind::Table,
                 estimated_rows: MetadataValue::available(0),
+                metadata_refreshed_at: MetadataValue::Unavailable,
                 metadata: ObjectMetadata {
                     size_bytes: MetadataValue::available(16_384),
                     engine: MetadataValue::available("InnoDB".to_string()),
@@ -655,25 +697,35 @@ fn mysql_fixtures() -> FakeFixtures {
         columns: vec![
             ColumnSummary {
                 name: "id".to_string(),
-                data_type: "bigint unsigned".to_string(),
+                data_type: "bigint(20) unsigned".to_string(),
+                length: MetadataValue::available(None),
+                precision: MetadataValue::available(Some(20)),
+                scale: MetadataValue::available(Some(0)),
                 nullable: false,
-                default_value: None,
+                default_value: MetadataValue::available(None),
                 ordinal_position: 1,
                 primary_key: true,
-                generated: false,
-                identity: false,
-                comment: None,
+                identity: MetadataValue::available(ColumnIdentity::AutoIncrement),
+                generated: MetadataValue::available(false),
+                generation_expression: MetadataValue::available(None),
+                comment: MetadataValue::available(None),
+                collation: MetadataValue::available(None),
             },
             ColumnSummary {
                 name: "email".to_string(),
                 data_type: "varchar(255)".to_string(),
+                length: MetadataValue::available(Some(255)),
+                precision: MetadataValue::available(None),
+                scale: MetadataValue::available(None),
                 nullable: false,
-                default_value: None,
+                default_value: MetadataValue::available(None),
                 ordinal_position: 2,
                 primary_key: false,
-                generated: false,
-                identity: false,
-                comment: Some("Login address".to_string()),
+                identity: MetadataValue::available(ColumnIdentity::None),
+                generated: MetadataValue::available(false),
+                generation_expression: MetadataValue::available(None),
+                comment: MetadataValue::available(Some("Login address".to_string())),
+                collation: MetadataValue::available(Some("utf8mb4_unicode_ci".to_string())),
             },
         ],
         indexes: vec![
@@ -682,14 +734,16 @@ fn mysql_fixtures() -> FakeFixtures {
                 columns: vec!["id".to_string()],
                 unique: true,
                 primary: true,
-                method: Some("BTREE".to_string()),
+                method: MetadataValue::available("BTREE".to_string()),
+                predicate: MetadataValue::Unavailable,
             },
             IndexSummary {
                 name: "users_email_unique".to_string(),
                 columns: vec!["email".to_string()],
                 unique: true,
                 primary: false,
-                method: Some("BTREE".to_string()),
+                method: MetadataValue::available("BTREE".to_string()),
+                predicate: MetadataValue::Unavailable,
             },
         ],
         constraints: vec![
@@ -697,21 +751,46 @@ fn mysql_fixtures() -> FakeFixtures {
                 name: "PRIMARY".to_string(),
                 kind: ConstraintKind::PrimaryKey,
                 columns: vec!["id".to_string()],
-                referenced_table: None,
+                referenced_schema: MetadataValue::available(None),
+                referenced_table: MetadataValue::available(None),
                 referenced_columns: Vec::new(),
-                on_update: None,
-                on_delete: None,
+                on_update: MetadataValue::available(None),
+                on_delete: MetadataValue::available(None),
+                check_expression: MetadataValue::available(None),
+                deferrable: MetadataValue::Unavailable,
+                initially_deferred: MetadataValue::Unavailable,
             },
             ConstraintSummary {
                 name: "users_email_unique".to_string(),
                 kind: ConstraintKind::Unique,
                 columns: vec!["email".to_string()],
-                referenced_table: None,
+                referenced_schema: MetadataValue::available(None),
+                referenced_table: MetadataValue::available(None),
                 referenced_columns: Vec::new(),
-                on_update: None,
-                on_delete: None,
+                on_update: MetadataValue::available(None),
+                on_delete: MetadataValue::available(None),
+                check_expression: MetadataValue::available(None),
+                deferrable: MetadataValue::Unavailable,
+                initially_deferred: MetadataValue::Unavailable,
             },
         ],
+        dependencies: TableDependencies {
+            incoming_foreign_keys: MetadataValue::available(Bounded::new(
+                vec![incoming_key(
+                    "orders_user_fk",
+                    "app",
+                    "orders",
+                    "user_id",
+                    "id",
+                    "CASCADE",
+                    "RESTRICT",
+                )],
+                100,
+            )),
+            dependent_views: MetadataValue::Unavailable,
+            owned_sequences: MetadataValue::Unavailable,
+            triggers: MetadataValue::available(Bounded::new(Vec::new(), 100)),
+        },
         detail_table: "users".to_string(),
     }
 }
@@ -767,6 +846,7 @@ fn postgres_fixtures() -> FakeFixtures {
                 name: "users".to_string(),
                 kind: TableKind::Table,
                 estimated_rows: MetadataValue::available(2),
+                metadata_refreshed_at: MetadataValue::available("2026-01-02T03:04:05Z".to_string()),
                 metadata: ObjectMetadata {
                     owner: MetadataValue::available("app".to_string()),
                     size_bytes: MetadataValue::available(8_192),
@@ -780,6 +860,7 @@ fn postgres_fixtures() -> FakeFixtures {
                 name: "orders".to_string(),
                 kind: TableKind::Table,
                 estimated_rows: MetadataValue::available(0),
+                metadata_refreshed_at: MetadataValue::Unavailable,
                 metadata: ObjectMetadata {
                     owner: MetadataValue::available("app".to_string()),
                     size_bytes: MetadataValue::available(8_192),
@@ -829,24 +910,34 @@ fn postgres_fixtures() -> FakeFixtures {
             ColumnSummary {
                 name: "id".to_string(),
                 data_type: "bigint".to_string(),
+                length: MetadataValue::available(None),
+                precision: MetadataValue::available(Some(64)),
+                scale: MetadataValue::available(Some(0)),
                 nullable: false,
-                default_value: Some("nextval('users_id_seq')".to_string()),
+                default_value: MetadataValue::available(None),
                 ordinal_position: 1,
                 primary_key: true,
-                generated: false,
-                identity: true,
-                comment: None,
+                identity: MetadataValue::available(ColumnIdentity::Always),
+                generated: MetadataValue::available(false),
+                generation_expression: MetadataValue::available(None),
+                comment: MetadataValue::available(None),
+                collation: MetadataValue::available(None),
             },
             ColumnSummary {
                 name: "email".to_string(),
                 data_type: "text".to_string(),
+                length: MetadataValue::available(None),
+                precision: MetadataValue::available(None),
+                scale: MetadataValue::available(None),
                 nullable: false,
-                default_value: None,
+                default_value: MetadataValue::available(None),
                 ordinal_position: 2,
                 primary_key: false,
-                generated: false,
-                identity: false,
-                comment: Some("Login address".to_string()),
+                identity: MetadataValue::available(ColumnIdentity::None),
+                generated: MetadataValue::available(false),
+                generation_expression: MetadataValue::available(None),
+                comment: MetadataValue::available(Some("Login address".to_string())),
+                collation: MetadataValue::available(Some("default".to_string())),
             },
         ],
         indexes: vec![
@@ -855,14 +946,16 @@ fn postgres_fixtures() -> FakeFixtures {
                 columns: vec!["id".to_string()],
                 unique: true,
                 primary: true,
-                method: Some("btree".to_string()),
+                method: MetadataValue::available("btree".to_string()),
+                predicate: MetadataValue::available(None),
             },
             IndexSummary {
                 name: "users_email_key".to_string(),
                 columns: vec!["email".to_string()],
                 unique: true,
                 primary: false,
-                method: Some("btree".to_string()),
+                method: MetadataValue::available("btree".to_string()),
+                predicate: MetadataValue::available(None),
             },
         ],
         constraints: vec![
@@ -870,21 +963,105 @@ fn postgres_fixtures() -> FakeFixtures {
                 name: "users_pkey".to_string(),
                 kind: ConstraintKind::PrimaryKey,
                 columns: vec!["id".to_string()],
-                referenced_table: None,
+                referenced_schema: MetadataValue::available(None),
+                referenced_table: MetadataValue::available(None),
                 referenced_columns: Vec::new(),
-                on_update: None,
-                on_delete: None,
+                on_update: MetadataValue::available(None),
+                on_delete: MetadataValue::available(None),
+                check_expression: MetadataValue::available(None),
+                deferrable: MetadataValue::available(false),
+                initially_deferred: MetadataValue::available(false),
             },
             ConstraintSummary {
                 name: "users_email_key".to_string(),
                 kind: ConstraintKind::Unique,
                 columns: vec!["email".to_string()],
-                referenced_table: None,
+                referenced_schema: MetadataValue::available(None),
+                referenced_table: MetadataValue::available(None),
                 referenced_columns: Vec::new(),
-                on_update: None,
-                on_delete: None,
+                on_update: MetadataValue::available(None),
+                on_delete: MetadataValue::available(None),
+                check_expression: MetadataValue::available(None),
+                deferrable: MetadataValue::available(false),
+                initially_deferred: MetadataValue::available(false),
             },
         ],
+        dependencies: TableDependencies {
+            incoming_foreign_keys: MetadataValue::available(Bounded::new(
+                vec![incoming_key(
+                    "orders_user_fk",
+                    "public",
+                    "orders",
+                    "user_id",
+                    "id",
+                    "CASCADE",
+                    "RESTRICT",
+                )],
+                100,
+            )),
+            dependent_views: MetadataValue::available(Bounded::new(
+                vec![dependent_view("active_users", "public", "VIEW")],
+                100,
+            )),
+            owned_sequences: MetadataValue::available(Bounded::new(
+                vec![owned_sequence("users_id_seq", "public", "id")],
+                100,
+            )),
+            triggers: MetadataValue::available(Bounded::new(Vec::new(), 100)),
+        },
         detail_table: "users".to_string(),
+    }
+}
+
+fn incoming_key(
+    name: &str,
+    schema: &str,
+    table: &str,
+    column: &str,
+    referenced_column: &str,
+    on_delete: &str,
+    on_update: &str,
+) -> DependencySummary {
+    DependencySummary {
+        kind: DependencyKind::IncomingForeignKey,
+        name: name.to_string(),
+        database: Some("app".to_string()),
+        schema: Some(schema.to_string()),
+        table: Some(table.to_string()),
+        columns: vec![column.to_string()],
+        referenced_columns: vec![referenced_column.to_string()],
+        on_update: MetadataValue::available(Some(on_update.to_string())),
+        on_delete: MetadataValue::available(Some(on_delete.to_string())),
+        details: MetadataValue::Unavailable,
+    }
+}
+
+fn dependent_view(name: &str, schema: &str, details: &str) -> DependencySummary {
+    DependencySummary {
+        kind: DependencyKind::DependentView,
+        name: name.to_string(),
+        database: Some("app".to_string()),
+        schema: Some(schema.to_string()),
+        table: None,
+        columns: Vec::new(),
+        referenced_columns: Vec::new(),
+        on_update: MetadataValue::Unavailable,
+        on_delete: MetadataValue::Unavailable,
+        details: MetadataValue::available(details.to_string()),
+    }
+}
+
+fn owned_sequence(name: &str, schema: &str, column: &str) -> DependencySummary {
+    DependencySummary {
+        kind: DependencyKind::OwnedSequence,
+        name: name.to_string(),
+        database: Some("app".to_string()),
+        schema: Some(schema.to_string()),
+        table: Some("users".to_string()),
+        columns: vec![column.to_string()],
+        referenced_columns: Vec::new(),
+        on_update: MetadataValue::Unavailable,
+        on_delete: MetadataValue::Unavailable,
+        details: MetadataValue::Unavailable,
     }
 }
