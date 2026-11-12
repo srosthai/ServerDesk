@@ -41,7 +41,7 @@ type DatabaseConnectionListProps = {
   busy: Record<string, boolean>;
   selectedProfileId: string | null;
   sshConnected: boolean;
-  onSelect: (profileId: string) => void;
+  onOpen: (profile: DatabaseProfile) => void;
   onConnect: (profile: DatabaseProfile) => void;
   onReconnect: (profile: DatabaseProfile) => void;
   onDisconnect: (profile: DatabaseProfile) => void;
@@ -116,7 +116,7 @@ function DatabaseConnectionList({
   busy,
   selectedProfileId,
   sshConnected,
-  onSelect,
+  onOpen,
   onConnect,
   onReconnect,
   onDisconnect,
@@ -186,7 +186,7 @@ function DatabaseConnectionList({
                   <div className="flex flex-wrap items-center gap-1.5">
                     <button
                       type="button"
-                      onClick={() => onSelect(profile.id)}
+                      onClick={() => onOpen(profile)}
                       aria-pressed={selected}
                       className="min-w-0 rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
                     >
@@ -275,7 +275,17 @@ function DatabaseConnectionList({
                   ) : null}
                 </div>
 
-                <div className="flex shrink-0 flex-wrap items-center gap-1 2xl:max-w-56 2xl:justify-end">
+                <div className="flex shrink-0 flex-wrap items-center gap-1 2xl:max-w-64 2xl:justify-end">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => onOpen(profile)}
+                    title="Open this connection in a workspace tab"
+                    aria-label={`Open ${profile.name} workspace`}
+                  >
+                    Open
+                    <ArrowRightIcon className="size-3.5" aria-hidden="true" />
+                  </Button>
                   {canConnect ? (
                     <Button
                       size="sm"
