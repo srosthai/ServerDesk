@@ -315,6 +315,8 @@ export type DatabaseAction =
   | "run_query"
   | "create_generated_column"
   | "create_identity_column"
+  | "create_auto_increment_column"
+  | "create_partial_index"
   | "refresh_materialized_view"
   | "insert_row"
   | "edit_row"
@@ -335,9 +337,14 @@ export type CapabilityFlags = {
   checkConstraints: boolean;
   generatedColumns: boolean;
   identityColumns: boolean;
+  autoIncrementColumns: boolean;
+  columnTypeChange: boolean;
+  columnRename: boolean;
+  tableRename: boolean;
   columnReorder: boolean;
   databaseRename: boolean;
   indexRename: boolean;
+  partialIndexes: boolean;
   queryTimeout: boolean;
 };
 
@@ -606,6 +613,158 @@ export type DatabaseActionResult = {
   metadata?: DatabaseSummary | null;
   activeDatabase?: string | null;
   durationMs: number;
+};
+
+export type DatabaseColumnDefaultInput =
+  | { kind: "null" }
+  | { kind: "string"; value: string }
+  | { kind: "number"; value: string }
+  | { kind: "boolean"; value: boolean }
+  | { kind: "current_timestamp" };
+
+export type DatabaseGeneratedColumnInput = {
+  expression: string;
+  stored: boolean;
+};
+
+export type DatabaseColumnDefinitionInput = {
+  name: string;
+  dataType: string;
+  nullable: boolean;
+  default?: DatabaseColumnDefaultInput | null;
+  comment?: string | null;
+  generated?: DatabaseGeneratedColumnInput | null;
+  identity?: DatabaseColumnIdentity | null;
+};
+
+export type DatabaseColumnPositionInput = { kind: "first" } | { kind: "after"; column: string };
+
+export type DatabaseReferentialAction =
+  "no_action" | "restrict" | "cascade" | "set_null" | "set_default";
+
+export type DatabaseConstraintInput =
+  | { kind: "primary_key"; name: string; columns: string[] }
+  | { kind: "unique"; name: string; columns: string[] }
+  | {
+      kind: "foreign_key";
+      name: string;
+      columns: string[];
+      referencedSchema?: string | null;
+      referencedTable: string;
+      referencedColumns: string[];
+      onDelete?: DatabaseReferentialAction | null;
+      onUpdate?: DatabaseReferentialAction | null;
+    }
+  | { kind: "check"; name: string; expression: string };
+
+type DatabaseStructureTableScope = {
+  database?: string | null;
+  schema?: string | null;
+};
+
+export type DatabaseStructureActionRequest =
+  | ({
+      kind: "create_table";
+      name: string;
+      columns: DatabaseColumnDefinitionInput[];
+      primaryKey?: string[];
+    } & DatabaseStructureTableScope)
+  | ({ kind: "rename_table"; name: string; newName: string } & DatabaseStructureTableScope)
+  | ({ kind: "drop_table"; name: string } & DatabaseStructureTableScope)
+  | ({ kind: "truncate_table"; name: string } & DatabaseStructureTableScope)
+  | ({
+      kind: "add_column";
+      table: string;
+      column: DatabaseColumnDefinitionInput;
+      position?: DatabaseColumnPositionInput | null;
+    } & DatabaseStructureTableScope)
+  | ({
+      kind: "alter_column";
+      table: string;
+      name: string;
+      dataType?: string | null;
+      nullable?: boolean | null;
+      default?: DatabaseColumnDefaultInput | null;
+      dropDefault?: boolean;
+      comment?: string | null;
+      dropComment?: boolean;
+    } & DatabaseStructureTableScope)
+  | ({
+      kind: "rename_column";
+      table: string;
+      name: string;
+      newName: string;
+    } & DatabaseStructureTableScope)
+  | ({ kind: "drop_column"; table: string; name: string } & DatabaseStructureTableScope)
+  | ({
+      kind: "reorder_column";
+      table: string;
+      column: DatabaseColumnDefinitionInput;
+      position: DatabaseColumnPositionInput;
+    } & DatabaseStructureTableScope)
+  | ({
+      kind: "create_index";
+      table: string;
+      name: string;
+      columns: string[];
+      unique?: boolean;
+      method?: string | null;
+      predicate?: string | null;
+    } & DatabaseStructureTableScope)
+  | ({
+      kind: "rename_index";
+      table: string;
+      name: string;
+      newName: string;
+    } & DatabaseStructureTableScope)
+  | ({ kind: "drop_index"; table: string; name: string } & DatabaseStructureTableScope)
+  | ({
+      kind: "add_constraint";
+      table: string;
+      constraint: DatabaseConstraintInput;
+    } & DatabaseStructureTableScope)
+  | ({
+      kind: "drop_constraint";
+      table: string;
+      name: string;
+      constraintKind: DatabaseConstraintKind;
+    } & DatabaseStructureTableScope);
+
+export type DatabaseStructureActionKind =
+  | "create_table"
+  | "rename_table"
+  | "drop_table"
+  | "truncate_table"
+  | "add_column"
+  | "alter_column"
+  | "rename_column"
+  | "drop_column"
+  | "reorder_column"
+  | "create_index"
+  | "rename_index"
+  | "drop_index"
+  | "add_constraint"
+  | "drop_constraint";
+
+export type DatabaseStructureObjectKind = "table" | "column" | "index" | "constraint";
+
+export type DatabaseAffectedObject = {
+  kind: DatabaseStructureObjectKind;
+  database?: string | null;
+  schema?: string | null;
+  table: string;
+  name?: string | null;
+};
+
+export type DatabaseStructureDdlPreview = {
+  action: DatabaseStructureActionKind;
+  engine: DatabaseEngine;
+  object: DatabaseAffectedObject;
+  statements: string[];
+  ddl: string;
+  warnings: string[];
+  destructive: boolean;
+  requiresConfirmation: boolean;
 };
 
 export type ProjectType = "laravel";

@@ -18,6 +18,7 @@ use super::{
     mysql,
     pagination::{Bounded, Page, PageRequest},
     postgres,
+    structure::{StructureDdlPreview, ValidatedStructureAction},
     traits::{
         ColumnIdentity, ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter,
         DatabaseConnectRequest, DatabaseConnectionInfo, DatabasePing, DatabaseSummary,
@@ -277,6 +278,18 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
         match self.engine {
             DatabaseEngine::Mysql => mysql::actions::preview(action),
             DatabaseEngine::Postgresql => postgres::actions::preview(action),
+        }
+    }
+
+    async fn preview_structure_action(
+        &self,
+        action: &ValidatedStructureAction,
+    ) -> Result<StructureDdlPreview, DatabaseError> {
+        self.require_connection()?;
+        action.ensure_supported(&self.capabilities)?;
+        match self.engine {
+            DatabaseEngine::Mysql => mysql::ddl::preview(action),
+            DatabaseEngine::Postgresql => postgres::ddl::preview(action),
         }
     }
 

@@ -30,13 +30,24 @@ pub fn flags_for(version: Option<DatabaseVersion>) -> CapabilityFlags {
         check_constraints: at_least(version, 8, 0, 16),
         // GENERATED columns were added in MySQL 5.7.6.
         generated_columns: at_least(version, 5, 7, 6),
+        // MySQL identity is expressed as AUTO_INCREMENT.
         identity_columns: false,
+        auto_increment_columns: true,
+        // ALTER TABLE ... MODIFY COLUMN always supports a type change.
+        column_type_change: true,
+        // ALTER TABLE ... RENAME COLUMN was added in MySQL 8.0. Older servers
+        // need CHANGE COLUMN with the full definition, which the structure
+        // planner does not guess from metadata.
+        column_rename: at_least(version, 8, 0, 0),
+        table_rename: true,
         // MySQL supports FIRST/AFTER column positioning.
         column_reorder: true,
         // There is no safe, atomic RENAME DATABASE operation.
         database_rename: false,
         // ALTER TABLE ... RENAME INDEX was added in MySQL 5.7.
         index_rename: at_least(version, 5, 7, 0),
+        // MySQL has no partial-index predicate.
+        partial_indexes: false,
         // max_execution_time was added in MySQL 5.7.4. The adapter still
         // applies a client-side bound for older servers.
         query_timeout: at_least(version, 5, 7, 4),
