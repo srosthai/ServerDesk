@@ -15,6 +15,7 @@ pub mod mysql;
 pub mod pagination;
 pub mod postgres;
 pub mod service;
+pub mod structure;
 pub mod traits;
 pub mod validation;
 
@@ -41,6 +42,16 @@ pub use pagination::{
 };
 pub use postgres::PostgresDatabaseAdapter;
 pub use service::{DEFAULT_DATABASE_CONNECT_TIMEOUT, DatabaseConnectionRegistry};
+pub use structure::{
+    AffectedObject, ColumnDefault, ColumnDefaultRequest, ColumnDefinitionRequest, ColumnPosition,
+    ColumnPositionRequest, ConstraintRequest, DatabaseStructureService, GeneratedColumnRequest,
+    MAX_COLUMN_COMMENT_LENGTH, MAX_COLUMN_EXPRESSION_LENGTH, MAX_COLUMN_LIST_LENGTH,
+    MAX_DATA_TYPE_LENGTH, MAX_DEFAULT_STRING_LENGTH, MAX_INDEX_METHOD_LENGTH, ReferentialAction,
+    StructureActionKind, StructureActionRequest, StructureDdlPreview, StructureObjectKind,
+    ValidatedColumnChanges, ValidatedColumnDefinition, ValidatedConstraint, ValidatedCreateIndex,
+    ValidatedCreateTable, ValidatedGeneratedColumn, ValidatedStructureAction,
+    preview_structure_with_adapter,
+};
 pub use traits::{
     ColumnIdentity, ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter,
     DatabaseConnectRequest, DatabaseConnectionInfo, DatabasePassword, DatabasePing,

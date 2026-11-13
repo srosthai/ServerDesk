@@ -124,9 +124,14 @@ pub struct CapabilityFlags {
     pub check_constraints: bool,
     pub generated_columns: bool,
     pub identity_columns: bool,
+    pub auto_increment_columns: bool,
+    pub column_type_change: bool,
+    pub column_rename: bool,
+    pub table_rename: bool,
     pub column_reorder: bool,
     pub database_rename: bool,
     pub index_rename: bool,
+    pub partial_indexes: bool,
     pub query_timeout: bool,
 }
 
@@ -177,6 +182,8 @@ pub enum DatabaseAction {
     RunQuery,
     CreateGeneratedColumn,
     CreateIdentityColumn,
+    CreateAutoIncrementColumn,
+    CreatePartialIndex,
     RefreshMaterializedView,
     InsertRow,
     EditRow,
@@ -228,6 +235,8 @@ impl DatabaseAction {
         Self::RunQuery,
         Self::CreateGeneratedColumn,
         Self::CreateIdentityColumn,
+        Self::CreateAutoIncrementColumn,
+        Self::CreatePartialIndex,
         Self::RefreshMaterializedView,
         Self::InsertRow,
         Self::EditRow,
@@ -279,6 +288,8 @@ impl DatabaseAction {
             Self::RunQuery => "run_query",
             Self::CreateGeneratedColumn => "create_generated_column",
             Self::CreateIdentityColumn => "create_identity_column",
+            Self::CreateAutoIncrementColumn => "create_auto_increment_column",
+            Self::CreatePartialIndex => "create_partial_index",
             Self::RefreshMaterializedView => "refresh_materialized_view",
             Self::InsertRow => "insert_row",
             Self::EditRow => "edit_row",
@@ -349,6 +360,11 @@ impl DatabaseCapabilities {
             DatabaseAction::CreateCheckConstraint => self.flags.check_constraints,
             DatabaseAction::CreateGeneratedColumn => self.flags.generated_columns,
             DatabaseAction::CreateIdentityColumn => self.flags.identity_columns,
+            DatabaseAction::CreateAutoIncrementColumn => self.flags.auto_increment_columns,
+            DatabaseAction::CreatePartialIndex => self.flags.partial_indexes,
+            DatabaseAction::EditColumn => self.flags.column_type_change,
+            DatabaseAction::RenameColumn => self.flags.column_rename,
+            DatabaseAction::RenameTable => self.flags.table_rename,
             DatabaseAction::ReorderColumns => self.flags.column_reorder,
             DatabaseAction::RenameDatabase => self.flags.database_rename,
             DatabaseAction::RenameIndex => self.flags.index_rename,
@@ -426,12 +442,17 @@ mod tests {
         let mysql_57 = DatabaseCapabilities::for_engine(DatabaseEngine::Mysql, Some("5.7.44-log"));
         assert!(mysql_57.supports(DatabaseAction::BrowseDatabases));
         assert!(mysql_57.supports(DatabaseAction::ReorderColumns));
+        assert!(mysql_57.supports(DatabaseAction::CreateAutoIncrementColumn));
+        assert!(!mysql_57.supports(DatabaseAction::RenameColumn));
+        assert!(!mysql_57.supports(DatabaseAction::CreatePartialIndex));
         assert!(!mysql_57.supports(DatabaseAction::BrowseRoles));
         assert!(!mysql_57.supports(DatabaseAction::CreateCheckConstraint));
         assert!(!mysql_57.supports(DatabaseAction::CreateIdentityColumn));
 
         let mysql_80 = DatabaseCapabilities::for_engine(DatabaseEngine::Mysql, Some("8.0.36"));
         assert!(mysql_80.supports(DatabaseAction::BrowseRoles));
+        assert!(mysql_80.supports(DatabaseAction::RenameColumn));
+        assert!(mysql_80.supports(DatabaseAction::RenameTable));
         assert!(mysql_80.supports(DatabaseAction::CreateGeneratedColumn));
         assert!(mysql_80.supports(DatabaseAction::CreateCheckConstraint));
         assert!(mysql_80.supports(DatabaseAction::RenameIndex));
@@ -454,6 +475,10 @@ mod tests {
         assert!(pg_12.supports(DatabaseAction::RefreshMaterializedView));
         assert!(pg_12.supports(DatabaseAction::CreateIdentityColumn));
         assert!(pg_12.supports(DatabaseAction::CreateGeneratedColumn));
+        assert!(pg_12.supports(DatabaseAction::CreatePartialIndex));
+        assert!(pg_12.supports(DatabaseAction::RenameColumn));
+        assert!(pg_12.supports(DatabaseAction::RenameTable));
+        assert!(!pg_12.supports(DatabaseAction::CreateAutoIncrementColumn));
         assert!(pg_12.supports(DatabaseAction::RenameDatabase));
         assert!(!pg_12.supports(DatabaseAction::ReorderColumns));
     }

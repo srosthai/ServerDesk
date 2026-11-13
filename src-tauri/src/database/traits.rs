@@ -16,6 +16,7 @@ use super::{
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
     pagination::{Bounded, Page, PageRequest},
+    structure::{StructureDdlPreview, ValidatedStructureAction},
 };
 
 /// A database password that never appears in debug output or serialization.
@@ -446,6 +447,13 @@ pub trait DatabaseAdapter: Send + Sync {
         &self,
         action: &ValidatedDatabaseAction,
     ) -> Result<DatabaseDdlPreview, DatabaseError>;
+
+    /// Generates engine-specific DDL for a table, column, index, or constraint
+    /// change. This is a planning method only; it must never execute SQL.
+    async fn preview_structure_action(
+        &self,
+        action: &ValidatedStructureAction,
+    ) -> Result<StructureDdlPreview, DatabaseError>;
 
     /// Executes one validated lifecycle action. Only set-active returns updated
     /// connection metadata; create, rename, and drop return `None`.

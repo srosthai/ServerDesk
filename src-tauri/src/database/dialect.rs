@@ -394,4 +394,28 @@ mod tests {
         );
         assert!(!query.sql().contains("DROP TABLE"));
     }
+
+    #[test]
+    fn placeholder_like_identifiers_stay_identifiers_and_never_become_values() {
+        let postgres = PostgresDialect;
+        let mysql = MysqlDialect;
+
+        let mut query = ParameterizedQuery::new();
+        query
+            .push_identifier(&postgres, &identifier("$1"))
+            .push_sql(" = ")
+            .push_value(&postgres, "value")
+            .expect("value");
+        assert_eq!(query.sql(), "\"$1\" = $1");
+        assert_eq!(query.values(), [SqlValue::Text("value".to_string())]);
+
+        let mut query = ParameterizedQuery::new();
+        query
+            .push_identifier(&mysql, &identifier("?"))
+            .push_sql(" = ")
+            .push_value(&mysql, "value")
+            .expect("value");
+        assert_eq!(query.sql(), "`?` = ?");
+        assert_eq!(query.values(), [SqlValue::Text("value".to_string())]);
+    }
 }
