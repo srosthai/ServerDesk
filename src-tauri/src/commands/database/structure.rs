@@ -1,10 +1,10 @@
 //! Structure-change preview and execution commands.
 //!
-//! Execution is deliberately narrow in this slice: table create, rename,
-//! duplicate, truncate, and drop. Every execution re-validates the request,
-//! regenerates the DDL preview, refuses an unconfirmed destructive action,
-//! rejects read-only profiles, checks blocking dependencies, and re-reads
-//! metadata before reporting success. The full structure editor is #174.
+//! Execution covers table lifecycle plus column add, edit, rename, drop, and
+//! reorder. Every execution re-validates the request, regenerates the DDL
+//! preview, refuses an unconfirmed destructive action, rejects read-only
+//! profiles, checks blocking dependencies, and re-reads metadata before
+//! reporting success. The full structure editor is #174.
 
 use std::time::Instant;
 
@@ -241,6 +241,31 @@ fn verified_structure_summary(
         "drop_table" => format!(
             "Dropped table {label} on {engine} connection {profile_name} and verified it is absent"
         ),
+        "add_column" => format!(
+            "Added column {} to table {label} on {engine} connection {profile_name} and verified \
+             its metadata",
+            object.name.as_deref().unwrap_or("the requested column")
+        ),
+        "alter_column" => format!(
+            "Edited column {} on table {label} on {engine} connection {profile_name} and verified \
+             its metadata",
+            object.name.as_deref().unwrap_or("the requested column")
+        ),
+        "rename_column" => format!(
+            "Renamed column {} on table {label} on {engine} connection {profile_name} and verified \
+             the new name",
+            object.name.as_deref().unwrap_or("the requested column")
+        ),
+        "drop_column" => format!(
+            "Dropped column {} from table {label} on {engine} connection {profile_name} and \
+             verified it is absent",
+            object.name.as_deref().unwrap_or("the requested column")
+        ),
+        "reorder_column" => format!(
+            "Reordered column {} on table {label} on {engine} connection {profile_name} and \
+             verified its position",
+            object.name.as_deref().unwrap_or("the requested column")
+        ),
         _ if object.name.is_some() => format!(
             "Completed the {action} action for {} on {engine} connection {profile_name} and \
              verified its metadata",
@@ -257,8 +282,11 @@ fn verified_structure_summary(
 mod tests {
     use super::*;
     use crate::{
-        database::{StructureActionKind, StructureObjectKind, TableSummary},
-        storage::DatabaseEngine,
+        database::{
+            ColumnDefaultRequest, ColumnDefinitionRequest, StructureActionKind,
+            StructureObjectKind, TableSummary,
+        },
+        storage::{AuthType, DatabaseEngine, NewServer},
     };
 
     fn profile(engine: DatabaseEngine) -> DatabaseConnection {
@@ -288,6 +316,16 @@ mod tests {
             schema: Some("public".to_string()),
             table: table.to_string(),
             name: None,
+        }
+    }
+
+    fn column_object(table: &str, name: &str) -> AffectedObject {
+        AffectedObject {
+            kind: StructureObjectKind::Column,
+            database: Some("app".to_string()),
+            schema: Some("public".to_string()),
+            table: table.to_string(),
+            name: Some(name.to_string()),
         }
     }
 
@@ -371,5 +409,88 @@ mod tests {
         );
         assert_eq!(status, OperationResult::Failure);
         assert!(summary.contains("did not complete"));
+    }
+
+    #[test]
+    fn column_history_summaries_name_the_action_without_ddl_or_values() {
+        let mut outcome = result(StructureActionKind::AddColumn, true);
+        outcome.object = column_object("accounts", "Display Name");
+        let object = outcome.object.clone();
+        let (status, summary, output) = history_outcome(
+            "add_column",
+            "PostgreSQL",
+            "app.public.accounts",
+            &object,
+            "Primary",
+            &Ok(outcome),
+        );
+
+        assert_eq!(status, OperationResult::Success);
+        assert!(summary.contains("Added column Display Name to table app.public.accounts"));
+        assert!(!summary.contains("ALTER TABLE"));
+        assert!(!summary.contains("varchar"));
+        assert!(output.is_some_and(|output| !output.contains("ALTER TABLE")));
+    }
+
+    #[test]
+    fn column_operation_history_is_persisted_without_generated_ddl_or_defaults() {
+        let database = Database::in_memory().expect("in-memory storage");
+        let server = database
+            .create_server(&NewServer {
+                name: "Fixture".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 22,
+                username: "deploy".to_string(),
+                auth_type: AuthType::Password,
+                credential_ref: None,
+                group_name: None,
+                tags: Vec::new(),
+                notes: None,
+            })
+            .expect("server");
+        let mut profile = profile(DatabaseEngine::Postgresql);
+        profile.server_id = server.id;
+
+        let request = StructureActionRequest::AddColumn {
+            database: Some("app".to_string()),
+            schema: Some("public".to_string()),
+            table: "accounts".to_string(),
+            column: ColumnDefinitionRequest {
+                name: "Display Name".to_string(),
+                data_type: "varchar(120)".to_string(),
+                nullable: false,
+                default: Some(ColumnDefaultRequest::String {
+                    value: "super-secret-default".to_string(),
+                }),
+                comment: Some("Shown in lists".to_string()),
+                generated: None,
+                identity: None,
+            },
+            position: None,
+        };
+        let mut outcome = result(StructureActionKind::AddColumn, true);
+        outcome.object = column_object("accounts", "Display Name");
+        outcome.statements = vec![
+            "ALTER TABLE \"public\".\"accounts\" ADD COLUMN \"Display Name\" varchar(120) NOT \
+             NULL DEFAULT 'super-secret-default'"
+                .to_string(),
+        ];
+        outcome.verification =
+            "Metadata re-read confirms column Display Name was added.".to_string();
+
+        record_structure_history(&database, &profile, &request, &Ok(outcome), 1, 7);
+
+        let rows = database.list_operations(10).expect("history");
+        let row = rows.first().expect("column operation recorded");
+        assert_eq!(row.operation, "database-add_column");
+        assert_eq!(row.category, OperationCategory::Database);
+        assert!(row.safe_summary.contains("Added column Display Name"));
+        assert!(!row.safe_summary.contains("ALTER TABLE"));
+        assert!(!row.safe_summary.contains("super-secret-default"));
+        assert!(
+            row.output_summary
+                .as_deref()
+                .is_some_and(|output| !output.contains("super-secret-default"))
+        );
     }
 }

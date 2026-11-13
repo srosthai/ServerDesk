@@ -332,16 +332,17 @@ surface:
 | Command                             | Purpose                                                        |
 | ----------------------------------- | -------------------------------------------------------------- |
 | `preview_database_structure_action` | Validate and generate DDL for one structure change, no execute |
-| `run_database_structure_action`     | Execute one table lifecycle change and verify the result       |
+| `run_database_structure_action`     | Execute one table or column change and verify the result       |
 
 `src-tauri/src/database/structure.rs` validates requests into
 `ValidatedStructureAction` values and asks the adapter for a
 `StructureDdlPreview`. `mysql::ddl` and `postgres::ddl` are pure planners: they
 receive validated identifiers, type names, and typed values only. Execution is
-implemented for table create, rename, duplicate, truncate, and drop; column,
-index, and constraint execution stays with the structure editor in #174, which
-must call the same preview/capability path first. Every execution command
-regenerates the preview before touching the database.
+implemented for table create, rename, duplicate, truncate, and drop plus column
+add, edit, rename, drop, and engine-supported reorder. Index and constraint
+execution stays with the structure editor in #174, which must call the same
+preview/capability path first. Every execution command regenerates the preview
+before touching the database.
 
 Requests are tagged by `kind` and cover table, column, index, and constraint
 changes:
@@ -424,12 +425,16 @@ text are never stored.
 
 Golden DDL fixtures live in `src-tauri/tests/fixtures/database_structure/` and
 are compared through the fake adapter by `src-tauri/tests/database_structure_ddl.rs`.
-Table execution tests use the same fake adapter and the opt-in MySQL and
-PostgreSQL container fixtures.
+Table and column execution tests use the same fake adapter and the opt-in MySQL
+and PostgreSQL container fixtures. Column execution verifies type, nullability,
+default, comment, identity/generated state, and position where applicable; MySQL
+MODIFY COLUMN requests must include the complete type and nullability, and
+PostgreSQL rejects unsupported stored-column reordering with a capability error.
 
 `src/services/databaseStructure.ts` is the only React module that invokes the
-structure commands. It exposes typed preview, create, rename, duplicate,
-truncate, and drop helpers; truncate and drop require an explicit confirmation
+structure commands. It exposes typed preview, table create/rename/duplicate/
+truncate/drop helpers and column add/edit/rename/drop/reorder helpers; truncate,
+column drop, and other destructive actions require an explicit confirmation
 argument. The full structure UI remains #174.
 
 ## Discovery command contract
@@ -725,11 +730,12 @@ The fixture tests cover connect, ping, version, capability flags, read-only
 write rejection, writable probe-table metadata, column identity/generated
 fields, bounded index and constraint metadata, incoming-foreign-key and trigger
 dependencies, typed authentication failure, database create/set-active/drop
-verification, table create/duplicate/rename/truncate/drop verification,
-read-only lifecycle and table permission denial, the unsupported rename
-explanation, and the unavailable-host path. They bind no public port; the
-container mapping is explicit `127.0.0.1`. The live path has been exercised
-against both MariaDB 11.4 and MySQL 8.4 containers.
+verification, table create/duplicate/rename/truncate/drop verification, column
+add/edit/rename/drop/reorder verification, read-only lifecycle and table
+permission denial, the unsupported rename explanation, and the unavailable-host
+path. They bind no public port; the container mapping is explicit `127.0.0.1`.
+The live path has been exercised against both MariaDB 11.4 and MySQL 8.4
+containers.
 
 ### Live PostgreSQL fixture
 
