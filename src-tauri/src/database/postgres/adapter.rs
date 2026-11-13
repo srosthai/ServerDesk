@@ -550,6 +550,18 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
         }
     }
 
+    async fn execute_structure_action(
+        &mut self,
+        action: &ValidatedStructureAction,
+    ) -> Result<(), DatabaseError> {
+        self.require_connection()?;
+        let preview = self.preview_structure_action(action).await?;
+        for statement in &preview.statements {
+            self.execute_statement(statement).await?;
+        }
+        Ok(())
+    }
+
     async fn list_schemas(&self, page: PageRequest) -> Result<Page<SchemaSummary>, DatabaseError> {
         self.require_capability(DatabaseAction::BrowseSchemas)?;
         let mut guard = self.live_connection().await?;
@@ -618,6 +630,30 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
             .collect::<Vec<_>>();
 
         Ok(Page::from_items(tables, page, None))
+    }
+
+    async fn table_summary(&self, table: &TableRef) -> Result<Option<TableSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseTables)?;
+        self.ensure_database_matches(table.database.as_ref().map(Identifier::as_str))?;
+        let schema = table.schema.as_ref().map(Identifier::as_str);
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let row = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::TABLE_SUMMARY)
+                .bind(schema)
+                .bind(table.name.as_str())
+                .fetch_optional(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("table", table.name.as_str()))?;
+
+        row.as_ref()
+            .map(PgTableRecord::from_row)
+            .transpose()
+            .map(|record| record.map(PgTableRecord::into_summary))
     }
 
     async fn list_views(
@@ -1368,6 +1404,10 @@ fn map_postgres_error(sql_state: &str) -> DatabaseError {
         "25006" => DatabaseError::permission(
             "The database session is read-only; the statement attempted a write.",
         ),
+        // 2BP01 dependent objects still exist, 23503 foreign-key violation.
+        "2BP01" | "23503" => DatabaseError::dependency(
+            "The operation is blocked by a foreign key or another dependent object.",
+        ),
         // 57014 statement cancelled by a timeout or cancellation request,
         // 55P03 lock not available, 40001 serialization failure.
         "57014" | "55P03" => DatabaseError::timeout("The database operation timed out."),
@@ -1471,6 +1511,8 @@ mod tests {
             ("28000", DatabaseErrorKind::DatabaseAuth),
             ("42501", DatabaseErrorKind::Permission),
             ("25006", DatabaseErrorKind::Permission),
+            ("2BP01", DatabaseErrorKind::Dependency),
+            ("23503", DatabaseErrorKind::Dependency),
             ("57014", DatabaseErrorKind::Timeout),
             ("55P03", DatabaseErrorKind::Timeout),
             ("40001", DatabaseErrorKind::Query),

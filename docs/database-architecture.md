@@ -35,13 +35,14 @@ src-tauri/src/commands/database/
   capabilities.rs   engine/version capability document
   discovery.rs      lazy explorer-node metadata commands
   profiles.rs       saved profile CRUD, test, connect, reconnect, disconnect
+  structure.rs      structure preview and table lifecycle execution + audit
   tunnels.rs        loopback SSH tunnel inspection commands
 
 src-tauri/src/database/
   mod.rs            public re-exports and dialect/capability factories
   traits.rs         DatabaseAdapter and typed metadata
   actions.rs        lifecycle requests, DDL preview, verified result service
-  structure.rs      table/column/index/constraint validation and DDL previews
+  structure.rs      table/column/index/constraint validation, DDL previews, and table execution
   discovery.rs      explorer-node request/response and metadata service
   capabilities.rs   action model, flags, version parsing
   dialect.rs        identifier validation/quoting and value binding
@@ -80,7 +81,9 @@ same adapter contract.
 - one exact database summary re-read after a lifecycle action;
 - engine-specific DDL previews for create, rename, drop, and set-active;
 - engine-specific structure previews for table, column, index, and constraint
-  changes, with no execution path;
+  changes;
+- table lifecycle execution (create, rename, duplicate, truncate, drop) through
+  the validated preview path;
 - lifecycle execution and read-only detection;
 - table, view, sequence, column, index, and constraint metadata;
 - bounded dependency inventories for one table before destructive changes;
@@ -321,26 +324,31 @@ rename, and the drop confirmation names the server, engine, database, exact
 refreshes the databases node and selects the created, renamed, or active
 database.
 
-## Structure preview commands
+## Structure preview and table execution commands
 
-`src-tauri/src/commands/database/structure.rs` owns the preview-only structure
+`src-tauri/src/commands/database/structure.rs` owns the structure command
 surface:
 
 | Command                             | Purpose                                                        |
 | ----------------------------------- | -------------------------------------------------------------- |
 | `preview_database_structure_action` | Validate and generate DDL for one structure change, no execute |
+| `run_database_structure_action`     | Execute one table lifecycle change and verify the result       |
 
 `src-tauri/src/database/structure.rs` validates requests into
 `ValidatedStructureAction` values and asks the adapter for a
 `StructureDdlPreview`. `mysql::ddl` and `postgres::ddl` are pure planners: they
-receive validated identifiers, type names, and typed values only. There is
-deliberately no execute command in this slice; the structure editor in #174
-will add one and must call the same preview/capability path first.
+receive validated identifiers, type names, and typed values only. Execution is
+implemented for table create, rename, duplicate, truncate, and drop; column,
+index, and constraint execution stays with the structure editor in #174, which
+must call the same preview/capability path first. Every execution command
+regenerates the preview before touching the database.
 
 Requests are tagged by `kind` and cover table, column, index, and constraint
 changes:
 
 ```json
+{ "kind": "create_table", "database": "app", "schema": "public", "name": "users", "columns": [{ "name": "id", "dataType": "bigint", "nullable": false, "identity": "by_default" }], "primaryKey": ["id"], "uniqueKeys": [{ "name": "users_email_key", "columns": ["email"] }], "options": { "unlogged": true, "comment": "Users" } }
+{ "kind": "duplicate_table", "database": "app", "schema": "public", "name": "users", "newName": "users_copy" }
 { "kind": "add_column", "database": "app", "table": "users", "column": { "name": "email", "dataType": "varchar(320)", "nullable": false }, "position": { "kind": "after", "column": "id" } }
 { "kind": "create_index", "database": "app", "table": "users", "name": "users_email_idx", "columns": ["email"], "unique": true }
 { "kind": "add_constraint", "table": "orders", "constraint": { "kind": "foreign_key", "name": "orders_user_fk", "columns": ["user_id"], "referencedTable": "users", "referencedColumns": ["id"], "onDelete": "cascade" } }
@@ -372,22 +380,57 @@ comment, or top-level comma. A request that is not a single expression fails
 validation before an engine planner runs.
 
 Capabilities gate type changes, column reorder, table/column/index rename,
-generated columns, identity columns, auto-increment columns, check constraints,
-and partial indexes. MySQL and PostgreSQL add their own restrictions: MySQL
-requires the full column definition for `MODIFY COLUMN`, does not support
-standard identity columns or partial indexes, and has no safe reorder syntax
-other than replacing the full definition; PostgreSQL does not support
-`AUTO_INCREMENT`, virtual generated columns, or stored-column reordering.
-Unsupported actions return a typed `capability` error before any DDL is
-generated. Destructive previews (drop table, truncate, drop column, and type
-changes) set `destructive` and `requiresConfirmation`; previews never execute
-SQL or touch the live session beyond the connection check.
+table duplicate, generated columns, identity columns, auto-increment columns,
+check constraints, and partial indexes. MySQL and PostgreSQL add their own
+restrictions: MySQL requires the full column definition for `MODIFY COLUMN`,
+does not support standard identity columns or partial indexes, and has no safe
+reorder syntax other than replacing the full definition; PostgreSQL does not
+support `AUTO_INCREMENT`, virtual generated columns, or stored-column
+reordering. Unsupported actions return a typed `capability` error before any
+DDL is generated. Destructive previews (drop table, truncate, drop column, and
+type changes) set `destructive` and `requiresConfirmation`; previews never
+execute SQL or touch the live session beyond the connection check.
+
+Table create supports typed columns, a primary key, named unique keys, and
+engine-specific options. MySQL accepts a storage engine, character set,
+collation, and table comment; PostgreSQL accepts `UNLOGGED`, a tablespace, and
+a table comment. Passing a PostgreSQL-only option to MySQL, or the reverse,
+returns a typed `capability` error before DDL is generated. Duplicate copies the
+table definition (`CREATE TABLE ... LIKE` in MySQL and
+`CREATE TABLE ... (LIKE ... INCLUDING ALL)` in PostgreSQL) but never rows or
+foreign keys, and the preview says so.
+
+Execution requires `confirmed: true` for drop and truncate (and any other
+preview marked destructive). A missing confirmation returns `cancelled` and no
+statement runs. Read-only profiles return `permission` before execution. Drop
+and truncate inspect incoming foreign keys and, for drop, dependent views; a
+blocking object returns a typed `dependency` error naming the blockers. Driver
+foreign-key and dependent-object codes map to the same typed error.
+
+After execution the service re-reads the table summary and column list. Create
+verifies the table exists with the expected columns; rename verifies the old
+name is gone and the new name exists; duplicate verifies the target exists and
+its columns match the source; truncate verifies the table still exists and its
+reported row estimate is zero when available; drop verifies the table is absent.
+A failed or partially applied operation returns `verified: false` with a safe
+explanation instead of claiming success.
+
+Audit history records one `database` category row per table action. The safe
+summary names the action, engine, table, and connection profile only when
+metadata verification succeeded, is marked `unknown` when verification fails or
+a timeout/connection error leaves the outcome unclear, and is marked `cancelled`
+when confirmation is missing. Generated DDL, row data, credentials, and driver
+text are never stored.
 
 Golden DDL fixtures live in `src-tauri/tests/fixtures/database_structure/` and
 are compared through the fake adapter by `src-tauri/tests/database_structure_ddl.rs`.
+Table execution tests use the same fake adapter and the opt-in MySQL and
+PostgreSQL container fixtures.
 
 `src/services/databaseStructure.ts` is the only React module that invokes the
-preview command. No structure UI is added in this slice.
+structure commands. It exposes typed preview, create, rename, duplicate,
+truncate, and drop helpers; truncate and drop require an explicit confirmation
+argument. The full structure UI remains #174.
 
 ## Discovery command contract
 
@@ -485,7 +528,7 @@ tree.
 - `CapabilityFlags` for schemas, sequences, materialized views, routines,
   triggers, roles, sessions, transactions, savepoints, cancellation, explain,
   check constraints, generated columns, identity columns, column reordering,
-  database rename, index rename, and query timeouts;
+  table duplicate, database rename, index rename, and query timeouts;
 - the `DatabaseAction` list derived from those flags.
 
 `CapabilitySnapshot` is the only document sent to React. It contains the
@@ -503,55 +546,56 @@ available.
 Version ranges below are minimums. "Both" means the action is available for
 the engine's baseline and every newer supported version.
 
-| Action                      | MySQL                              | PostgreSQL                 |
-| --------------------------- | ---------------------------------- | -------------------------- |
-| `browse_databases`          | Both                               | Both                       |
-| `browse_schemas`            | Both (schema is a database)        | Both                       |
-| `browse_tables`             | Both                               | Both                       |
-| `browse_columns`            | Both                               | Both                       |
-| `browse_indexes`            | Both                               | Both                       |
-| `browse_constraints`        | Both                               | Both                       |
-| `browse_views`              | Both                               | Both                       |
-| `browse_materialized_views` | Not supported                      | 9.3+                       |
-| `browse_sequences`          | Not supported                      | Both                       |
-| `browse_routines`           | Both                               | Both                       |
-| `browse_triggers`           | Both                               | Both                       |
-| `browse_roles`              | 8.0+                               | Both                       |
-| `browse_sessions`           | Both                               | 9.2+                       |
-| `show_object_size`          | Both                               | Both                       |
-| `create_database`           | Both                               | Both                       |
-| `rename_database`           | Not supported                      | Both                       |
-| `drop_database`             | Both                               | Both                       |
-| `set_active_database`       | Both (reopens the session)         | Both (reopens the session) |
-| `create_schema`             | Both (schema is a database)        | Both                       |
-| `drop_schema`               | Both (schema is a database)        | Both                       |
-| `create_table`              | Both                               | Both                       |
-| `rename_table`              | Both                               | Both                       |
-| `truncate_table`            | Both                               | Both                       |
-| `drop_table`                | Both                               | Both                       |
-| `add_column`                | Both                               | Both                       |
-| `edit_column`               | Both                               | Both                       |
-| `rename_column`             | Both                               | Both                       |
-| `drop_column`               | Both                               | Both                       |
-| `reorder_columns`           | Both                               | Not supported              |
-| `create_generated_column`   | 5.7.6+                             | 12+                        |
-| `create_identity_column`    | Not supported (use AUTO_INCREMENT) | 10+                        |
-| `create_index`              | Both                               | Both                       |
-| `rename_index`              | 5.7+                               | 9.2+                       |
-| `drop_index`                | Both                               | Both                       |
-| `create_check_constraint`   | 8.0.16+                            | Both                       |
-| `create_view`               | Both                               | Both                       |
-| `create_routine`            | Both                               | Both                       |
-| `create_trigger`            | Both                               | Both                       |
-| `refresh_materialized_view` | Not supported                      | 9.3+                       |
-| `manage_roles`              | 8.0+                               | Both                       |
-| `kill_session`              | Both                               | 9.2+                       |
-| `cancel_query`              | Both                               | Both                       |
-| `explain_query`             | Both                               | Both                       |
-| `run_query`                 | Both                               | Both                       |
-| `insert_row`                | Both                               | Both                       |
-| `edit_row`                  | Both                               | Both                       |
-| `delete_row`                | Both                               | Both                       |
+| Action                      | MySQL                              | PostgreSQL                      |
+| --------------------------- | ---------------------------------- | ------------------------------- |
+| `browse_databases`          | Both                               | Both                            |
+| `browse_schemas`            | Both (schema is a database)        | Both                            |
+| `browse_tables`             | Both                               | Both                            |
+| `browse_columns`            | Both                               | Both                            |
+| `browse_indexes`            | Both                               | Both                            |
+| `browse_constraints`        | Both                               | Both                            |
+| `browse_views`              | Both                               | Both                            |
+| `browse_materialized_views` | Not supported                      | 9.3+                            |
+| `browse_sequences`          | Not supported                      | Both                            |
+| `browse_routines`           | Both                               | Both                            |
+| `browse_triggers`           | Both                               | Both                            |
+| `browse_roles`              | 8.0+                               | Both                            |
+| `browse_sessions`           | Both                               | 9.2+                            |
+| `show_object_size`          | Both                               | Both                            |
+| `create_database`           | Both                               | Both                            |
+| `rename_database`           | Not supported                      | Both                            |
+| `drop_database`             | Both                               | Both                            |
+| `set_active_database`       | Both (reopens the session)         | Both (reopens the session)      |
+| `create_schema`             | Both (schema is a database)        | Both                            |
+| `drop_schema`               | Both (schema is a database)        | Both                            |
+| `create_table`              | Both                               | Both                            |
+| `rename_table`              | Both                               | Both                            |
+| `duplicate_table`           | Both (`CREATE TABLE ... LIKE`)     | Both (`LIKE ... INCLUDING ALL`) |
+| `truncate_table`            | Both                               | Both                            |
+| `drop_table`                | Both                               | Both                            |
+| `add_column`                | Both                               | Both                            |
+| `edit_column`               | Both                               | Both                            |
+| `rename_column`             | Both                               | Both                            |
+| `drop_column`               | Both                               | Both                            |
+| `reorder_columns`           | Both                               | Not supported                   |
+| `create_generated_column`   | 5.7.6+                             | 12+                             |
+| `create_identity_column`    | Not supported (use AUTO_INCREMENT) | 10+                             |
+| `create_index`              | Both                               | Both                            |
+| `rename_index`              | 5.7+                               | 9.2+                            |
+| `drop_index`                | Both                               | Both                            |
+| `create_check_constraint`   | 8.0.16+                            | Both                            |
+| `create_view`               | Both                               | Both                            |
+| `create_routine`            | Both                               | Both                            |
+| `create_trigger`            | Both                               | Both                            |
+| `refresh_materialized_view` | Not supported                      | 9.3+                            |
+| `manage_roles`              | 8.0+                               | Both                            |
+| `kill_session`              | Both                               | 9.2+                            |
+| `cancel_query`              | Both                               | Both                            |
+| `explain_query`             | Both                               | Both                            |
+| `run_query`                 | Both                               | Both                            |
+| `insert_row`                | Both                               | Both                            |
+| `edit_row`                  | Both                               | Both                            |
+| `delete_row`                | Both                               | Both                            |
 
 Additional version-dependent flags:
 
@@ -681,7 +725,8 @@ The fixture tests cover connect, ping, version, capability flags, read-only
 write rejection, writable probe-table metadata, column identity/generated
 fields, bounded index and constraint metadata, incoming-foreign-key and trigger
 dependencies, typed authentication failure, database create/set-active/drop
-verification, read-only lifecycle permission denial, the unsupported rename
+verification, table create/duplicate/rename/truncate/drop verification,
+read-only lifecycle and table permission denial, the unsupported rename
 explanation, and the unavailable-host path. They bind no public port; the
 container mapping is explicit `127.0.0.1`. The live path has been exercised
 against both MariaDB 11.4 and MySQL 8.4 containers.
@@ -722,10 +767,11 @@ schema listing, schema-scoped table metadata, statistics refresh time,
 cross-database rejection, read-only write rejection, identity/generated column
 detection, column length/precision/collation, index and constraint metadata,
 incoming foreign keys, dependent views, owned sequences, triggers,
-create/rename/set-active/drop verification, read-only lifecycle permission
-denial, active-catalog rename rejection, typed authentication failure, and the
-unavailable-host path. They bind no public port. The live path has been
-exercised against a PostgreSQL 18 container.
+create/rename/set-active/drop verification, table
+create/duplicate/rename/truncate/drop verification, read-only lifecycle and
+table permission denial, active-catalog rename rejection, typed authentication
+failure, and the unavailable-host path. They bind no public port. The live path
+has been exercised against a PostgreSQL 18 container.
 
 ## Current limitations
 
@@ -739,6 +785,9 @@ exercised against a PostgreSQL 18 container.
   concept. Those fields are explicitly unavailable rather than guessed.
 - MySQL has no safe database rename operation. The explorer disables rename
   and explains that a new database plus data migration is required.
+- Table duplicate copies the table definition, indexes, defaults, and comments
+  but not rows or foreign keys. Copying data is deferred to the import/export
+  slice so a duplicate cannot unexpectedly copy a large table.
 - MySQL table row counts are engine estimates (`TABLE_ROWS`); they are not exact.
 - PostgreSQL `reltuples` can remain `-1` until the table is analyzed, so a
   freshly created table reports estimated rows and statistics refresh time as

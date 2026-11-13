@@ -462,6 +462,13 @@ pub trait DatabaseAdapter: Send + Sync {
         action: &ValidatedDatabaseAction,
     ) -> Result<Option<DatabaseConnectionInfo>, DatabaseError>;
 
+    /// Executes one validated structure action after re-running the same
+    /// preview/capability path. The caller verifies metadata afterwards.
+    async fn execute_structure_action(
+        &mut self,
+        action: &ValidatedStructureAction,
+    ) -> Result<(), DatabaseError>;
+
     async fn list_schemas(&self, page: PageRequest) -> Result<Page<SchemaSummary>, DatabaseError>;
 
     async fn list_tables(
@@ -469,6 +476,10 @@ pub trait DatabaseAdapter: Send + Sync {
         scope: &MetadataScope,
         page: PageRequest,
     ) -> Result<Page<TableSummary>, DatabaseError>;
+
+    /// Re-reads one table summary after a structure action. `None` means the
+    /// table is not present in the selected scope.
+    async fn table_summary(&self, table: &TableRef) -> Result<Option<TableSummary>, DatabaseError>;
 
     async fn list_views(
         &self,

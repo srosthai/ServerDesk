@@ -10,6 +10,8 @@
 //! planning step; a future execution command must ask an adapter for the same
 //! preview first so capability checks and read-only checks cannot be bypassed.
 
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{core::AppError, storage::DatabaseEngine};
@@ -17,9 +19,13 @@ use crate::{core::AppError, storage::DatabaseEngine};
 use super::{
     capabilities::{DatabaseAction as CapabilityAction, DatabaseCapabilities},
     dialect::Identifier,
-    errors::DatabaseError,
+    errors::{DatabaseError, DatabaseErrorKind},
+    pagination::{Bounded, MAX_PAGE_LIMIT, PageRequest},
     service::DatabaseConnectionRegistry,
-    traits::{ColumnIdentity, ConstraintKind, DatabaseAdapter, TableRef},
+    traits::{
+        ColumnIdentity, ConstraintKind, DatabaseAdapter, DependencySummary, MetadataValue,
+        TableRef, TableSummary,
+    },
 };
 
 /// Longest accepted data type spelling, including length/precision modifiers.
@@ -48,8 +54,21 @@ pub enum StructureActionRequest {
         columns: Vec<ColumnDefinitionRequest>,
         #[serde(default, rename = "primaryKey", skip_serializing_if = "Vec::is_empty")]
         primary_key: Vec<String>,
+        #[serde(default, rename = "uniqueKeys", skip_serializing_if = "Vec::is_empty")]
+        unique_keys: Vec<UniqueKeyRequest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<TableOptionsRequest>,
     },
     RenameTable {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        database: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schema: Option<String>,
+        name: String,
+        #[serde(rename = "newName")]
+        new_name: String,
+    },
+    DuplicateTable {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         database: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -187,6 +206,7 @@ impl StructureActionRequest {
         match self {
             Self::CreateTable { .. } => StructureActionKind::CreateTable,
             Self::RenameTable { .. } => StructureActionKind::RenameTable,
+            Self::DuplicateTable { .. } => StructureActionKind::DuplicateTable,
             Self::DropTable { .. } => StructureActionKind::DropTable,
             Self::TruncateTable { .. } => StructureActionKind::TruncateTable,
             Self::AddColumn { .. } => StructureActionKind::AddColumn,
@@ -202,6 +222,27 @@ impl StructureActionRequest {
         }
     }
 
+    /// The table name carried by this request, before identifier validation.
+    pub fn table_name(&self) -> Option<&str> {
+        match self {
+            Self::CreateTable { name, .. }
+            | Self::RenameTable { name, .. }
+            | Self::DuplicateTable { name, .. }
+            | Self::DropTable { name, .. }
+            | Self::TruncateTable { name, .. } => Some(name),
+            Self::AddColumn { table, .. }
+            | Self::AlterColumn { table, .. }
+            | Self::RenameColumn { table, .. }
+            | Self::DropColumn { table, .. }
+            | Self::ReorderColumn { table, .. }
+            | Self::CreateIndex { table, .. }
+            | Self::RenameIndex { table, .. }
+            | Self::DropIndex { table, .. }
+            | Self::AddConstraint { table, .. }
+            | Self::DropConstraint { table, .. } => Some(table),
+        }
+    }
+
     /// Validates the complete request before an engine planner sees it.
     pub fn validate(&self) -> Result<ValidatedStructureAction, DatabaseError> {
         match self {
@@ -211,6 +252,8 @@ impl StructureActionRequest {
                 name,
                 columns,
                 primary_key,
+                unique_keys,
+                options,
             } => {
                 let table = table_ref(database, schema, name, "table")?;
                 let columns = validate_columns(columns)?;
@@ -234,11 +277,14 @@ impl StructureActionRequest {
                         }
                     }
                 }
+                let unique_keys = validate_unique_keys(unique_keys, &columns)?;
                 Ok(ValidatedStructureAction::CreateTable(
                     ValidatedCreateTable {
                         table,
                         columns,
                         primary_key,
+                        unique_keys,
+                        options: validate_table_options(options)?,
                     },
                 ))
             }
@@ -252,6 +298,17 @@ impl StructureActionRequest {
                 let new_name = validate_identifier("new table name", new_name)?;
                 ensure_distinct_name(&table.name, &new_name, "table")?;
                 Ok(ValidatedStructureAction::RenameTable { table, new_name })
+            }
+            Self::DuplicateTable {
+                database,
+                schema,
+                name,
+                new_name,
+            } => {
+                let table = table_ref(database, schema, name, "table")?;
+                let new_name = validate_identifier("new table name", new_name)?;
+                ensure_distinct_name(&table.name, &new_name, "table")?;
+                Ok(ValidatedStructureAction::DuplicateTable { table, new_name })
             }
             Self::DropTable {
                 database,
@@ -463,6 +520,10 @@ pub enum ValidatedStructureAction {
         table: TableRef,
         new_name: Identifier,
     },
+    DuplicateTable {
+        table: TableRef,
+        new_name: Identifier,
+    },
     DropTable {
         table: TableRef,
     },
@@ -519,6 +580,7 @@ impl ValidatedStructureAction {
         match self {
             Self::CreateTable(_) => StructureActionKind::CreateTable,
             Self::RenameTable { .. } => StructureActionKind::RenameTable,
+            Self::DuplicateTable { .. } => StructureActionKind::DuplicateTable,
             Self::DropTable { .. } => StructureActionKind::DropTable,
             Self::TruncateTable { .. } => StructureActionKind::TruncateTable,
             Self::AddColumn { .. } => StructureActionKind::AddColumn,
@@ -538,6 +600,7 @@ impl ValidatedStructureAction {
         match self {
             Self::CreateTable(options) => &options.table,
             Self::RenameTable { table, .. }
+            | Self::DuplicateTable { table, .. }
             | Self::DropTable { table }
             | Self::TruncateTable { table }
             | Self::AddColumn { table, .. }
@@ -566,6 +629,7 @@ impl ValidatedStructureAction {
         match self {
             Self::CreateTable(_)
             | Self::RenameTable { .. }
+            | Self::DuplicateTable { .. }
             | Self::DropTable { .. }
             | Self::TruncateTable { .. } => {}
             Self::AddColumn { column, .. } | Self::ReorderColumn { column, .. } => {
@@ -605,6 +669,7 @@ impl ValidatedStructureAction {
         match self {
             Self::CreateTable(_) => Some(CapabilityAction::CreateTable),
             Self::RenameTable { .. } => Some(CapabilityAction::RenameTable),
+            Self::DuplicateTable { .. } => Some(CapabilityAction::DuplicateTable),
             Self::DropTable { .. } => Some(CapabilityAction::DropTable),
             Self::TruncateTable { .. } => Some(CapabilityAction::TruncateTable),
             Self::AddColumn { .. } => Some(CapabilityAction::AddColumn),
@@ -703,6 +768,30 @@ pub struct ValidatedCreateTable {
     pub table: TableRef,
     pub columns: Vec<ValidatedColumnDefinition>,
     pub primary_key: Vec<Identifier>,
+    pub unique_keys: Vec<ValidatedUniqueKey>,
+    pub options: ValidatedTableOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedUniqueKey {
+    pub name: Identifier,
+    pub columns: Vec<Identifier>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ValidatedTableOptions {
+    /// MySQL storage engine, for example `InnoDB`.
+    pub engine: Option<String>,
+    /// MySQL database character set.
+    pub charset: Option<String>,
+    /// MySQL database collation.
+    pub collation: Option<String>,
+    /// PostgreSQL tablespace.
+    pub tablespace: Option<Identifier>,
+    /// PostgreSQL unlogged-table option.
+    pub unlogged: bool,
+    /// Optional table comment, rendered with engine-specific syntax.
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -854,6 +943,32 @@ pub struct GeneratedColumnRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UniqueKeyRequest {
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
+/// Optional table-level options. Each engine supports a different subset; the
+/// engine planner rejects an option the selected server cannot express.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableOptionsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tablespace: Option<String>,
+    #[serde(default)]
+    pub unlogged: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ColumnPositionRequest {
     First,
@@ -925,6 +1040,7 @@ impl ReferentialAction {
 pub enum StructureActionKind {
     CreateTable,
     RenameTable,
+    DuplicateTable,
     DropTable,
     TruncateTable,
     AddColumn,
@@ -944,6 +1060,7 @@ impl StructureActionKind {
         match self {
             Self::CreateTable => "create_table",
             Self::RenameTable => "rename_table",
+            Self::DuplicateTable => "duplicate_table",
             Self::DropTable => "drop_table",
             Self::TruncateTable => "truncate_table",
             Self::AddColumn => "add_column",
@@ -999,7 +1116,30 @@ pub struct StructureDdlPreview {
     pub requires_confirmation: bool,
 }
 
-/// Stateless preview service used by the structure command.
+/// Verified outcome of one structure action. The statements are safe to show
+/// because they contain only validated identifiers and typed values; row data is
+/// never selected or returned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StructureActionResult {
+    pub action: StructureActionKind,
+    pub engine: DatabaseEngine,
+    pub object: AffectedObject,
+    /// New table name for rename and duplicate actions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_table: Option<String>,
+    pub statements: Vec<String>,
+    pub warnings: Vec<String>,
+    pub verified: bool,
+    pub verification: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<TableSummary>,
+    pub duration_ms: u64,
+}
+
+/// Stateless preview/execute service used by the structure commands.
 pub struct DatabaseStructureService<'a> {
     connections: &'a DatabaseConnectionRegistry,
 }
@@ -1020,17 +1160,530 @@ impl<'a> DatabaseStructureService<'a> {
             .await
             .map_err(AppError::from)
     }
+
+    pub async fn execute(
+        &self,
+        profile_id: &str,
+        request: StructureActionRequest,
+        confirmed: bool,
+    ) -> Result<StructureActionResult, AppError> {
+        let adapter = self.connections.adapter(profile_id).await?;
+        let mut adapter = adapter.lock().await;
+        execute_structure_with_adapter(adapter.as_mut(), request, confirmed)
+            .await
+            .map_err(AppError::from)
+    }
 }
 
-/// Validates a request and asks the adapter for a preview. There is no execute
-/// counterpart in this module yet; when one is added it must call this function
-/// or [`DatabaseAdapter::preview_structure_action`] first.
+/// Validates a request and asks the adapter for a preview. Execution always
+/// calls this same path first so a caller cannot skip capability checks, the
+/// read-only gate, or confirmation.
 pub async fn preview_structure_with_adapter(
     adapter: &dyn DatabaseAdapter,
     request: &StructureActionRequest,
 ) -> Result<StructureDdlPreview, DatabaseError> {
     let validated = request.validate()?;
     adapter.preview_structure_action(&validated).await
+}
+
+/// Executes one validated structure action and re-reads metadata before
+/// reporting success.
+pub async fn execute_structure_with_adapter(
+    adapter: &mut dyn DatabaseAdapter,
+    request: StructureActionRequest,
+    confirmed: bool,
+) -> Result<StructureActionResult, DatabaseError> {
+    let started = Instant::now();
+    let validated = request.validate()?;
+    let preview = adapter.preview_structure_action(&validated).await?;
+
+    if !matches!(
+        validated,
+        ValidatedStructureAction::CreateTable(_)
+            | ValidatedStructureAction::RenameTable { .. }
+            | ValidatedStructureAction::DuplicateTable { .. }
+            | ValidatedStructureAction::TruncateTable { .. }
+            | ValidatedStructureAction::DropTable { .. }
+    ) {
+        return Err(DatabaseError::capability(
+            "This build executes only table create, rename, duplicate, truncate, and drop. Column, \
+             index, and constraint execution arrives with the structure editor.",
+        ));
+    }
+
+    if preview.requires_confirmation && !confirmed {
+        return Err(DatabaseError::cancelled(format!(
+            "The {} action for table {} was cancelled because it was not confirmed.",
+            validated.kind().as_str(),
+            validated.table().name
+        ))
+        .with_details(
+            "No statement was executed. Review the server, engine, table, dependencies, and the \
+             exact preview, then confirm the destructive action.",
+        ));
+    }
+
+    if adapter.is_read_only() {
+        return Err(DatabaseError::permission(
+            "The database connection profile is read-only; table structure changes require a \
+             writable connection.",
+        )
+        .with_scope("table", validated.table().name.as_str()));
+    }
+
+    ensure_no_blocking_dependencies(adapter, &validated).await?;
+    adapter.execute_structure_action(&validated).await?;
+
+    let verification = verify_structure_action(adapter, &validated).await;
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    Ok(StructureActionResult {
+        action: validated.kind(),
+        engine: adapter.engine(),
+        object: preview.object,
+        target_table: validated.target_table_name().map(str::to_string),
+        statements: preview.statements,
+        warnings: preview.warnings,
+        verified: verification.verified,
+        verification: verification.summary,
+        verification_error: verification.error,
+        metadata: verification.metadata,
+        duration_ms,
+    })
+}
+
+impl ValidatedStructureAction {
+    /// New table name for rename and duplicate actions.
+    pub fn target_table_name(&self) -> Option<&str> {
+        match self {
+            Self::RenameTable { new_name, .. } | Self::DuplicateTable { new_name, .. } => {
+                Some(new_name.as_str())
+            }
+            _ => None,
+        }
+    }
+}
+
+async fn ensure_no_blocking_dependencies(
+    adapter: &dyn DatabaseAdapter,
+    action: &ValidatedStructureAction,
+) -> Result<(), DatabaseError> {
+    let (check_foreign_keys, check_views) = match action {
+        ValidatedStructureAction::DropTable { .. } => (true, true),
+        ValidatedStructureAction::TruncateTable { .. } => (true, false),
+        _ => return Ok(()),
+    };
+
+    let dependencies = match adapter.table_dependencies(action.table(), 20).await {
+        Ok(dependencies) => dependencies,
+        // Unqualified names resolve through the connection's active
+        // database/search_path. The adapter cannot inventory dependencies
+        // without an explicit scope, so the engine's own dependency error
+        // remains the fallback.
+        Err(error)
+            if error.kind == DatabaseErrorKind::Validation && action.table().schema.is_none() =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut blockers = Vec::new();
+    if check_foreign_keys {
+        collect_dependency_names(
+            &mut blockers,
+            "incoming foreign key",
+            &dependencies.incoming_foreign_keys,
+        );
+    }
+    if check_views {
+        collect_dependency_names(
+            &mut blockers,
+            "dependent view",
+            &dependencies.dependent_views,
+        );
+    }
+
+    if blockers.is_empty() {
+        return Ok(());
+    }
+
+    let action_label = if matches!(action, ValidatedStructureAction::DropTable { .. }) {
+        "drop"
+    } else {
+        "truncate"
+    };
+    Err(DatabaseError::dependency(format!(
+        "Cannot {action_label} table {} because {} object(s) depend on it.",
+        action.table().name,
+        blockers.len()
+    ))
+    .with_details(format!(
+        "Remove or retarget these dependencies first: {}.",
+        blockers.join(", ")
+    ))
+    .with_scope("table", action.table().name.as_str()))
+}
+
+fn collect_dependency_names(
+    target: &mut Vec<String>,
+    label: &str,
+    group: &MetadataValue<Bounded<DependencySummary>>,
+) {
+    let Some(group) = group.value() else {
+        return;
+    };
+    for dependency in &group.items {
+        let mut name = format!("{label} {}", dependency.name);
+        if let Some(table) = dependency.table.as_deref()
+            && table != dependency.name
+        {
+            name.push_str(&format!(" on {table}"));
+        }
+        target.push(name);
+    }
+}
+
+struct StructureVerification {
+    verified: bool,
+    summary: String,
+    error: Option<String>,
+    metadata: Option<TableSummary>,
+}
+
+impl StructureVerification {
+    fn success(summary: String, metadata: Option<TableSummary>) -> Self {
+        Self {
+            verified: true,
+            summary,
+            error: None,
+            metadata,
+        }
+    }
+
+    fn failure(summary: String, error: String) -> Self {
+        Self {
+            verified: false,
+            summary,
+            error: Some(error),
+            metadata: None,
+        }
+    }
+}
+
+async fn verify_structure_action(
+    adapter: &dyn DatabaseAdapter,
+    action: &ValidatedStructureAction,
+) -> StructureVerification {
+    match action {
+        ValidatedStructureAction::CreateTable(options) => {
+            let table = &options.table;
+            let expected = options
+                .columns
+                .iter()
+                .map(|column| column.name.as_str().to_string())
+                .collect::<Vec<_>>();
+            match adapter.table_summary(table).await {
+                Ok(Some(metadata)) => {
+                    let target = resolved_table_ref(table, &metadata);
+                    match verify_table_columns(adapter, &target, &expected).await {
+                        Ok(None) => StructureVerification::success(
+                            format!(
+                                "Metadata re-read confirms table {} exists with the expected {} column(s){}.",
+                                table.name,
+                                expected.len(),
+                                table_metadata_detail(&metadata)
+                            ),
+                            Some(metadata),
+                        ),
+                        Ok(Some(problem)) => StructureVerification::failure(
+                            format!(
+                                "The create action finished, but table {} does not match the expected \
+                                 definition.",
+                                table.name
+                            ),
+                            problem,
+                        ),
+                        Err(error) => verification_error(&table.name, &error),
+                    }
+                }
+                Ok(None) => StructureVerification::failure(
+                    format!(
+                        "The create action finished, but metadata does not list table {}.",
+                        table.name
+                    ),
+                    "The table was not present in metadata after the create action.".to_string(),
+                ),
+                Err(error) => verification_error(&table.name, &error),
+            }
+        }
+        ValidatedStructureAction::RenameTable { table, new_name } => {
+            let renamed = table_ref_with_name(table, new_name);
+            let renamed_result = adapter.table_summary(&renamed).await;
+            let previous_result = adapter.table_summary(table).await;
+            match (renamed_result, previous_result) {
+                (Ok(Some(metadata)), Ok(None)) => StructureVerification::success(
+                    format!(
+                        "Metadata re-read confirms table {} was renamed to {}.",
+                        table.name, new_name
+                    ),
+                    Some(metadata),
+                ),
+                (Ok(None), _) => StructureVerification::failure(
+                    format!(
+                        "The rename action finished, but metadata does not list table {new_name}."
+                    ),
+                    "The new table name was not present in metadata after the rename action."
+                        .to_string(),
+                ),
+                (Ok(Some(_)), Ok(Some(_))) => StructureVerification::failure(
+                    format!(
+                        "The rename action finished, but metadata still lists both {} and {}.",
+                        table.name, new_name
+                    ),
+                    "Both the previous and new table names are present after the rename."
+                        .to_string(),
+                ),
+                (Err(error), _) | (_, Err(error)) => verification_error(&table.name, &error),
+            }
+        }
+        ValidatedStructureAction::DuplicateTable { table, new_name } => {
+            let duplicate = table_ref_with_name(table, new_name);
+            match adapter.table_summary(&duplicate).await {
+                Ok(Some(metadata)) => {
+                    let target_duplicate = resolved_table_ref(&duplicate, &metadata);
+                    let source = match adapter.table_summary(table).await {
+                        Ok(Some(source)) => resolved_table_ref(table, &source),
+                        Ok(None) => table.clone(),
+                        Err(error) => return verification_error(&table.name, &error),
+                    };
+                    match verify_duplicate_columns(adapter, &source, &target_duplicate).await {
+                        Ok(None) => StructureVerification::success(
+                            format!(
+                                "Metadata re-read confirms table {} was duplicated as {} with the \
+                                 same column definition.",
+                                table.name, new_name
+                            ),
+                            Some(metadata),
+                        ),
+                        Ok(Some(problem)) => StructureVerification::failure(
+                            format!(
+                                "The duplicate action finished, but table {new_name} does not match \
+                                 its source definition."
+                            ),
+                            problem,
+                        ),
+                        Err(error) => verification_error(new_name, &error),
+                    }
+                }
+                Ok(None) => StructureVerification::failure(
+                    format!(
+                        "The duplicate action finished, but metadata does not list table {new_name}."
+                    ),
+                    "The duplicate table was not present in metadata.".to_string(),
+                ),
+                Err(error) => verification_error(new_name, &error),
+            }
+        }
+        ValidatedStructureAction::TruncateTable { table } => {
+            match adapter.table_summary(table).await {
+                Ok(Some(metadata)) => {
+                    let rows = metadata.estimated_rows.value().copied();
+                    if rows.is_some_and(|rows| rows > 0) {
+                        StructureVerification::failure(
+                            format!(
+                                "The truncate action finished, but metadata still reports {} \
+                                 estimated row(s) for table {}.",
+                                rows.unwrap_or_default(),
+                                table.name
+                            ),
+                            "The table appears to contain rows after the truncate action."
+                                .to_string(),
+                        )
+                    } else if rows == Some(0) {
+                        StructureVerification::success(
+                            format!(
+                                "Metadata re-read confirms table {} exists and reports no rows{}.",
+                                table.name,
+                                table_metadata_detail(&metadata)
+                            ),
+                            Some(metadata),
+                        )
+                    } else {
+                        StructureVerification::success(
+                            format!(
+                                "Metadata re-read confirms table {} still exists. The engine does \
+                                 not report an exact row estimate, so emptiness could not be \
+                                 checked.",
+                                table.name
+                            ),
+                            Some(metadata),
+                        )
+                    }
+                }
+                Ok(None) => StructureVerification::failure(
+                    format!(
+                        "The truncate action finished, but metadata does not list table {}.",
+                        table.name
+                    ),
+                    "The table was not present in metadata after the truncate action.".to_string(),
+                ),
+                Err(error) => verification_error(&table.name, &error),
+            }
+        }
+        ValidatedStructureAction::DropTable { table } => match adapter.table_summary(table).await {
+            Ok(None) => StructureVerification::success(
+                format!(
+                    "Metadata re-read confirms table {} is no longer present.",
+                    table.name
+                ),
+                None,
+            ),
+            Ok(Some(_)) => StructureVerification::failure(
+                format!(
+                    "The drop action finished, but metadata still lists table {}.",
+                    table.name
+                ),
+                "The table was still present in metadata after the drop action.".to_string(),
+            ),
+            Err(error) => verification_error(&table.name, &error),
+        },
+        // Non-table actions keep the preview-only contract from #170.
+        _ => StructureVerification::success(
+            "The structure action finished; no automatic table verification applies.".to_string(),
+            None,
+        ),
+    }
+}
+
+async fn verify_table_columns(
+    adapter: &dyn DatabaseAdapter,
+    table: &TableRef,
+    expected: &[String],
+) -> Result<Option<String>, DatabaseError> {
+    let page = adapter
+        .list_columns(table, PageRequest::new(MAX_PAGE_LIMIT, 0))
+        .await?;
+    let actual = page
+        .items
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    compare_column_names(expected, &actual, page.has_more)
+}
+
+async fn verify_duplicate_columns(
+    adapter: &dyn DatabaseAdapter,
+    source: &TableRef,
+    duplicate: &TableRef,
+) -> Result<Option<String>, DatabaseError> {
+    let source_page = adapter
+        .list_columns(source, PageRequest::new(MAX_PAGE_LIMIT, 0))
+        .await?;
+    let duplicate_page = adapter
+        .list_columns(duplicate, PageRequest::new(MAX_PAGE_LIMIT, 0))
+        .await?;
+    let source_names = source_page
+        .items
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    let duplicate_names = duplicate_page
+        .items
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    if let Some(problem) = compare_column_names(&source_names, &duplicate_names, false)? {
+        return Ok(Some(problem));
+    }
+    if source_page.has_more != duplicate_page.has_more {
+        return Ok(Some(
+            "The duplicate and source tables report different column counts.".to_string(),
+        ));
+    }
+    Ok(None)
+}
+
+fn compare_column_names(
+    expected: &[String],
+    actual: &[String],
+    has_more: bool,
+) -> Result<Option<String>, DatabaseError> {
+    if has_more {
+        return Ok(Some(format!(
+            "The table has more than {MAX_PAGE_LIMIT} columns, so the complete column list could \
+             not be verified."
+        )));
+    }
+    if expected.len() != actual.len() {
+        return Ok(Some(format!(
+            "Expected {} column(s), but metadata reports {}.",
+            expected.len(),
+            actual.len()
+        )));
+    }
+    for (expected, actual) in expected.iter().zip(actual) {
+        if !expected.eq_ignore_ascii_case(actual) {
+            return Ok(Some(format!(
+                "Expected column {expected}, but metadata reports {actual}."
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn table_ref_with_name(table: &TableRef, name: &Identifier) -> TableRef {
+    TableRef {
+        database: table.database.clone(),
+        schema: table.schema.clone(),
+        name: name.clone(),
+    }
+}
+
+fn resolved_table_ref(table: &TableRef, metadata: &TableSummary) -> TableRef {
+    TableRef {
+        database: metadata
+            .database
+            .as_deref()
+            .map(Identifier::new)
+            .transpose()
+            .ok()
+            .flatten()
+            .or_else(|| table.database.clone()),
+        schema: metadata
+            .schema
+            .as_deref()
+            .map(Identifier::new)
+            .transpose()
+            .ok()
+            .flatten()
+            .or_else(|| table.schema.clone()),
+        name: table.name.clone(),
+    }
+}
+
+fn verification_error(name: &Identifier, error: &DatabaseError) -> StructureVerification {
+    StructureVerification::failure(
+        format!(
+            "The structure action finished, but metadata for {} could not be re-read.",
+            name
+        ),
+        error.message.clone(),
+    )
+}
+
+fn table_metadata_detail(metadata: &TableSummary) -> String {
+    let mut details = Vec::new();
+    if let Some(engine) = metadata.metadata.engine.value() {
+        details.push(format!("engine {engine}"));
+    }
+    if let Some(rows) = metadata.estimated_rows.value() {
+        details.push(format!("estimated rows {rows}"));
+    }
+    if details.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", details.join(", "))
+    }
 }
 
 fn table_ref(
@@ -1074,6 +1727,96 @@ fn ensure_distinct_name(
         )));
     }
     Ok(())
+}
+
+fn validate_unique_keys(
+    keys: &[UniqueKeyRequest],
+    columns: &[ValidatedColumnDefinition],
+) -> Result<Vec<ValidatedUniqueKey>, DatabaseError> {
+    if keys.len() > MAX_COLUMN_LIST_LENGTH {
+        return Err(DatabaseError::validation(format!(
+            "A new table cannot include more than {MAX_COLUMN_LIST_LENGTH} unique keys in one preview."
+        )));
+    }
+    let mut validated = Vec::with_capacity(keys.len());
+    for key in keys {
+        let name = validate_identifier("unique key name", &key.name)?;
+        let key_columns = validate_column_list("unique key columns", &key.columns)?;
+        if key_columns.is_empty() {
+            return Err(DatabaseError::validation(
+                "A unique key must include at least one column.",
+            ));
+        }
+        for key_column in &key_columns {
+            let Some(_column) = columns
+                .iter()
+                .find(|column| column.name.as_str() == key_column.as_str())
+            else {
+                return Err(DatabaseError::validation(format!(
+                    "The unique key column {key_column} is not part of the new table."
+                )));
+            };
+        }
+        if validated
+            .iter()
+            .any(|existing: &ValidatedUniqueKey| existing.name == name)
+        {
+            return Err(DatabaseError::validation(format!(
+                "The unique key {name} appears more than once in the table definition."
+            )));
+        }
+        validated.push(ValidatedUniqueKey {
+            name,
+            columns: key_columns,
+        });
+    }
+    Ok(validated)
+}
+
+fn validate_table_options(
+    options: &Option<TableOptionsRequest>,
+) -> Result<ValidatedTableOptions, DatabaseError> {
+    let Some(options) = options else {
+        return Ok(ValidatedTableOptions::default());
+    };
+    let comment = options
+        .comment
+        .as_deref()
+        .map(|value| validate_comment("table comment", value))
+        .transpose()?;
+    Ok(ValidatedTableOptions {
+        engine: validate_option_name("storage engine", options.engine.as_deref())?,
+        charset: validate_option_name("character set", options.charset.as_deref())?,
+        collation: validate_option_name("collation", options.collation.as_deref())?,
+        tablespace: options
+            .tablespace
+            .as_deref()
+            .map(|value| validate_identifier("tablespace", value))
+            .transpose()?,
+        unlogged: options.unlogged,
+        comment,
+    })
+}
+
+fn validate_option_name(label: &str, value: Option<&str>) -> Result<Option<String>, DatabaseError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() || value.len() > MAX_DATA_TYPE_LENGTH {
+        return Err(DatabaseError::validation(format!(
+            "The table {label} must be between 1 and {MAX_DATA_TYPE_LENGTH} characters."
+        )));
+    }
+    if !value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        return Err(DatabaseError::validation(format!(
+            "The table {label} contains unsupported characters."
+        )));
+    }
+    Ok(Some(value.to_string()))
 }
 
 fn validate_columns(
@@ -1942,6 +2685,8 @@ mod tests {
                 name: "users".to_string(),
                 columns: vec![column("Email"), column("email")],
                 primary_key: Vec::new(),
+                unique_keys: Vec::new(),
+                options: None,
             }
             .validate()
             .is_err()
@@ -1953,6 +2698,8 @@ mod tests {
                 name: "users".to_string(),
                 columns: vec![column("id")],
                 primary_key: vec!["missing".to_string()],
+                unique_keys: Vec::new(),
+                options: None,
             }
             .validate()
             .is_err()
@@ -1977,5 +2724,116 @@ mod tests {
     fn expression_depth_is_balanced_across_quoted_values() {
         assert!(validate_expression("check", "concat('(', email) <> ''").is_ok());
         assert!(validate_expression("check", "concat(')', email) <> ''").is_ok());
+    }
+
+    #[test]
+    fn create_table_validates_unique_keys_and_engine_options() {
+        let mut email = column("email");
+        email.data_type = "varchar(320)".to_string();
+        let request = StructureActionRequest::CreateTable {
+            database: Some("app".to_string()),
+            schema: None,
+            name: "users".to_string(),
+            columns: vec![column("id"), email],
+            primary_key: vec!["id".to_string()],
+            unique_keys: vec![UniqueKeyRequest {
+                name: "users_email_key".to_string(),
+                columns: vec!["email".to_string()],
+            }],
+            options: Some(TableOptionsRequest {
+                engine: Some("InnoDB".to_string()),
+                charset: Some("utf8mb4".to_string()),
+                collation: Some("utf8mb4_unicode_ci".to_string()),
+                tablespace: None,
+                unlogged: false,
+                comment: Some("Users table".to_string()),
+            }),
+        };
+        let validated = request.validate().expect("valid table");
+        let ValidatedStructureAction::CreateTable(options) = validated else {
+            panic!("create table");
+        };
+        assert_eq!(options.unique_keys.len(), 1);
+        assert_eq!(options.options.engine.as_deref(), Some("InnoDB"));
+        assert_eq!(options.options.charset.as_deref(), Some("utf8mb4"));
+
+        let missing_column = StructureActionRequest::CreateTable {
+            database: None,
+            schema: None,
+            name: "users".to_string(),
+            columns: vec![column("id")],
+            primary_key: Vec::new(),
+            unique_keys: vec![UniqueKeyRequest {
+                name: "users_email_key".to_string(),
+                columns: vec!["email".to_string()],
+            }],
+            options: None,
+        };
+        assert!(missing_column.validate().is_err());
+
+        let duplicate_key_names = StructureActionRequest::CreateTable {
+            database: None,
+            schema: None,
+            name: "users".to_string(),
+            columns: vec![column("id")],
+            primary_key: Vec::new(),
+            unique_keys: vec![
+                UniqueKeyRequest {
+                    name: "same".to_string(),
+                    columns: vec!["id".to_string()],
+                },
+                UniqueKeyRequest {
+                    name: "same".to_string(),
+                    columns: vec!["id".to_string()],
+                },
+            ],
+            options: None,
+        };
+        assert!(duplicate_key_names.validate().is_err());
+
+        let bad_option = StructureActionRequest::CreateTable {
+            database: None,
+            schema: None,
+            name: "users".to_string(),
+            columns: vec![column("id")],
+            primary_key: Vec::new(),
+            unique_keys: Vec::new(),
+            options: Some(TableOptionsRequest {
+                engine: Some("InnoDB; DROP TABLE users".to_string()),
+                ..TableOptionsRequest::default()
+            }),
+        };
+        assert!(bad_option.validate().is_err());
+    }
+
+    #[test]
+    fn duplicate_table_requires_a_new_name_and_uses_the_duplicate_capability() {
+        let request = StructureActionRequest::DuplicateTable {
+            database: Some("app".to_string()),
+            schema: None,
+            name: "users".to_string(),
+            new_name: "users_copy".to_string(),
+        };
+        let validated = request.validate().expect("valid duplicate");
+        assert_eq!(validated.kind(), StructureActionKind::DuplicateTable);
+        assert_eq!(validated.target_table_name(), Some("users_copy"));
+        assert_eq!(
+            validated.capability(),
+            Some(CapabilityAction::DuplicateTable)
+        );
+        validated
+            .ensure_supported(&capabilities(DatabaseEngine::Mysql, "5.7.44"))
+            .expect("duplicate is baseline");
+        validated
+            .ensure_supported(&capabilities(DatabaseEngine::Postgresql, "9.6.24"))
+            .expect("duplicate is baseline");
+
+        let same_name = StructureActionRequest::DuplicateTable {
+            database: Some("app".to_string()),
+            schema: None,
+            name: "users".to_string(),
+            new_name: "users".to_string(),
+        };
+        assert!(same_name.validate().is_err());
     }
 }

@@ -294,6 +294,7 @@ export type DatabaseAction =
   | "drop_schema"
   | "create_table"
   | "rename_table"
+  | "duplicate_table"
   | "truncate_table"
   | "drop_table"
   | "add_column"
@@ -341,6 +342,7 @@ export type CapabilityFlags = {
   columnTypeChange: boolean;
   columnRename: boolean;
   tableRename: boolean;
+  tableDuplicate: boolean;
   columnReorder: boolean;
   databaseRename: boolean;
   indexRename: boolean;
@@ -639,6 +641,20 @@ export type DatabaseColumnDefinitionInput = {
 
 export type DatabaseColumnPositionInput = { kind: "first" } | { kind: "after"; column: string };
 
+export type DatabaseUniqueKeyInput = {
+  name: string;
+  columns: string[];
+};
+
+export type DatabaseTableOptionsInput = {
+  engine?: string | null;
+  charset?: string | null;
+  collation?: string | null;
+  tablespace?: string | null;
+  unlogged?: boolean;
+  comment?: string | null;
+};
+
 export type DatabaseReferentialAction =
   "no_action" | "restrict" | "cascade" | "set_null" | "set_default";
 
@@ -668,8 +684,11 @@ export type DatabaseStructureActionRequest =
       name: string;
       columns: DatabaseColumnDefinitionInput[];
       primaryKey?: string[];
+      uniqueKeys?: DatabaseUniqueKeyInput[];
+      options?: DatabaseTableOptionsInput | null;
     } & DatabaseStructureTableScope)
   | ({ kind: "rename_table"; name: string; newName: string } & DatabaseStructureTableScope)
+  | ({ kind: "duplicate_table"; name: string; newName: string } & DatabaseStructureTableScope)
   | ({ kind: "drop_table"; name: string } & DatabaseStructureTableScope)
   | ({ kind: "truncate_table"; name: string } & DatabaseStructureTableScope)
   | ({
@@ -733,6 +752,7 @@ export type DatabaseStructureActionRequest =
 export type DatabaseStructureActionKind =
   | "create_table"
   | "rename_table"
+  | "duplicate_table"
   | "drop_table"
   | "truncate_table"
   | "add_column"
@@ -765,6 +785,20 @@ export type DatabaseStructureDdlPreview = {
   warnings: string[];
   destructive: boolean;
   requiresConfirmation: boolean;
+};
+
+export type DatabaseStructureActionResult = {
+  action: DatabaseStructureActionKind;
+  engine: DatabaseEngine;
+  object: DatabaseAffectedObject;
+  targetTable?: string | null;
+  statements: string[];
+  warnings: string[];
+  verified: boolean;
+  verification: string;
+  verificationError?: string | null;
+  metadata?: DatabaseTableSummary | null;
+  durationMs: number;
 };
 
 export type ProjectType = "laravel";
