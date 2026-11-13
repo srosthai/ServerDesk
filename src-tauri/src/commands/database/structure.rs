@@ -1,10 +1,11 @@
 //! Structure-change preview and execution commands.
 //!
-//! Execution covers table lifecycle plus column add, edit, rename, drop, and
-//! reorder. Every execution re-validates the request, regenerates the DDL
-//! preview, refuses an unconfirmed destructive action, rejects read-only
-//! profiles, checks blocking dependencies, and re-reads metadata before
-//! reporting success. The full structure editor is #174.
+//! Execution covers table lifecycle, column add/edit/rename/drop/reorder, index
+//! create/rename/drop, and primary-key, unique, foreign-key, and check
+//! constraint add/drop. Every execution re-validates the request, regenerates
+//! the DDL preview, refuses an unconfirmed destructive action, rejects
+//! read-only profiles, checks blocking dependencies, and re-reads metadata
+//! before reporting success. The full structure editor is #174.
 
 use std::time::Instant;
 
@@ -266,6 +267,31 @@ fn verified_structure_summary(
              verified its position",
             object.name.as_deref().unwrap_or("the requested column")
         ),
+        "create_index" => format!(
+            "Created index {} on table {label} on {engine} connection {profile_name} and verified \
+             its metadata",
+            object.name.as_deref().unwrap_or("the requested index")
+        ),
+        "rename_index" => format!(
+            "Renamed index {} on table {label} on {engine} connection {profile_name} and verified \
+             the new name",
+            object.name.as_deref().unwrap_or("the requested index")
+        ),
+        "drop_index" => format!(
+            "Dropped index {} from table {label} on {engine} connection {profile_name} and \
+             verified it is absent",
+            object.name.as_deref().unwrap_or("the requested index")
+        ),
+        "add_constraint" => format!(
+            "Added constraint {} to table {label} on {engine} connection {profile_name} and \
+             verified its metadata",
+            object.name.as_deref().unwrap_or("the requested constraint")
+        ),
+        "drop_constraint" => format!(
+            "Dropped constraint {} from table {label} on {engine} connection {profile_name} and \
+             verified it is absent",
+            object.name.as_deref().unwrap_or("the requested constraint")
+        ),
         _ if object.name.is_some() => format!(
             "Completed the {action} action for {} on {engine} connection {profile_name} and \
              verified its metadata",
@@ -322,6 +348,26 @@ mod tests {
     fn column_object(table: &str, name: &str) -> AffectedObject {
         AffectedObject {
             kind: StructureObjectKind::Column,
+            database: Some("app".to_string()),
+            schema: Some("public".to_string()),
+            table: table.to_string(),
+            name: Some(name.to_string()),
+        }
+    }
+
+    fn index_object(table: &str, name: &str) -> AffectedObject {
+        AffectedObject {
+            kind: StructureObjectKind::Index,
+            database: Some("app".to_string()),
+            schema: Some("public".to_string()),
+            table: table.to_string(),
+            name: Some(name.to_string()),
+        }
+    }
+
+    fn constraint_object(table: &str, name: &str) -> AffectedObject {
+        AffectedObject {
+            kind: StructureObjectKind::Constraint,
             database: Some("app".to_string()),
             schema: Some("public".to_string()),
             table: table.to_string(),
@@ -491,6 +537,102 @@ mod tests {
             row.output_summary
                 .as_deref()
                 .is_some_and(|output| !output.contains("super-secret-default"))
+        );
+    }
+
+    #[test]
+    fn index_and_constraint_history_summaries_never_include_ddl() {
+        let mut index_outcome = result(StructureActionKind::CreateIndex, true);
+        index_outcome.object = index_object("accounts", "accounts_email_idx");
+        index_outcome.statements = vec![
+            "CREATE UNIQUE INDEX \"accounts_email_idx\" ON \"public\".\"accounts\" (\"email\")"
+                .to_string(),
+        ];
+        let object = index_outcome.object.clone();
+        let (status, summary, output) = history_outcome(
+            "create_index",
+            "PostgreSQL",
+            "app.public.accounts",
+            &object,
+            "Primary",
+            &Ok(index_outcome),
+        );
+        assert_eq!(status, OperationResult::Success);
+        assert!(summary.contains("Created index accounts_email_idx"));
+        assert!(!summary.contains("CREATE"));
+        assert!(output.is_some_and(|output| !output.contains("CREATE")));
+
+        let mut constraint_outcome = result(StructureActionKind::DropConstraint, true);
+        constraint_outcome.object = constraint_object("orders", "orders_user_fk");
+        constraint_outcome.statements = vec![
+            "ALTER TABLE \"public\".\"orders\" DROP CONSTRAINT \"orders_user_fk\"".to_string(),
+        ];
+        let object = constraint_outcome.object.clone();
+        let (status, summary, output) = history_outcome(
+            "drop_constraint",
+            "PostgreSQL",
+            "app.public.orders",
+            &object,
+            "Primary",
+            &Ok(constraint_outcome),
+        );
+        assert_eq!(status, OperationResult::Success);
+        assert!(summary.contains("Dropped constraint orders_user_fk"));
+        assert!(!summary.contains("ALTER TABLE"));
+        assert!(output.is_some_and(|output| !output.contains("ALTER TABLE")));
+    }
+
+    #[test]
+    fn index_history_is_persisted_without_generated_ddl() {
+        let database = Database::in_memory().expect("in-memory storage");
+        let server = database
+            .create_server(&NewServer {
+                name: "Fixture".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 22,
+                username: "deploy".to_string(),
+                auth_type: AuthType::Password,
+                credential_ref: None,
+                group_name: None,
+                tags: Vec::new(),
+                notes: None,
+            })
+            .expect("server");
+        let mut profile = profile(DatabaseEngine::Postgresql);
+        profile.server_id = server.id;
+
+        let request = StructureActionRequest::CreateIndex {
+            database: Some("app".to_string()),
+            schema: Some("public".to_string()),
+            table: "accounts".to_string(),
+            name: "accounts_email_idx".to_string(),
+            columns: vec!["email".to_string()],
+            unique: true,
+            method: None,
+            predicate: Some("email IS NOT NULL".to_string()),
+        };
+        let mut outcome = result(StructureActionKind::CreateIndex, true);
+        outcome.object = index_object("accounts", "accounts_email_idx");
+        outcome.statements = vec![
+            "CREATE UNIQUE INDEX \"accounts_email_idx\" ON \"public\".\"accounts\" (\"email\") \
+             WHERE (email IS NOT NULL)"
+                .to_string(),
+        ];
+
+        record_structure_history(&database, &profile, &request, &Ok(outcome), 1, 3);
+
+        let rows = database.list_operations(10).expect("history");
+        let row = rows.first().expect("index operation recorded");
+        assert_eq!(row.operation, "database-create_index");
+        assert!(
+            row.safe_summary
+                .contains("Created index accounts_email_idx")
+        );
+        assert!(!row.safe_summary.contains("CREATE INDEX"));
+        assert!(
+            row.output_summary
+                .as_deref()
+                .is_some_and(|output| !output.contains("CREATE INDEX"))
         );
     }
 }

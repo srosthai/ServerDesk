@@ -324,25 +324,26 @@ rename, and the drop confirmation names the server, engine, database, exact
 refreshes the databases node and selects the created, renamed, or active
 database.
 
-## Structure preview and table execution commands
+## Structure preview and execution commands
 
 `src-tauri/src/commands/database/structure.rs` owns the structure command
 surface:
 
-| Command                             | Purpose                                                        |
-| ----------------------------------- | -------------------------------------------------------------- |
-| `preview_database_structure_action` | Validate and generate DDL for one structure change, no execute |
-| `run_database_structure_action`     | Execute one table or column change and verify the result       |
+| Command                             | Purpose                                                              |
+| ----------------------------------- | -------------------------------------------------------------------- |
+| `preview_database_structure_action` | Validate and generate DDL for one structure change, no execute       |
+| `run_database_structure_action`     | Execute one table, column, index, or constraint change and verify it |
 
 `src-tauri/src/database/structure.rs` validates requests into
 `ValidatedStructureAction` values and asks the adapter for a
 `StructureDdlPreview`. `mysql::ddl` and `postgres::ddl` are pure planners: they
 receive validated identifiers, type names, and typed values only. Execution is
-implemented for table create, rename, duplicate, truncate, and drop plus column
-add, edit, rename, drop, and engine-supported reorder. Index and constraint
-execution stays with the structure editor in #174, which must call the same
-preview/capability path first. Every execution command regenerates the preview
-before touching the database.
+implemented for table create, rename, duplicate, truncate, and drop; column
+add, edit, rename, drop, and engine-supported reorder; index create, rename
+where supported, and drop; and primary-key, unique, foreign-key, and check
+constraint add/drop. The full structure editor remains #174, but it uses this
+same preview/capability/execution contract. Every execution command regenerates
+the preview before touching the database.
 
 Requests are tagged by `kind` and cover table, column, index, and constraint
 changes:
@@ -389,8 +390,20 @@ reorder syntax other than replacing the full definition; PostgreSQL does not
 support `AUTO_INCREMENT`, virtual generated columns, or stored-column
 reordering. Unsupported actions return a typed `capability` error before any
 DDL is generated. Destructive previews (drop table, truncate, drop column, and
-type changes) set `destructive` and `requiresConfirmation`; previews never
-execute SQL or touch the live session beyond the connection check.
+type changes) set `destructive`; drop index and drop constraint set
+`requiresConfirmation` without claiming data loss. Previews never execute SQL or
+touch the live session beyond the connection check.
+
+Index create supports ordered columns, uniqueness, an engine access method, and
+a PostgreSQL partial-index predicate. Index rename is available on MySQL 5.7+
+and PostgreSQL 9.2+; on an older server the capability check disables the action
+before DDL is generated and returns the explanation the UI shows beside the
+disabled control. MySQL has no partial indexes, and both engines reject an
+unknown access method before planning. Constraints cover primary key, unique,
+foreign key, and check. Foreign keys carry the referenced schema, table, ordered
+columns, and ON UPDATE/ON DELETE actions; MySQL rejects `SET DEFAULT` where
+InnoDB cannot express it. Check constraints are gated at MySQL 8.0.16+ and are
+baseline on PostgreSQL.
 
 Table create supports typed columns, a primary key, named unique keys, and
 engine-specific options. MySQL accepts a storage engine, character set,
@@ -401,41 +414,54 @@ table definition (`CREATE TABLE ... LIKE` in MySQL and
 `CREATE TABLE ... (LIKE ... INCLUDING ALL)` in PostgreSQL) but never rows or
 foreign keys, and the preview says so.
 
-Execution requires `confirmed: true` for drop and truncate (and any other
-preview marked destructive). A missing confirmation returns `cancelled` and no
-statement runs. Read-only profiles return `permission` before execution. Drop
-and truncate inspect incoming foreign keys and, for drop, dependent views; a
-blocking object returns a typed `dependency` error naming the blockers. Driver
-foreign-key and dependent-object codes map to the same typed error.
+Execution requires `confirmed: true` for drop table, truncate, drop column, type
+changes, drop index, and drop constraint. A missing confirmation returns
+`cancelled` and no statement runs. Read-only profiles return `permission` before
+execution. Drop and truncate inspect incoming foreign keys and, for drop,
+dependent views. Drop index inspects the constraint it backs and drop of a
+primary-key or unique constraint inspects incoming foreign keys that reference
+its columns; a blocking object returns a typed `dependency` error naming the
+blockers. The preview adds the same dependency notices before the user
+confirms. Driver foreign-key and dependent-object codes map to the same typed
+error.
 
-After execution the service re-reads the table summary and column list. Create
-verifies the table exists with the expected columns; rename verifies the old
-name is gone and the new name exists; duplicate verifies the target exists and
-its columns match the source; truncate verifies the table still exists and its
-reported row estimate is zero when available; drop verifies the table is absent.
-A failed or partially applied operation returns `verified: false` with a safe
-explanation instead of claiming success.
+After execution the service re-reads metadata. Create verifies the table exists
+with the expected columns; rename verifies the old name is gone and the new name
+exists; duplicate verifies the target exists and its columns match the source;
+truncate verifies the table still exists and its reported row estimate is zero
+when available; drop verifies the table is absent. Index create verifies the
+index exists with the requested ordered columns, uniqueness, method, and
+predicate where reported; index rename verifies the old name is gone and the new
+name exists; index drop verifies it is absent. Constraint create verifies the
+kind, ordered columns, referenced table/columns, update/delete actions, and
+check expression where reported; constraint drop verifies the exact named kind
+is absent. A failed or partially applied operation returns `verified: false`
+with a safe explanation instead of claiming success.
 
-Audit history records one `database` category row per table action. The safe
-summary names the action, engine, table, and connection profile only when
-metadata verification succeeded, is marked `unknown` when verification fails or
-a timeout/connection error leaves the outcome unclear, and is marked `cancelled`
-when confirmation is missing. Generated DDL, row data, credentials, and driver
-text are never stored.
+Audit history records one `database` category row per structure action. The safe
+summary names the action, engine, table, object, and connection profile only
+when metadata verification succeeded, is marked `unknown` when verification
+fails or a timeout/connection error leaves the outcome unclear, and is marked
+`cancelled` when confirmation is missing. Generated DDL, row data, credentials,
+and driver text are never stored.
 
 Golden DDL fixtures live in `src-tauri/tests/fixtures/database_structure/` and
 are compared through the fake adapter by `src-tauri/tests/database_structure_ddl.rs`.
-Table and column execution tests use the same fake adapter and the opt-in MySQL
-and PostgreSQL container fixtures. Column execution verifies type, nullability,
-default, comment, identity/generated state, and position where applicable; MySQL
-MODIFY COLUMN requests must include the complete type and nullability, and
-PostgreSQL rejects unsupported stored-column reordering with a capability error.
+Table, column, index, and constraint execution tests use the same fake adapter
+and the opt-in MySQL and PostgreSQL container fixtures. Index and constraint
+tests cover create, rename, drop, capability rejection, dependency blocking,
+read-only denial, verification failure, and audit history. Column execution
+verifies type, nullability, default, comment, identity/generated state, and
+position where applicable; MySQL MODIFY COLUMN requests must include the
+complete type and nullability, and PostgreSQL rejects unsupported stored-column
+reordering with a capability error.
 
 `src/services/databaseStructure.ts` is the only React module that invokes the
 structure commands. It exposes typed preview, table create/rename/duplicate/
-truncate/drop helpers and column add/edit/rename/drop/reorder helpers; truncate,
-column drop, and other destructive actions require an explicit confirmation
-argument. The full structure UI remains #174.
+truncate/drop helpers, column add/edit/rename/drop/reorder helpers, and index
+create/rename/drop plus constraint add/drop helpers. Truncate, column drop, drop
+index, drop constraint, and other destructive actions require an explicit
+confirmation argument. The full structure UI remains #174.
 
 ## Discovery command contract
 

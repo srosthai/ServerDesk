@@ -12,12 +12,12 @@ use std::{
 
 use serverdesk_lib::{
     database::{
-        ColumnDefaultRequest, ColumnDefinitionRequest, ColumnIdentity, DatabaseAction,
-        DatabaseActionRequest, DatabaseAdapter, DatabaseConnectRequest, DatabaseErrorKind,
-        DatabasePassword, MetadataScope, MetadataValue, PageRequest, PostgresDatabaseAdapter,
-        StructureActionRequest, TableOptionsRequest, UniqueKeyRequest,
-        execute_structure_with_adapter, execute_with_adapter, preview_structure_with_adapter,
-        preview_with_adapter,
+        ColumnDefaultRequest, ColumnDefinitionRequest, ColumnIdentity, ConstraintKind,
+        ConstraintRequest, DatabaseAction, DatabaseActionRequest, DatabaseAdapter,
+        DatabaseConnectRequest, DatabaseErrorKind, DatabasePassword, MetadataScope, MetadataValue,
+        PageRequest, PostgresDatabaseAdapter, ReferentialAction, StructureActionRequest,
+        TableOptionsRequest, TableRef, UniqueKeyRequest, execute_structure_with_adapter,
+        execute_with_adapter, preview_structure_with_adapter, preview_with_adapter,
     },
     storage::DatabaseEngine,
 };
@@ -701,6 +701,298 @@ async fn live_postgres_column_lifecycle_is_verified() {
         true,
     )
     .await;
+
+    adapter.close().await.expect("close fixture");
+}
+
+#[tokio::test]
+async fn live_postgres_index_and_constraint_lifecycle_is_verified() {
+    let Some(fixture) = LivePostgres::from_env() else {
+        eprintln!("skipping live PostgreSQL index/constraint test: fixture environment is not set");
+        return;
+    };
+
+    let mut adapter = PostgresDatabaseAdapter::new();
+    adapter
+        .connect(fixture.request(false))
+        .await
+        .expect("connect to fixture");
+
+    let parent = "serverdesk_schema_parent";
+    let child = "serverdesk_schema_child";
+    for leftover in [child, parent] {
+        let _ = execute_structure_with_adapter(
+            &mut adapter,
+            StructureActionRequest::DropTable {
+                database: Some(fixture.database.clone()),
+                schema: Some("public".to_string()),
+                name: leftover.to_string(),
+            },
+            true,
+        )
+        .await;
+    }
+
+    let create_parent = StructureActionRequest::CreateTable {
+        database: Some(fixture.database.clone()),
+        schema: Some("public".to_string()),
+        name: parent.to_string(),
+        columns: vec![
+            ColumnDefinitionRequest {
+                name: "id".to_string(),
+                data_type: "bigint".to_string(),
+                nullable: false,
+                default: None,
+                comment: None,
+                generated: None,
+                identity: Some(ColumnIdentity::ByDefault),
+            },
+            ColumnDefinitionRequest {
+                name: "email".to_string(),
+                data_type: "text".to_string(),
+                nullable: false,
+                default: None,
+                comment: None,
+                generated: None,
+                identity: None,
+            },
+        ],
+        primary_key: vec!["id".to_string()],
+        unique_keys: Vec::new(),
+        options: None,
+    };
+    execute_structure_with_adapter(&mut adapter, create_parent, false)
+        .await
+        .expect("create parent fixture table");
+
+    let create_child = StructureActionRequest::CreateTable {
+        database: Some(fixture.database.clone()),
+        schema: Some("public".to_string()),
+        name: child.to_string(),
+        columns: vec![
+            ColumnDefinitionRequest {
+                name: "id".to_string(),
+                data_type: "bigint".to_string(),
+                nullable: false,
+                default: None,
+                comment: None,
+                generated: None,
+                identity: Some(ColumnIdentity::ByDefault),
+            },
+            ColumnDefinitionRequest {
+                name: "parent_id".to_string(),
+                data_type: "bigint".to_string(),
+                nullable: false,
+                default: None,
+                comment: None,
+                generated: None,
+                identity: None,
+            },
+            ColumnDefinitionRequest {
+                name: "code".to_string(),
+                data_type: "text".to_string(),
+                nullable: false,
+                default: None,
+                comment: None,
+                generated: None,
+                identity: None,
+            },
+        ],
+        primary_key: vec!["id".to_string()],
+        unique_keys: Vec::new(),
+        options: None,
+    };
+    execute_structure_with_adapter(&mut adapter, create_child, false)
+        .await
+        .expect("create child fixture table");
+
+    let index = "serverdesk_schema_child_code_idx";
+    let renamed_index = "serverdesk_schema_child_code_lookup";
+    let created = execute_structure_with_adapter(
+        &mut adapter,
+        StructureActionRequest::CreateIndex {
+            database: Some(fixture.database.clone()),
+            schema: Some("public".to_string()),
+            table: child.to_string(),
+            name: index.to_string(),
+            columns: vec!["code".to_string()],
+            unique: true,
+            method: Some("btree".to_string()),
+            predicate: None,
+        },
+        false,
+    )
+    .await
+    .expect("create index");
+    assert!(created.verified, "{}", created.verification);
+
+    let renamed = execute_structure_with_adapter(
+        &mut adapter,
+        StructureActionRequest::RenameIndex {
+            database: Some(fixture.database.clone()),
+            schema: Some("public".to_string()),
+            table: child.to_string(),
+            name: index.to_string(),
+            new_name: renamed_index.to_string(),
+        },
+        false,
+    )
+    .await
+    .expect("rename index");
+    assert!(renamed.verified, "{}", renamed.verification);
+
+    let dropped = execute_structure_with_adapter(
+        &mut adapter,
+        StructureActionRequest::DropIndex {
+            database: Some(fixture.database.clone()),
+            schema: Some("public".to_string()),
+            table: child.to_string(),
+            name: renamed_index.to_string(),
+        },
+        true,
+    )
+    .await
+    .expect("drop index");
+    assert!(dropped.verified, "{}", dropped.verification);
+
+    let unique = "serverdesk_schema_parent_email_key";
+    let added_unique = execute_structure_with_adapter(
+        &mut adapter,
+        StructureActionRequest::AddConstraint {
+            database: Some(fixture.database.clone()),
+            schema: Some("public".to_string()),
+            table: parent.to_string(),
+            constraint: ConstraintRequest::Unique {
+                name: unique.to_string(),
+                columns: vec!["email".to_string()],
+            },
+        },
+        false,
+    )
+    .await
+    .expect("add unique constraint");
+    assert!(added_unique.verified, "{}", added_unique.verification);
+    let dropped_unique = execute_structure_with_adapter(
+        &mut adapter,
+        StructureActionRequest::DropConstraint {
+            database: Some(fixture.database.clone()),
+            schema: Some("public".to_string()),
+            table: parent.to_string(),
+            name: unique.to_string(),
+            kind: ConstraintKind::Unique,
+        },
+        true,
+    )
+    .await
+    .expect("drop unique constraint");
+    assert!(dropped_unique.verified, "{}", dropped_unique.verification);
+
+    let foreign_key = "serverdesk_schema_child_parent_fk";
+    let added_fk = execute_structure_with_adapter(
+        &mut adapter,
+        StructureActionRequest::AddConstraint {
+            database: Some(fixture.database.clone()),
+            schema: Some("public".to_string()),
+            table: child.to_string(),
+            constraint: ConstraintRequest::ForeignKey {
+                name: foreign_key.to_string(),
+                columns: vec!["parent_id".to_string()],
+                referenced_schema: Some("public".to_string()),
+                referenced_table: parent.to_string(),
+                referenced_columns: vec!["id".to_string()],
+                on_delete: Some(ReferentialAction::Cascade),
+                on_update: Some(ReferentialAction::Restrict),
+            },
+        },
+        false,
+    )
+    .await
+    .expect("add foreign key");
+    assert!(added_fk.verified, "{}", added_fk.verification);
+    let table = TableRef::new(Some(&fixture.database), Some("public"), child).expect("table ref");
+    let constraints = adapter
+        .list_constraints(&table, PageRequest::new(500, 0))
+        .await
+        .expect("list constraints");
+    let constraint = constraints
+        .items
+        .iter()
+        .find(|constraint| constraint.name == foreign_key)
+        .expect("foreign key metadata");
+    assert_eq!(
+        constraint
+            .referenced_table
+            .value()
+            .and_then(|value| value.as_deref()),
+        Some(parent)
+    );
+    assert_eq!(
+        constraint.on_delete,
+        MetadataValue::available(Some("CASCADE".to_string()))
+    );
+    assert_eq!(
+        constraint.on_update,
+        MetadataValue::available(Some("RESTRICT".to_string()))
+    );
+    let dropped_fk = execute_structure_with_adapter(
+        &mut adapter,
+        StructureActionRequest::DropConstraint {
+            database: Some(fixture.database.clone()),
+            schema: Some("public".to_string()),
+            table: child.to_string(),
+            name: foreign_key.to_string(),
+            kind: ConstraintKind::ForeignKey,
+        },
+        true,
+    )
+    .await
+    .expect("drop foreign key");
+    assert!(dropped_fk.verified, "{}", dropped_fk.verification);
+
+    let check = "serverdesk_schema_child_parent_check";
+    let added_check = execute_structure_with_adapter(
+        &mut adapter,
+        StructureActionRequest::AddConstraint {
+            database: Some(fixture.database.clone()),
+            schema: Some("public".to_string()),
+            table: child.to_string(),
+            constraint: ConstraintRequest::Check {
+                name: check.to_string(),
+                expression: "parent_id > 0".to_string(),
+            },
+        },
+        false,
+    )
+    .await
+    .expect("add check constraint");
+    assert!(added_check.verified, "{}", added_check.verification);
+    let dropped_check = execute_structure_with_adapter(
+        &mut adapter,
+        StructureActionRequest::DropConstraint {
+            database: Some(fixture.database.clone()),
+            schema: Some("public".to_string()),
+            table: child.to_string(),
+            name: check.to_string(),
+            kind: ConstraintKind::Check,
+        },
+        true,
+    )
+    .await
+    .expect("drop check constraint");
+    assert!(dropped_check.verified, "{}", dropped_check.verification);
+
+    for leftover in [child, parent] {
+        let _ = execute_structure_with_adapter(
+            &mut adapter,
+            StructureActionRequest::DropTable {
+                database: Some(fixture.database.clone()),
+                schema: Some("public".to_string()),
+                name: leftover.to_string(),
+            },
+            true,
+        )
+        .await;
+    }
 
     adapter.close().await.expect("close fixture");
 }
