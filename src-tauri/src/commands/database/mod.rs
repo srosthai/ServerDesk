@@ -8,5 +8,6 @@ pub mod actions;
 pub mod capabilities;
 pub mod discovery;
 pub mod profiles;
+pub mod rows;
 pub mod structure;
 pub mod tunnels;

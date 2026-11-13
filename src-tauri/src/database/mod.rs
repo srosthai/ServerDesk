@@ -14,6 +14,8 @@ pub mod fake;
 pub mod mysql;
 pub mod pagination;
 pub mod postgres;
+pub mod row_service;
+pub mod rows;
 pub mod service;
 pub mod structure;
 pub mod traits;
@@ -36,11 +38,24 @@ pub use discovery::{
 };
 pub use errors::{DatabaseError, DatabaseErrorKind};
 pub use fake::FakeDatabaseAdapter;
+pub use fake::FakeRowTable;
 pub use mysql::MysqlDatabaseAdapter;
 pub use pagination::{
     Bounded, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, MAX_PAGE_OFFSET, Page, PageRequest,
 };
 pub use postgres::PostgresDatabaseAdapter;
+pub use row_service::DatabaseRowService;
+pub use rows::{
+    DEFAULT_ROW_PAGE_LIMIT, DEFAULT_ROW_QUERY_TIMEOUT, MAX_ROW_CELL_CHARACTERS, MAX_ROW_COLUMNS,
+    MAX_ROW_FILTER_VALUE_CHARACTERS, MAX_ROW_FILTER_VALUES, MAX_ROW_FILTERS, MAX_ROW_OFFSET,
+    MAX_ROW_PAGE_LIMIT, MAX_ROW_QUERY_TIMEOUT, MAX_ROW_SEARCH_CHARACTERS, MAX_ROW_SEARCH_COLUMNS,
+    MAX_ROW_SORTS, MAX_ROW_VISIBLE_COLUMNS, RowCell, RowColumn, RowColumnKind, RowCounts,
+    RowExactCount, RowFilter, RowFilterOperator, RowFilterValue, RowIdentity, RowIdentityKind,
+    RowIdentityValue, RowPageInfo, RowPageRequest, RowQueryCancellation, RowQueryControl,
+    RowQueryGuard, RowQueryRegistry, RowReadOnlyReason, RowReadRequest, RowReadResult, RowRecord,
+    RowSearch, RowSort, RowSortDirection, RowTableMetadata, classify_column_kind,
+    row_query_timeout, validate_row_query_id,
+};
 pub use service::{DEFAULT_DATABASE_CONNECT_TIMEOUT, DatabaseConnectionRegistry};
 pub use structure::{
     AffectedObject, ColumnDefault, ColumnDefaultRequest, ColumnDefinitionRequest, ColumnPosition,

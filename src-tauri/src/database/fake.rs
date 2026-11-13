@@ -5,6 +5,7 @@
 //! can depend on `DatabaseAdapter` alone.
 
 use std::{
+    cmp::Ordering as CmpOrdering,
     collections::HashMap,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
@@ -21,6 +22,12 @@ use super::{
     mysql,
     pagination::{Bounded, Page, PageRequest},
     postgres,
+    rows::{
+        MAX_ROW_CELL_CHARACTERS, RowCell, RowColumn, RowColumnKind, RowExactCount,
+        RowFilterOperator, RowFilterValue, RowIdentity, RowIdentityValue, RowQueryControl,
+        RowReadRequest, RowReadResult, RowRecord, RowSortDirection, RowTableMetadata,
+        resolve_read_plan,
+    },
     structure::{
         ColumnDefault, ColumnPosition, StructureDdlPreview, ValidatedColumnChanges,
         ValidatedColumnDefinition, ValidatedConstraint, ValidatedStructureAction,
@@ -35,6 +42,47 @@ use super::{
 };
 
 const FAKE_LATENCY_MS: u64 = 1;
+
+/// One deterministic row-browser fixture for the in-memory adapter.
+#[derive(Debug, Clone)]
+pub struct FakeRowTable {
+    pub table: TableRef,
+    pub columns: Vec<RowColumn>,
+    pub identity: RowIdentity,
+    pub estimated_rows: MetadataValue<u64>,
+    /// Row values in column order. `None` is SQL NULL.
+    pub rows: Vec<Vec<Option<String>>>,
+}
+
+impl FakeRowTable {
+    pub fn new(
+        table: TableRef,
+        columns: Vec<RowColumn>,
+        identity: RowIdentity,
+        estimated_rows: MetadataValue<u64>,
+        rows: Vec<Vec<Option<String>>>,
+    ) -> Self {
+        Self {
+            table,
+            columns,
+            identity,
+            estimated_rows,
+            rows,
+        }
+    }
+
+    fn matches(&self, reference: &TableRef) -> bool {
+        let database = reference.database.as_ref().map(Identifier::as_str);
+        let schema = reference.schema.as_ref().map(Identifier::as_str);
+        self.table.name == reference.name
+            && database.is_none_or(|value| {
+                self.table.database.as_ref().map(Identifier::as_str) == Some(value)
+            })
+            && schema.is_none_or(|value| {
+                self.table.schema.as_ref().map(Identifier::as_str) == Some(value)
+            })
+    }
+}
 
 /// A deterministic adapter backed by fixture metadata.
 pub struct FakeDatabaseAdapter {
@@ -63,6 +111,8 @@ pub struct FakeDatabaseAdapter {
     constraints: HashMap<String, Vec<ConstraintSummary>>,
     dependencies: TableDependencies,
     detail_table: String,
+    row_tables: Vec<FakeRowTable>,
+    row_read_error: Option<DatabaseError>,
 }
 
 impl FakeDatabaseAdapter {
@@ -117,7 +167,21 @@ impl FakeDatabaseAdapter {
             constraints: HashMap::from([(detail_table.clone(), detail_constraints)]),
             dependencies: fixtures.dependencies,
             detail_table,
+            row_tables: Vec::new(),
+            row_read_error: None,
         }
+    }
+
+    /// Adds one deterministic row-browser table fixture.
+    pub fn with_row_table(mut self, table: FakeRowTable) -> Self {
+        self.row_tables.push(table);
+        self
+    }
+
+    /// Makes every row read fail with a typed database error.
+    pub fn with_row_read_error(mut self, error: DatabaseError) -> Self {
+        self.row_read_error = Some(error);
+        self
     }
 
     /// Makes the next structure execution fail with a typed database error.
@@ -307,6 +371,214 @@ impl FakeDatabaseAdapter {
         for (index, column) in columns.iter_mut().enumerate() {
             column.ordinal_position = u32::try_from(index + 1).unwrap_or(u32::MAX);
         }
+    }
+
+    fn record_from_values(
+        metadata: &RowTableMetadata,
+        plan: &crate::database::rows::RowReadPlan,
+        values: &[Option<String>],
+    ) -> Result<RowRecord, DatabaseError> {
+        let identity_indices = metadata.identity_indices();
+        let mut cells = Vec::with_capacity(plan.visible.len());
+        for index in &plan.visible {
+            let raw = values.get(*index).cloned().ok_or_else(|| {
+                DatabaseError::internal("A fake row fixture is missing a column value.")
+            })?;
+            let (value, truncated) = if identity_indices.contains(index) {
+                (raw, false)
+            } else {
+                truncate_fake_cell(raw)
+            };
+            cells.push(RowCell { value, truncated });
+        }
+        let identity = identity_indices
+            .iter()
+            .filter_map(|index| {
+                let column = metadata.columns.get(*index)?.name.clone();
+                let value = values.get(*index).cloned()?;
+                Some(RowIdentityValue { column, value })
+            })
+            .collect();
+        Ok(RowRecord { cells, identity })
+    }
+
+    fn row_matches(
+        values: &[Option<String>],
+        metadata: &RowTableMetadata,
+        plan: &crate::database::rows::RowReadPlan,
+    ) -> bool {
+        for filter in &plan.filters {
+            let Some(column) = metadata.columns.get(filter.column) else {
+                return false;
+            };
+            let Some(cell) = values.get(filter.column) else {
+                return false;
+            };
+            if !filter_matches(
+                cell,
+                column.kind,
+                filter.operator,
+                filter.value.as_ref(),
+                &filter.values,
+            ) {
+                return false;
+            }
+        }
+
+        if let Some(search) = &plan.search {
+            let needle = search.query.to_lowercase();
+            let matched = search.columns.iter().any(|index| {
+                values
+                    .get(*index)
+                    .and_then(Option::as_deref)
+                    .is_some_and(|value| value.to_lowercase().contains(&needle))
+            });
+            if !matched {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+fn truncate_fake_cell(value: Option<String>) -> (Option<String>, bool) {
+    let Some(value) = value else {
+        return (None, false);
+    };
+    if value.chars().count() <= MAX_ROW_CELL_CHARACTERS {
+        return (Some(value), false);
+    }
+    (
+        Some(value.chars().take(MAX_ROW_CELL_CHARACTERS).collect()),
+        true,
+    )
+}
+
+fn filter_matches(
+    cell: &Option<String>,
+    kind: RowColumnKind,
+    operator: RowFilterOperator,
+    value: Option<&RowFilterValue>,
+    values: &[RowFilterValue],
+) -> bool {
+    match operator {
+        RowFilterOperator::IsNull => cell.is_none(),
+        RowFilterOperator::IsNotNull => cell.is_some(),
+        RowFilterOperator::In => cell
+            .as_deref()
+            .is_some_and(|cell| values.iter().any(|value| cell_equals(cell, value, kind))),
+        RowFilterOperator::Contains
+        | RowFilterOperator::StartsWith
+        | RowFilterOperator::EndsWith => {
+            let (Some(cell), Some(RowFilterValue::Text(value))) = (cell.as_deref(), value) else {
+                return false;
+            };
+            let cell = cell.to_lowercase();
+            let value = value.to_lowercase();
+            match operator {
+                RowFilterOperator::Contains => cell.contains(&value),
+                RowFilterOperator::StartsWith => cell.starts_with(&value),
+                RowFilterOperator::EndsWith => cell.ends_with(&value),
+                _ => false,
+            }
+        }
+        _ => {
+            let (Some(cell), Some(value)) = (cell.as_deref(), value) else {
+                return false;
+            };
+            let Some(ordering) = compare_cell_to_value(cell, value, kind) else {
+                return false;
+            };
+            match operator {
+                RowFilterOperator::Equals => ordering == CmpOrdering::Equal,
+                RowFilterOperator::NotEquals => ordering != CmpOrdering::Equal,
+                RowFilterOperator::GreaterThan => ordering == CmpOrdering::Greater,
+                RowFilterOperator::GreaterThanOrEqual => {
+                    matches!(ordering, CmpOrdering::Greater | CmpOrdering::Equal)
+                }
+                RowFilterOperator::LessThan => ordering == CmpOrdering::Less,
+                RowFilterOperator::LessThanOrEqual => {
+                    matches!(ordering, CmpOrdering::Less | CmpOrdering::Equal)
+                }
+                _ => false,
+            }
+        }
+    }
+}
+
+fn cell_equals(cell: &str, value: &RowFilterValue, kind: RowColumnKind) -> bool {
+    compare_cell_to_value(cell, value, kind) == Some(CmpOrdering::Equal)
+}
+
+fn compare_cell_to_value(
+    cell: &str,
+    value: &RowFilterValue,
+    kind: RowColumnKind,
+) -> Option<CmpOrdering> {
+    match (kind, value) {
+        (RowColumnKind::Text, RowFilterValue::Text(value))
+        | (RowColumnKind::Temporal, RowFilterValue::Text(value))
+        | (RowColumnKind::Uuid, RowFilterValue::Text(value)) => Some(cell.cmp(value)),
+        (RowColumnKind::Integer, RowFilterValue::Integer(value)) => {
+            Some(cell.parse::<i64>().ok()?.cmp(value))
+        }
+        (RowColumnKind::Float, RowFilterValue::Integer(value)) => {
+            Some(cell.parse::<f64>().ok()?.total_cmp(&(*value as f64)))
+        }
+        (RowColumnKind::Float, RowFilterValue::Float(value))
+        | (RowColumnKind::Decimal, RowFilterValue::Float(value)) => {
+            Some(cell.parse::<f64>().ok()?.total_cmp(value))
+        }
+        (RowColumnKind::Decimal, RowFilterValue::Integer(value)) => {
+            Some(cell.parse::<f64>().ok()?.total_cmp(&(*value as f64)))
+        }
+        (RowColumnKind::Decimal, RowFilterValue::Text(value)) => Some(
+            cell.parse::<f64>()
+                .ok()?
+                .total_cmp(&value.parse::<f64>().ok()?),
+        ),
+        (RowColumnKind::Boolean, RowFilterValue::Boolean(value)) => {
+            Some(parse_fake_bool(cell)?.cmp(value))
+        }
+        _ => None,
+    }
+}
+
+fn compare_cells(
+    left: &Option<String>,
+    right: &Option<String>,
+    kind: RowColumnKind,
+) -> CmpOrdering {
+    match (left.as_deref(), right.as_deref()) {
+        (None, None) => CmpOrdering::Equal,
+        (None, Some(_)) => CmpOrdering::Greater,
+        (Some(_), None) => CmpOrdering::Less,
+        (Some(left), Some(right)) => match kind {
+            RowColumnKind::Integer => match (left.parse::<i64>(), right.parse::<i64>()) {
+                (Ok(left), Ok(right)) => left.cmp(&right),
+                _ => left.cmp(right),
+            },
+            RowColumnKind::Float | RowColumnKind::Decimal => {
+                match (left.parse::<f64>(), right.parse::<f64>()) {
+                    (Ok(left), Ok(right)) => left.total_cmp(&right),
+                    _ => left.cmp(right),
+                }
+            }
+            RowColumnKind::Boolean => match (parse_fake_bool(left), parse_fake_bool(right)) {
+                (Some(left), Some(right)) => left.cmp(&right),
+                _ => left.cmp(right),
+            },
+            _ => left.cmp(right),
+        },
+    }
+}
+
+fn parse_fake_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "t" | "true" | "yes" => Some(true),
+        "0" | "f" | "false" | "no" => Some(false),
+        _ => None,
     }
 }
 
@@ -1353,6 +1625,125 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
                 .map(Vec::as_slice)
                 .unwrap_or_default(),
             page,
+        ))
+    }
+
+    async fn read_rows(
+        &self,
+        request: &RowReadRequest,
+        control: &RowQueryControl,
+    ) -> Result<RowReadResult, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseRows)?;
+        self.require_connection()?;
+        if control.is_cancelled() {
+            return Err(DatabaseError::cancelled("The row read was cancelled."));
+        }
+        if let Some(error) = &self.row_read_error {
+            return Err(error.clone());
+        }
+
+        let fixture = self
+            .row_tables
+            .iter()
+            .find(|table| table.matches(&request.table))
+            .ok_or_else(|| DatabaseError::query("The selected table was not found."))?;
+        if fixture.columns.is_empty() {
+            return Err(DatabaseError::query(
+                "The selected table does not expose any columns.",
+            ));
+        }
+
+        let metadata = RowTableMetadata {
+            engine: self.engine,
+            database: fixture
+                .table
+                .database
+                .as_ref()
+                .map(|value| value.as_str().to_string()),
+            schema: fixture
+                .table
+                .schema
+                .as_ref()
+                .map(|value| value.as_str().to_string()),
+            table: fixture.table.name.clone(),
+            columns: fixture.columns.clone(),
+            identity: fixture.identity.clone(),
+            estimated_rows: fixture.estimated_rows.clone(),
+        };
+        let plan = resolve_read_plan(request, &metadata)?;
+        if control.is_cancelled() {
+            return Err(DatabaseError::cancelled("The row read was cancelled."));
+        }
+
+        let mut matched = Vec::new();
+        for (position, values) in fixture.rows.iter().enumerate() {
+            if values.len() != metadata.columns.len() {
+                return Err(DatabaseError::internal(
+                    "A fake row fixture has the wrong number of values.",
+                ));
+            }
+            if Self::row_matches(values, &metadata, &plan) {
+                matched.push((position, values));
+            }
+        }
+
+        let mut order = plan.sort.clone();
+        let mut seen: std::collections::HashSet<usize> =
+            order.iter().map(|(index, _)| *index).collect();
+        for index in metadata.identity_indices() {
+            if seen.insert(index) {
+                order.push((index, RowSortDirection::Asc));
+            }
+        }
+        if !order.is_empty() {
+            matched.sort_by(|left, right| {
+                for (index, direction) in &order {
+                    let ordering = compare_cells(
+                        &left.1[*index],
+                        &right.1[*index],
+                        metadata.columns[*index].kind,
+                    );
+                    let ordering = match direction {
+                        RowSortDirection::Asc => ordering,
+                        RowSortDirection::Desc => ordering.reverse(),
+                    };
+                    if ordering != CmpOrdering::Equal {
+                        return ordering;
+                    }
+                }
+                left.0.cmp(&right.0)
+            });
+        }
+
+        let total = matched.len() as u64;
+        let start = usize::try_from(request.page.offset)
+            .unwrap_or(usize::MAX)
+            .min(matched.len());
+        let end = start
+            .saturating_add(request.page.limit as usize)
+            .min(matched.len());
+        let has_more = end < matched.len();
+        let records = matched[start..end]
+            .iter()
+            .map(|(_, values)| Self::record_from_values(&metadata, &plan, values))
+            .collect::<Result<Vec<_>, _>>()?;
+        let exact_rows = request.include_exact_count.then(|| RowExactCount {
+            value: total,
+            filtered: !request.filters.is_empty()
+                || request
+                    .search
+                    .as_ref()
+                    .is_some_and(|search| !search.query.trim().is_empty()),
+        });
+
+        Ok(RowReadResult::new(
+            metadata,
+            &plan,
+            records,
+            request.page,
+            has_more,
+            exact_rows,
+            self.read_only,
         ))
     }
 
