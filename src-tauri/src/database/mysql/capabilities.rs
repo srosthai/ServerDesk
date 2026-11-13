@@ -40,6 +40,9 @@ pub fn flags_for(version: Option<DatabaseVersion>) -> CapabilityFlags {
         // planner does not guess from metadata.
         column_rename: at_least(version, 8, 0, 0),
         table_rename: true,
+        // CREATE TABLE ... LIKE copies the table definition on every
+        // supported MySQL and MariaDB release.
+        table_duplicate: true,
         // MySQL supports FIRST/AFTER column positioning.
         column_reorder: true,
         // There is no safe, atomic RENAME DATABASE operation.

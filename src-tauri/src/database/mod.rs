@@ -47,10 +47,11 @@ pub use structure::{
     ColumnPositionRequest, ConstraintRequest, DatabaseStructureService, GeneratedColumnRequest,
     MAX_COLUMN_COMMENT_LENGTH, MAX_COLUMN_EXPRESSION_LENGTH, MAX_COLUMN_LIST_LENGTH,
     MAX_DATA_TYPE_LENGTH, MAX_DEFAULT_STRING_LENGTH, MAX_INDEX_METHOD_LENGTH, ReferentialAction,
-    StructureActionKind, StructureActionRequest, StructureDdlPreview, StructureObjectKind,
-    ValidatedColumnChanges, ValidatedColumnDefinition, ValidatedConstraint, ValidatedCreateIndex,
-    ValidatedCreateTable, ValidatedGeneratedColumn, ValidatedStructureAction,
-    preview_structure_with_adapter,
+    StructureActionKind, StructureActionRequest, StructureActionResult, StructureDdlPreview,
+    StructureObjectKind, TableOptionsRequest, UniqueKeyRequest, ValidatedColumnChanges,
+    ValidatedColumnDefinition, ValidatedConstraint, ValidatedCreateIndex, ValidatedCreateTable,
+    ValidatedGeneratedColumn, ValidatedStructureAction, ValidatedTableOptions, ValidatedUniqueKey,
+    execute_structure_with_adapter, preview_structure_with_adapter,
 };
 pub use traits::{
     ColumnIdentity, ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter,

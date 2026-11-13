@@ -103,6 +103,8 @@ fn mysql_cases() -> Vec<(&'static str, StructureActionRequest)> {
                 name: "Users".to_string(),
                 columns: vec![id, slug, email],
                 primary_key: vec!["ID".to_string()],
+                unique_keys: Vec::new(),
+                options: None,
             },
         ),
         (
@@ -253,6 +255,8 @@ fn postgres_cases() -> Vec<(&'static str, StructureActionRequest)> {
                 name: "Users".to_string(),
                 columns: vec![id, slug, email],
                 primary_key: vec!["ID".to_string()],
+                unique_keys: Vec::new(),
+                options: None,
             },
         ),
         (
@@ -483,6 +487,8 @@ async fn placeholder_like_identifiers_are_quoted_not_bound_as_values() {
         name: "Params".to_string(),
         columns: vec![column("?", "int", false), column("$1", "int", true)],
         primary_key: Vec::new(),
+        unique_keys: Vec::new(),
+        options: None,
     };
     let preview = preview_structure_with_adapter(&mysql, &request)
         .await
@@ -500,6 +506,8 @@ async fn placeholder_like_identifiers_are_quoted_not_bound_as_values() {
             name: "Params".to_string(),
             columns: vec![column("?", "int", false), column("$1", "int", true)],
             primary_key: Vec::new(),
+            unique_keys: Vec::new(),
+            options: None,
         },
     )
     .await

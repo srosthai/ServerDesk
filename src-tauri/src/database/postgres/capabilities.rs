@@ -38,6 +38,9 @@ pub fn flags_for(version: Option<DatabaseVersion>) -> CapabilityFlags {
         // ALTER TABLE ... RENAME COLUMN has been available since before 9.2.
         column_rename: true,
         table_rename: true,
+        // CREATE TABLE ... (LIKE ... INCLUDING ALL) is available on every
+        // supported PostgreSQL release.
+        table_duplicate: true,
         // PostgreSQL does not support reordering stored columns.
         column_reorder: false,
         database_rename: true,

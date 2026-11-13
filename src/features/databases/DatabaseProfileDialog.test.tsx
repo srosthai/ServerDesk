@@ -84,6 +84,7 @@ const capabilities: DatabaseCapabilities = {
     columnTypeChange: true,
     columnRename: true,
     tableRename: true,
+    tableDuplicate: true,
     columnReorder: false,
     databaseRename: true,
     indexRename: true,
