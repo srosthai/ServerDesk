@@ -4,7 +4,10 @@
 //! connection, SSH tunnel, or engine SQL. Tests use it to prove that commands
 //! can depend on `DatabaseAdapter` alone.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use async_trait::async_trait;
 
@@ -41,6 +44,9 @@ pub struct FakeDatabaseAdapter {
     ping_count: AtomicUsize,
     close_count: AtomicUsize,
     connect_error: Option<DatabaseError>,
+    structure_execution_error: Option<DatabaseError>,
+    skip_structure_execution: bool,
+    structure_execution_count: AtomicUsize,
     read_only: bool,
     active_database: Option<String>,
     databases: Vec<DatabaseSummary>,
@@ -49,6 +55,7 @@ pub struct FakeDatabaseAdapter {
     views: Vec<ViewSummary>,
     sequences: Vec<SequenceSummary>,
     columns: Vec<ColumnSummary>,
+    created_tables: HashMap<String, Vec<ColumnSummary>>,
     indexes: Vec<IndexSummary>,
     constraints: Vec<ConstraintSummary>,
     dependencies: TableDependencies,
@@ -73,6 +80,8 @@ impl FakeDatabaseAdapter {
             ),
         };
         let capabilities = DatabaseCapabilities::with_version(engine, parsed_version);
+        let detail_table = fixtures.detail_table.clone();
+        let detail_columns = fixtures.columns.clone();
 
         Self {
             engine,
@@ -87,6 +96,9 @@ impl FakeDatabaseAdapter {
             ping_count: AtomicUsize::new(0),
             close_count: AtomicUsize::new(0),
             connect_error: None,
+            structure_execution_error: None,
+            skip_structure_execution: false,
+            structure_execution_count: AtomicUsize::new(0),
             read_only: false,
             active_database: None,
             databases: fixtures.databases,
@@ -95,11 +107,30 @@ impl FakeDatabaseAdapter {
             views: fixtures.views,
             sequences: fixtures.sequences,
             columns: fixtures.columns,
+            created_tables: HashMap::from([(detail_table, detail_columns)]),
             indexes: fixtures.indexes,
             constraints: fixtures.constraints,
             dependencies: fixtures.dependencies,
             detail_table: fixtures.detail_table,
         }
+    }
+
+    /// Makes the next structure execution fail with a typed database error.
+    pub fn with_structure_execution_error(mut self, error: DatabaseError) -> Self {
+        self.structure_execution_error = Some(error);
+        self
+    }
+
+    /// Simulates a driver that reports success without applying the change.
+    /// Verification must detect the missing metadata instead of trusting the
+    /// execution result.
+    pub fn without_structure_execution(mut self) -> Self {
+        self.skip_structure_execution = true;
+        self
+    }
+
+    pub fn structure_execution_count(&self) -> usize {
+        self.structure_execution_count.load(Ordering::SeqCst)
     }
 
     /// Makes the next `connect` call fail with a typed database error.
@@ -155,6 +186,26 @@ impl FakeDatabaseAdapter {
         table.name == reference.name.as_str()
             && database.is_none_or(|value| table.database.as_deref() == Some(value))
             && schema.is_none_or(|value| table.schema.as_deref() == Some(value))
+    }
+
+    fn structure_scope(&self, table: &TableRef) -> (String, String) {
+        let database = table
+            .database
+            .as_ref()
+            .map(Identifier::as_str)
+            .or(self.active_database.as_deref())
+            .unwrap_or("app")
+            .to_string();
+        let schema = table
+            .schema
+            .as_ref()
+            .map(Identifier::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| match self.engine {
+                DatabaseEngine::Mysql => database.clone(),
+                DatabaseEngine::Postgresql => "public".to_string(),
+            });
+        (database, schema)
     }
 }
 
@@ -411,6 +462,16 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
         Ok(Self::paginate(&tables, page))
     }
 
+    async fn table_summary(&self, table: &TableRef) -> Result<Option<TableSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseTables)?;
+        self.require_connection()?;
+        Ok(self
+            .tables
+            .iter()
+            .find(|summary| Self::table_matches(summary, table))
+            .cloned())
+    }
+
     async fn list_views(
         &self,
         scope: &MetadataScope,
@@ -512,6 +573,164 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
         })
     }
 
+    async fn execute_structure_action(
+        &mut self,
+        action: &ValidatedStructureAction,
+    ) -> Result<(), DatabaseError> {
+        self.require_connection()?;
+        // Re-run the planner so capability and DDL errors happen before a
+        // simulated mutation, just like the live adapters.
+        self.preview_structure_action(action).await?;
+        self.structure_execution_count
+            .fetch_add(1, Ordering::SeqCst);
+
+        if let Some(error) = self.structure_execution_error.take() {
+            return Err(error);
+        }
+        if self.skip_structure_execution {
+            return Ok(());
+        }
+
+        match action {
+            ValidatedStructureAction::CreateTable(options) => {
+                let (database, schema) = self.structure_scope(&options.table);
+                if self.tables.iter().any(|table| {
+                    table.name == options.table.name.as_str()
+                        && table.database.as_deref() == Some(database.as_str())
+                }) {
+                    return Err(DatabaseError::query(format!(
+                        "Table {} already exists.",
+                        options.table.name
+                    )));
+                }
+                let summary = TableSummary {
+                    database: Some(database.clone()),
+                    schema: Some(schema.clone()),
+                    name: options.table.name.as_str().to_string(),
+                    kind: TableKind::Table,
+                    estimated_rows: MetadataValue::available(0),
+                    metadata_refreshed_at: MetadataValue::unavailable(),
+                    metadata: ObjectMetadata {
+                        size_bytes: MetadataValue::available(0),
+                        engine: MetadataValue::available(match self.engine {
+                            DatabaseEngine::Mysql => "InnoDB".to_string(),
+                            DatabaseEngine::Postgresql => "heap".to_string(),
+                        }),
+                        ..ObjectMetadata::default()
+                    },
+                };
+                let columns = options
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| ColumnSummary {
+                        name: column.name.as_str().to_string(),
+                        data_type: column.data_type.clone(),
+                        length: MetadataValue::available(None),
+                        precision: MetadataValue::available(None),
+                        scale: MetadataValue::available(None),
+                        nullable: column.nullable,
+                        default_value: MetadataValue::available(None),
+                        ordinal_position: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                        primary_key: options.primary_key.iter().any(|key| key == &column.name),
+                        identity: MetadataValue::available(column.identity),
+                        generated: MetadataValue::available(column.generated.is_some()),
+                        generation_expression: MetadataValue::available(
+                            column
+                                .generated
+                                .as_ref()
+                                .map(|generated| generated.expression.clone()),
+                        ),
+                        comment: MetadataValue::available(column.comment.clone()),
+                        collation: MetadataValue::available(None),
+                    })
+                    .collect::<Vec<_>>();
+                self.tables.push(summary);
+                self.created_tables
+                    .insert(options.table.name.as_str().to_string(), columns);
+            }
+            ValidatedStructureAction::RenameTable { table, new_name } => {
+                let old_name = table.name.as_str().to_string();
+                let Some(summary) = self
+                    .tables
+                    .iter_mut()
+                    .find(|summary| Self::table_matches(summary, table))
+                else {
+                    return Err(DatabaseError::query(format!(
+                        "Table {} does not exist.",
+                        table.name
+                    )));
+                };
+                summary.name = new_name.as_str().to_string();
+                if let Some(columns) = self.created_tables.remove(&old_name) {
+                    self.created_tables
+                        .insert(new_name.as_str().to_string(), columns);
+                }
+            }
+            ValidatedStructureAction::DuplicateTable { table, new_name } => {
+                let Some(source) = self
+                    .tables
+                    .iter()
+                    .find(|summary| Self::table_matches(summary, table))
+                    .cloned()
+                else {
+                    return Err(DatabaseError::query(format!(
+                        "Table {} does not exist.",
+                        table.name
+                    )));
+                };
+                if self
+                    .tables
+                    .iter()
+                    .any(|summary| summary.name == new_name.as_str())
+                {
+                    return Err(DatabaseError::query(format!(
+                        "Table {new_name} already exists."
+                    )));
+                }
+                let source_name = table.name.as_str().to_string();
+                let mut duplicate = source;
+                duplicate.name = new_name.as_str().to_string();
+                duplicate.estimated_rows = MetadataValue::available(0);
+                self.tables.push(duplicate);
+                if let Some(columns) = self.created_tables.get(&source_name).cloned() {
+                    self.created_tables
+                        .insert(new_name.as_str().to_string(), columns);
+                }
+            }
+            ValidatedStructureAction::TruncateTable { table } => {
+                let Some(summary) = self
+                    .tables
+                    .iter_mut()
+                    .find(|summary| Self::table_matches(summary, table))
+                else {
+                    return Err(DatabaseError::query(format!(
+                        "Table {} does not exist.",
+                        table.name
+                    )));
+                };
+                summary.estimated_rows = MetadataValue::available(0);
+            }
+            ValidatedStructureAction::DropTable { table } => {
+                let before = self.tables.len();
+                self.tables
+                    .retain(|summary| !Self::table_matches(summary, table));
+                if self.tables.len() == before {
+                    return Err(DatabaseError::query(format!(
+                        "Table {} does not exist.",
+                        table.name
+                    )));
+                }
+                self.created_tables.remove(table.name.as_str());
+            }
+            // Other structure actions are covered by the preview contract in
+            // this fixture; only table lifecycle needs mutable metadata here.
+            _ => {}
+        }
+
+        Ok(())
+    }
+
     async fn list_columns(
         &self,
         table: &TableRef,
@@ -527,6 +746,9 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
         else {
             return Ok(Page::from_items(Vec::new(), page, Some(0)));
         };
+        if let Some(columns) = self.created_tables.get(&summary.name) {
+            return Ok(Self::paginate(columns, page));
+        }
         if summary.name != self.detail_table {
             return Ok(Page::from_items(Vec::new(), page, Some(0)));
         }

@@ -567,6 +567,18 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
         }
     }
 
+    async fn execute_structure_action(
+        &mut self,
+        action: &ValidatedStructureAction,
+    ) -> Result<(), DatabaseError> {
+        self.require_connection()?;
+        let preview = self.preview_structure_action(action).await?;
+        for statement in &preview.statements {
+            self.execute_statement(statement).await?;
+        }
+        Ok(())
+    }
+
     async fn list_schemas(&self, page: PageRequest) -> Result<Page<SchemaSummary>, DatabaseError> {
         self.require_capability(DatabaseAction::BrowseSchemas)?;
         let mut guard = self.live_connection().await?;
@@ -646,6 +658,29 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
             .collect::<Vec<_>>();
 
         Ok(Page::from_items(tables, page, None))
+    }
+
+    async fn table_summary(&self, table: &TableRef) -> Result<Option<TableSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseTables)?;
+        let database = Self::table_name(table)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let row = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::TABLE_SUMMARY)
+                .bind(database.as_deref())
+                .bind(table.name.as_str())
+                .fetch_optional(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("table", table.name.as_str()))?;
+
+        row.as_ref()
+            .map(MysqlTableRecord::from_row)
+            .transpose()
+            .map(|record| record.map(|record| record.into_summary(MetadataValue::Unavailable)))
     }
 
     async fn list_views(
@@ -859,11 +894,13 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
         limit: u32,
     ) -> Result<TableDependencies, DatabaseError> {
         self.require_capability(DatabaseAction::BrowseTables)?;
-        let database = Self::table_name(table)?.ok_or_else(|| {
-            DatabaseError::validation(
-                "Select a MySQL database before inspecting table dependencies.",
-            )
-        })?;
+        let database = Self::table_name(table)?
+            .or_else(|| self.current_database.clone())
+            .ok_or_else(|| {
+                DatabaseError::validation(
+                    "Select a MySQL database before inspecting table dependencies.",
+                )
+            })?;
         let table_name = table.name.as_str();
         let limit = i64::from(limit.clamp(1, crate::database::MAX_PAGE_LIMIT));
         let mut guard = self.live_connection().await?;
@@ -1420,6 +1457,11 @@ fn map_mysql_error(number: Option<u16>, sql_state: Option<&str>) -> DatabaseErro
         Some(1836) => DatabaseError::permission(
             "The database server is in read-only mode; the statement attempted a write.",
         ),
+        // 1217/1451 rows referenced by a foreign key, 3730 a table referenced
+        // by a foreign key, 1553 an index required by a foreign key.
+        Some(1217 | 1451 | 1553 | 3730) => DatabaseError::dependency(
+            "The operation is blocked by a foreign key or another dependent object.",
+        ),
         Some(1205) => DatabaseError::timeout("The database operation timed out."),
         // 1049 unknown database, 2006 server gone, 2013 lost connection.
         Some(1049) => {
@@ -1517,6 +1559,10 @@ mod tests {
             (1044, DatabaseErrorKind::Permission),
             (1142, DatabaseErrorKind::Permission),
             (1792, DatabaseErrorKind::Permission),
+            (1217, DatabaseErrorKind::Dependency),
+            (1451, DatabaseErrorKind::Dependency),
+            (1553, DatabaseErrorKind::Dependency),
+            (3730, DatabaseErrorKind::Dependency),
             (1205, DatabaseErrorKind::Timeout),
             (1049, DatabaseErrorKind::Connection),
         ] {

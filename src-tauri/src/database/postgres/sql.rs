@@ -77,6 +77,39 @@ WHERE c.relkind IN ('r', 'p', 'f')
 ORDER BY n.nspname, c.relname
 LIMIT $2 OFFSET $3"#;
 
+pub const TABLE_SUMMARY: &str = r#"SELECT current_database() AS database_name,
+    n.nspname AS schema_name,
+    c.relname AS name,
+    CASE c.relkind
+        WHEN 'r' THEN 'BASE TABLE'
+        WHEN 'p' THEN 'PARTITIONED TABLE'
+        WHEN 'f' THEN 'FOREIGN TABLE'
+        ELSE 'OTHER'
+    END AS table_type,
+    pg_catalog.pg_get_userbyid(c.relowner) AS owner,
+    CASE WHEN pg_catalog.has_table_privilege(c.oid, 'SELECT')
+         THEN pg_catalog.pg_total_relation_size(c.oid)
+    END AS size_bytes,
+    CASE WHEN c.reltuples >= 0 THEN c.reltuples::bigint END AS estimated_rows,
+    am.amname AS engine,
+    CASE
+        WHEN GREATEST(st.last_analyze, st.last_autoanalyze) IS NOT NULL
+        THEN pg_catalog.to_char(
+            GREATEST(st.last_analyze, st.last_autoanalyze) AT TIME ZONE 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+        )
+    END AS metadata_refreshed_at
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
+LEFT JOIN pg_catalog.pg_stat_user_tables st ON st.relid = c.oid
+WHERE c.relkind IN ('r', 'p', 'f')
+  AND c.relname = $2
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND ($1::text IS NULL OR n.nspname = $1)
+ORDER BY n.nspname
+LIMIT 1"#;
+
 pub const LIST_VIEWS: &str = r#"SELECT current_database() AS database_name,
     n.nspname AS schema_name,
     c.relname AS name,

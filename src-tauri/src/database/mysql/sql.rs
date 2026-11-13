@@ -55,6 +55,15 @@ pub const LIST_TABLES: &str = "SELECT TABLE_SCHEMA AS database_name, TABLE_NAME 
     AND (? IS NULL OR TABLE_SCHEMA = ?) \
     ORDER BY TABLE_SCHEMA, TABLE_NAME LIMIT ? OFFSET ?";
 
+pub const TABLE_SUMMARY: &str = "SELECT TABLE_SCHEMA AS database_name, TABLE_NAME AS name, \
+    TABLE_TYPE AS table_type, CAST(TABLE_ROWS AS SIGNED) AS estimated_rows, \
+    CAST(COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0) AS SIGNED) AS size_bytes, \
+    ENGINE AS engine \
+    FROM information_schema.TABLES \
+    WHERE TABLE_TYPE = 'BASE TABLE' \
+    AND TABLE_SCHEMA = COALESCE(?, DATABASE()) \
+    AND TABLE_NAME = ? LIMIT 1";
+
 pub const LIST_VIEWS: &str = "SELECT TABLE_SCHEMA AS database_name, TABLE_NAME AS name, \
     DEFINER AS owner \
     FROM information_schema.VIEWS \
