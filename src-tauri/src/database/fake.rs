@@ -23,7 +23,7 @@ use super::{
     postgres,
     structure::{
         ColumnDefault, ColumnPosition, StructureDdlPreview, ValidatedColumnChanges,
-        ValidatedColumnDefinition, ValidatedStructureAction,
+        ValidatedColumnDefinition, ValidatedConstraint, ValidatedStructureAction,
     },
     traits::{
         ColumnIdentity, ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter,
@@ -59,8 +59,8 @@ pub struct FakeDatabaseAdapter {
     sequences: Vec<SequenceSummary>,
     columns: Vec<ColumnSummary>,
     created_tables: HashMap<String, Vec<ColumnSummary>>,
-    indexes: Vec<IndexSummary>,
-    constraints: Vec<ConstraintSummary>,
+    indexes: HashMap<String, Vec<IndexSummary>>,
+    constraints: HashMap<String, Vec<ConstraintSummary>>,
     dependencies: TableDependencies,
     detail_table: String,
 }
@@ -85,6 +85,8 @@ impl FakeDatabaseAdapter {
         let capabilities = DatabaseCapabilities::with_version(engine, parsed_version);
         let detail_table = fixtures.detail_table.clone();
         let detail_columns = fixtures.columns.clone();
+        let detail_indexes = fixtures.indexes.clone();
+        let detail_constraints = fixtures.constraints.clone();
 
         Self {
             engine,
@@ -110,11 +112,11 @@ impl FakeDatabaseAdapter {
             views: fixtures.views,
             sequences: fixtures.sequences,
             columns: fixtures.columns,
-            created_tables: HashMap::from([(detail_table, detail_columns)]),
-            indexes: fixtures.indexes,
-            constraints: fixtures.constraints,
+            created_tables: HashMap::from([(detail_table.clone(), detail_columns)]),
+            indexes: HashMap::from([(detail_table.clone(), detail_indexes)]),
+            constraints: HashMap::from([(detail_table.clone(), detail_constraints)]),
             dependencies: fixtures.dependencies,
-            detail_table: fixtures.detail_table,
+            detail_table,
         }
     }
 
@@ -306,6 +308,82 @@ impl FakeDatabaseAdapter {
             column.ordinal_position = u32::try_from(index + 1).unwrap_or(u32::MAX);
         }
     }
+}
+
+fn table_key(adapter: &FakeDatabaseAdapter, table: &TableRef) -> Result<String, DatabaseError> {
+    adapter
+        .tables
+        .iter()
+        .find(|summary| FakeDatabaseAdapter::table_matches(summary, table))
+        .map(|summary| summary.name.clone())
+        .ok_or_else(|| DatabaseError::query(format!("Table {} does not exist.", table.name)))
+}
+
+fn rename_column_in_list(columns: &mut [String], old: &str, new: &str) {
+    for column in columns {
+        if column.eq_ignore_ascii_case(old) {
+            *column = new.to_string();
+        }
+    }
+}
+
+fn fake_constraint(constraint: &ValidatedConstraint, engine: DatabaseEngine) -> ConstraintSummary {
+    let mut summary = ConstraintSummary {
+        name: constraint.name().as_str().to_string(),
+        kind: constraint.kind(),
+        columns: constraint
+            .columns()
+            .iter()
+            .map(|column| column.as_str().to_string())
+            .collect(),
+        referenced_schema: MetadataValue::available(None),
+        referenced_table: MetadataValue::available(None),
+        referenced_columns: Vec::new(),
+        on_update: MetadataValue::available(None),
+        on_delete: MetadataValue::available(None),
+        check_expression: MetadataValue::available(None),
+        deferrable: match engine {
+            DatabaseEngine::Mysql => MetadataValue::Unavailable,
+            DatabaseEngine::Postgresql => MetadataValue::available(false),
+        },
+        initially_deferred: match engine {
+            DatabaseEngine::Mysql => MetadataValue::Unavailable,
+            DatabaseEngine::Postgresql => MetadataValue::available(false),
+        },
+    };
+
+    match constraint {
+        ValidatedConstraint::ForeignKey {
+            referenced_schema,
+            referenced_table,
+            referenced_columns,
+            on_delete,
+            on_update,
+            ..
+        } => {
+            summary.referenced_schema = MetadataValue::available(
+                referenced_schema
+                    .as_ref()
+                    .map(|schema| schema.as_str().to_string()),
+            );
+            summary.referenced_table =
+                MetadataValue::available(Some(referenced_table.as_str().to_string()));
+            summary.referenced_columns = referenced_columns
+                .iter()
+                .map(|column| column.as_str().to_string())
+                .collect();
+            summary.on_delete =
+                MetadataValue::available(on_delete.map(|action| action.as_sql().to_string()));
+            summary.on_update =
+                MetadataValue::available(on_update.map(|action| action.as_sql().to_string()));
+        }
+        ValidatedConstraint::Check { expression, .. } => {
+            summary.check_expression = MetadataValue::available(Some(expression.clone()));
+        }
+        ValidatedConstraint::PrimaryKey { .. } | ValidatedConstraint::Unique { .. } => {}
+    }
+
+    summary
 }
 
 #[async_trait]
@@ -744,9 +822,11 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
                         collation: MetadataValue::available(None),
                     })
                     .collect::<Vec<_>>();
+                let table_name = options.table.name.as_str().to_string();
                 self.tables.push(summary);
-                self.created_tables
-                    .insert(options.table.name.as_str().to_string(), columns);
+                self.created_tables.insert(table_name.clone(), columns);
+                self.indexes.insert(table_name.clone(), Vec::new());
+                self.constraints.insert(table_name, Vec::new());
             }
             ValidatedStructureAction::RenameTable { table, new_name } => {
                 let old_name = table.name.as_str().to_string();
@@ -764,6 +844,13 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
                 if let Some(columns) = self.created_tables.remove(&old_name) {
                     self.created_tables
                         .insert(new_name.as_str().to_string(), columns);
+                }
+                if let Some(indexes) = self.indexes.remove(&old_name) {
+                    self.indexes.insert(new_name.as_str().to_string(), indexes);
+                }
+                if let Some(constraints) = self.constraints.remove(&old_name) {
+                    self.constraints
+                        .insert(new_name.as_str().to_string(), constraints);
                 }
             }
             ValidatedStructureAction::DuplicateTable { table, new_name } => {
@@ -796,6 +883,13 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
                     self.created_tables
                         .insert(new_name.as_str().to_string(), columns);
                 }
+                if let Some(indexes) = self.indexes.get(&source_name).cloned() {
+                    self.indexes.insert(new_name.as_str().to_string(), indexes);
+                }
+                if let Some(constraints) = self.constraints.get(&source_name).cloned() {
+                    self.constraints
+                        .insert(new_name.as_str().to_string(), constraints);
+                }
             }
             ValidatedStructureAction::TruncateTable { table } => {
                 let Some(summary) = self
@@ -821,6 +915,8 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
                     )));
                 }
                 self.created_tables.remove(table.name.as_str());
+                self.indexes.remove(table.name.as_str());
+                self.constraints.remove(table.name.as_str());
             }
             ValidatedStructureAction::AddColumn {
                 table,
@@ -905,6 +1001,25 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
                     )));
                 }
                 columns[index].name = new_name.as_str().to_string();
+                if let Some(indexes) = self.indexes.get_mut(table.name.as_str()) {
+                    for index in indexes {
+                        rename_column_in_list(&mut index.columns, name.as_str(), new_name.as_str());
+                    }
+                }
+                if let Some(constraints) = self.constraints.get_mut(table.name.as_str()) {
+                    for constraint in constraints {
+                        rename_column_in_list(
+                            &mut constraint.columns,
+                            name.as_str(),
+                            new_name.as_str(),
+                        );
+                        rename_column_in_list(
+                            &mut constraint.referenced_columns,
+                            name.as_str(),
+                            new_name.as_str(),
+                        );
+                    }
+                }
             }
             ValidatedStructureAction::DropColumn { table, name } => {
                 let engine = self.engine;
@@ -923,6 +1038,20 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
                     })?;
                 columns.remove(index);
                 Self::renumber_columns(columns);
+                if let Some(indexes) = self.indexes.get_mut(table.name.as_str()) {
+                    for index in indexes.iter_mut() {
+                        index.columns.retain(|column| column != name.as_str());
+                    }
+                    indexes.retain(|index| !index.columns.is_empty());
+                }
+                if let Some(constraints) = self.constraints.get_mut(table.name.as_str()) {
+                    for constraint in constraints.iter_mut() {
+                        constraint.columns.retain(|column| column != name.as_str());
+                    }
+                    constraints.retain(|constraint| {
+                        constraint.kind == ConstraintKind::Check || !constraint.columns.is_empty()
+                    });
+                }
             }
             ValidatedStructureAction::ReorderColumn {
                 table,
@@ -961,8 +1090,192 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
                 columns.insert(insert_at, moved);
                 Self::renumber_columns(columns);
             }
-            // Index and constraint actions remain preview-only in this fixture.
-            _ => {}
+            ValidatedStructureAction::CreateIndex(options) => {
+                let table_name = table_key(self, &options.table)?;
+                let indexes = self.indexes.entry(table_name).or_default();
+                if indexes
+                    .iter()
+                    .any(|index| index.name.eq_ignore_ascii_case(options.name.as_str()))
+                {
+                    return Err(DatabaseError::query(format!(
+                        "Index {} already exists on table {}.",
+                        options.name, options.table.name
+                    )));
+                }
+                indexes.push(IndexSummary {
+                    name: options.name.as_str().to_string(),
+                    columns: options
+                        .columns
+                        .iter()
+                        .map(|column| column.as_str().to_string())
+                        .collect(),
+                    unique: options.unique,
+                    primary: false,
+                    method: MetadataValue::available(options.method.clone().unwrap_or_else(|| {
+                        match self.engine {
+                            DatabaseEngine::Mysql => "BTREE".to_string(),
+                            DatabaseEngine::Postgresql => "btree".to_string(),
+                        }
+                    })),
+                    predicate: match self.engine {
+                        DatabaseEngine::Mysql => MetadataValue::Unavailable,
+                        DatabaseEngine::Postgresql => {
+                            MetadataValue::available(options.predicate.clone())
+                        }
+                    },
+                });
+            }
+            ValidatedStructureAction::RenameIndex {
+                table,
+                name,
+                new_name,
+            } => {
+                let table_name = table_key(self, table)?;
+                let indexes = self.indexes.entry(table_name).or_default();
+                let Some(position) = indexes
+                    .iter()
+                    .position(|index| index.name.eq_ignore_ascii_case(name.as_str()))
+                else {
+                    return Err(DatabaseError::query(format!(
+                        "Index {} does not exist on table {}.",
+                        name, table.name
+                    )));
+                };
+                if indexes
+                    .iter()
+                    .any(|candidate| candidate.name.eq_ignore_ascii_case(new_name.as_str()))
+                {
+                    return Err(DatabaseError::query(format!(
+                        "Index {} already exists on table {}.",
+                        new_name, table.name
+                    )));
+                }
+                indexes[position].name = new_name.as_str().to_string();
+            }
+            ValidatedStructureAction::DropIndex { table, name } => {
+                let table_name = table_key(self, table)?;
+                let indexes = self.indexes.entry(table_name).or_default();
+                let Some(position) = indexes
+                    .iter()
+                    .position(|index| index.name.eq_ignore_ascii_case(name.as_str()))
+                else {
+                    return Err(DatabaseError::query(format!(
+                        "Index {} does not exist on table {}.",
+                        name, table.name
+                    )));
+                };
+                indexes.remove(position);
+            }
+            ValidatedStructureAction::AddConstraint { table, constraint } => {
+                let table_name = table_key(self, table)?;
+                let constraints = self.constraints.entry(table_name.clone()).or_default();
+                if constraints.iter().any(|existing| {
+                    existing
+                        .name
+                        .eq_ignore_ascii_case(constraint.name().as_str())
+                }) {
+                    return Err(DatabaseError::query(format!(
+                        "Constraint {} already exists on table {}.",
+                        constraint.name(),
+                        table.name
+                    )));
+                }
+                if constraint.kind() == ConstraintKind::PrimaryKey
+                    && constraints
+                        .iter()
+                        .any(|existing| existing.kind == ConstraintKind::PrimaryKey)
+                {
+                    return Err(DatabaseError::query(format!(
+                        "Table {} already has a primary key.",
+                        table.name
+                    )));
+                }
+
+                constraints.push(fake_constraint(constraint, self.engine));
+                match constraint {
+                    ValidatedConstraint::PrimaryKey { name, columns } => {
+                        if let Some(created) = self.created_tables.get_mut(&table_name) {
+                            for column in created {
+                                column.primary_key = columns
+                                    .iter()
+                                    .any(|key| key.as_str().eq_ignore_ascii_case(&column.name));
+                            }
+                        }
+                        self.indexes
+                            .entry(table_name)
+                            .or_default()
+                            .push(IndexSummary {
+                                name: match self.engine {
+                                    DatabaseEngine::Mysql => "PRIMARY".to_string(),
+                                    DatabaseEngine::Postgresql => name.as_str().to_string(),
+                                },
+                                columns: columns
+                                    .iter()
+                                    .map(|column| column.as_str().to_string())
+                                    .collect(),
+                                unique: true,
+                                primary: true,
+                                method: MetadataValue::available(match self.engine {
+                                    DatabaseEngine::Mysql => "BTREE".to_string(),
+                                    DatabaseEngine::Postgresql => "btree".to_string(),
+                                }),
+                                predicate: MetadataValue::available(None),
+                            });
+                    }
+                    ValidatedConstraint::Unique { name, columns } => {
+                        self.indexes
+                            .entry(table_name)
+                            .or_default()
+                            .push(IndexSummary {
+                                name: name.as_str().to_string(),
+                                columns: columns
+                                    .iter()
+                                    .map(|column| column.as_str().to_string())
+                                    .collect(),
+                                unique: true,
+                                primary: false,
+                                method: MetadataValue::available(match self.engine {
+                                    DatabaseEngine::Mysql => "BTREE".to_string(),
+                                    DatabaseEngine::Postgresql => "btree".to_string(),
+                                }),
+                                predicate: MetadataValue::available(None),
+                            });
+                    }
+                    ValidatedConstraint::ForeignKey { .. } | ValidatedConstraint::Check { .. } => {}
+                }
+            }
+            ValidatedStructureAction::DropConstraint { table, name, kind } => {
+                let table_name = table_key(self, table)?;
+                let constraints = self.constraints.entry(table_name.clone()).or_default();
+                let Some(position) = constraints.iter().position(|constraint| {
+                    constraint.kind == *kind
+                        && (constraint.name.eq_ignore_ascii_case(name.as_str())
+                            || (self.engine == DatabaseEngine::Mysql
+                                && *kind == ConstraintKind::PrimaryKey))
+                }) else {
+                    return Err(DatabaseError::query(format!(
+                        "Constraint {} does not exist on table {}.",
+                        name, table.name
+                    )));
+                };
+                constraints.remove(position);
+                if matches!(kind, ConstraintKind::PrimaryKey | ConstraintKind::Unique)
+                    && let Some(indexes) = self.indexes.get_mut(&table_name)
+                {
+                    indexes.retain(|index| match kind {
+                        ConstraintKind::PrimaryKey => !index.primary,
+                        ConstraintKind::Unique => !index.name.eq_ignore_ascii_case(name.as_str()),
+                        _ => true,
+                    });
+                }
+                if *kind == ConstraintKind::PrimaryKey
+                    && let Some(columns) = self.created_tables.get_mut(&table_name)
+                {
+                    for column in columns {
+                        column.primary_key = false;
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -1001,15 +1314,21 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
         self.require_capability(DatabaseAction::BrowseIndexes)?;
         self.require_connection()?;
 
-        if !self
+        let Some(summary) = self
             .tables
             .iter()
-            .any(|summary| Self::table_matches(summary, table) && summary.name == self.detail_table)
-        {
+            .find(|summary| Self::table_matches(summary, table))
+        else {
             return Ok(Page::from_items(Vec::new(), page, Some(0)));
-        }
+        };
 
-        Ok(Self::paginate(&self.indexes, page))
+        Ok(Self::paginate(
+            self.indexes
+                .get(&summary.name)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            page,
+        ))
     }
 
     async fn list_constraints(
@@ -1020,15 +1339,21 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
         self.require_capability(DatabaseAction::BrowseConstraints)?;
         self.require_connection()?;
 
-        if !self
+        let Some(summary) = self
             .tables
             .iter()
-            .any(|summary| Self::table_matches(summary, table) && summary.name == self.detail_table)
-        {
+            .find(|summary| Self::table_matches(summary, table))
+        else {
             return Ok(Page::from_items(Vec::new(), page, Some(0)));
-        }
+        };
 
-        Ok(Self::paginate(&self.constraints, page))
+        Ok(Self::paginate(
+            self.constraints
+                .get(&summary.name)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            page,
+        ))
     }
 
     async fn table_dependencies(
