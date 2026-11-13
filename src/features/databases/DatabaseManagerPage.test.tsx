@@ -6,7 +6,17 @@ import { DatabaseManagerPage } from "@/features/databases/DatabaseManagerPage";
 import { DEFAULT_PREFERENCES } from "@/lib/preferences";
 import { getConnectionState } from "@/services/connections";
 import { previewDatabaseAction, dropDatabase, setActiveDatabase } from "@/services/databaseActions";
-import { refreshExplorerNode } from "@/services/databaseDiscovery";
+import {
+  getTableDependencies,
+  listColumns,
+  listConstraints,
+  listIndexes,
+  refreshExplorerNode,
+} from "@/services/databaseDiscovery";
+import {
+  previewDatabaseStructureAction,
+  runDatabaseStructureAction,
+} from "@/services/databaseStructure";
 import {
   connectDatabaseProfile,
   deleteDatabaseProfile,
@@ -15,6 +25,8 @@ import {
   reconnectDatabaseProfile,
   testDatabaseProfile,
 } from "@/services/databaseProfiles";
+import { objectRowId } from "@/features/databases/databaseExplorerTreeModel";
+import type { DatabaseWorkspaceView } from "@/stores/databaseWorkspaceStore";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { databaseExplorerNodeKey, useDatabaseExplorerStore } from "@/stores/databaseExplorerStore";
 import { useDatabaseProfileStore } from "@/stores/databaseProfileStore";
@@ -24,10 +36,20 @@ import { useServerStore } from "@/stores/serverStore";
 import type {
   ConnectionSnapshot,
   DatabaseCapabilities,
+  DatabaseColumnSummary,
   DatabaseConnectionSnapshot,
+  DatabaseConstraintSummary,
   DatabaseExplorerNodePayload,
+  DatabaseIndexSummary,
   DatabaseProfile,
+  DatabaseStructureActionRequest,
+  DatabaseStructureActionResult,
   DatabaseSummary,
+  DatabaseBounded,
+  DatabaseDependencySummary,
+  DatabaseMetadataValue,
+  DatabaseTableDependencies,
+  DatabaseTableSummary,
   DatabaseTestResult,
   ServerProfile,
 } from "@/types/contracts";
@@ -68,9 +90,18 @@ vi.mock("@/services/databaseDiscovery", () => ({
   listTables: vi.fn(),
   listViews: vi.fn(),
   listSequences: vi.fn(),
+  listColumns: vi.fn(),
+  listIndexes: vi.fn(),
+  listConstraints: vi.fn(),
+  getTableDependencies: vi.fn(),
   getObjectCounts: vi.fn(),
   loadExplorerNode: vi.fn(),
   refreshExplorerNode: vi.fn(),
+}));
+
+vi.mock("@/services/databaseStructure", () => ({
+  previewDatabaseStructureAction: vi.fn(),
+  runDatabaseStructureAction: vi.fn(),
 }));
 
 const server: ServerProfile = {
@@ -105,7 +136,7 @@ const profile: DatabaseProfile = {
   databaseName: "app",
   username: "app",
   hasCredential: true,
-  readOnly: true,
+  readOnly: false,
   sslMode: "required",
   createdAt: 1,
   updatedAt: 1,
@@ -159,7 +190,33 @@ const capabilities: DatabaseCapabilities = {
     partialIndexes: true,
     queryTimeout: true,
   },
-  actions: ["browse_databases", "run_query"],
+  actions: [
+    "browse_databases",
+    "browse_schemas",
+    "browse_tables",
+    "browse_columns",
+    "browse_indexes",
+    "browse_constraints",
+    "browse_views",
+    "browse_sequences",
+    "show_object_size",
+    "create_table",
+    "rename_table",
+    "duplicate_table",
+    "truncate_table",
+    "drop_table",
+    "add_column",
+    "edit_column",
+    "rename_column",
+    "drop_column",
+    "create_index",
+    "rename_index",
+    "drop_index",
+    "create_check_constraint",
+    "create_generated_column",
+    "create_identity_column",
+    "run_query",
+  ],
 };
 
 const connectedSnapshot: DatabaseConnectionSnapshot = {
@@ -168,7 +225,7 @@ const connectedSnapshot: DatabaseConnectionSnapshot = {
   name: profile.name,
   engine: profile.engine,
   state: "connected",
-  readOnly: true,
+  readOnly: false,
   databaseName: "app",
   version: { version: "16.2.0", raw: "PostgreSQL 16.2" },
   capabilities,
@@ -285,6 +342,243 @@ const actionResult = (
   durationMs: 4,
 });
 
+function available<T>(value: T): DatabaseMetadataValue<T> {
+  return { status: "available", value };
+}
+
+const unavailable = { status: "unavailable" } as const;
+
+function bounded<T>(items: T[]): DatabaseBounded<T> {
+  return { items, limit: 100, truncated: false };
+}
+
+const usersTable: DatabaseTableSummary = {
+  database: "app",
+  schema: "public",
+  name: "users",
+  kind: "table",
+  estimatedRows: available(42),
+  metadataRefreshedAt: available("2026-02-01 12:00:00"),
+  owner: available("app"),
+  encoding: available("UTF8"),
+  collation: available("C.UTF-8"),
+  sizeBytes: available(16_384),
+  engine: unavailable,
+};
+
+const tablesPayload: DatabaseExplorerNodePayload = {
+  nodeKind: "tables",
+  payload: {
+    items: [usersTable],
+    limit: 100,
+    offset: 0,
+    hasMore: false,
+    total: 1,
+  },
+};
+
+function columnSummary(
+  overrides: Partial<DatabaseColumnSummary> &
+    Pick<DatabaseColumnSummary, "name" | "ordinalPosition">,
+): DatabaseColumnSummary {
+  return {
+    dataType: "bigint",
+    length: available(null),
+    precision: available(20),
+    scale: available(0),
+    nullable: false,
+    defaultValue: available(null),
+    primaryKey: false,
+    identity: available("none"),
+    generated: available(false),
+    generationExpression: available(null),
+    comment: available(null),
+    collation: available(null),
+    ...overrides,
+  };
+}
+
+const columns: DatabaseColumnSummary[] = [
+  columnSummary({
+    name: "id",
+    ordinalPosition: 1,
+    primaryKey: true,
+    identity: available("by_default"),
+  }),
+  columnSummary({
+    name: "email",
+    ordinalPosition: 2,
+    dataType: "character varying",
+    length: available(255),
+    precision: unavailable,
+    scale: unavailable,
+    nullable: true,
+    defaultValue: available("'pending'"),
+    comment: available("Login email"),
+  }),
+];
+
+const indexes: DatabaseIndexSummary[] = [
+  {
+    name: "users_pkey",
+    columns: ["id"],
+    unique: true,
+    primary: true,
+    method: available("btree"),
+    predicate: available(null),
+  },
+  {
+    name: "users_email_idx",
+    columns: ["email"],
+    unique: true,
+    primary: false,
+    method: available("btree"),
+    predicate: available(null),
+  },
+];
+
+const constraints: DatabaseConstraintSummary[] = [
+  {
+    name: "users_pkey",
+    kind: "primary_key",
+    columns: ["id"],
+    referencedSchema: unavailable,
+    referencedTable: unavailable,
+    referencedColumns: [],
+    onUpdate: unavailable,
+    onDelete: unavailable,
+    checkExpression: unavailable,
+    deferrable: available(false),
+    initiallyDeferred: available(false),
+  },
+  {
+    name: "users_team_id_fkey",
+    kind: "foreign_key",
+    columns: ["team_id"],
+    referencedSchema: available("public"),
+    referencedTable: available("teams"),
+    referencedColumns: ["id"],
+    onUpdate: available("CASCADE"),
+    onDelete: available("SET NULL"),
+    checkExpression: unavailable,
+    deferrable: available(false),
+    initiallyDeferred: available(false),
+  },
+];
+
+const dependency: DatabaseDependencySummary = {
+  kind: "incoming_foreign_key",
+  name: "orders_user_id_fkey",
+  database: "app",
+  schema: "public",
+  table: "orders",
+  columns: ["user_id"],
+  referencedColumns: ["id"],
+  onUpdate: available("CASCADE"),
+  onDelete: available("CASCADE"),
+  details: available("orders.user_id references users.id"),
+};
+
+const dependencies: DatabaseTableDependencies = {
+  incomingForeignKeys: available(bounded([dependency])),
+  dependentViews: available(bounded([])),
+  ownedSequences: unavailable,
+  triggers: available(bounded([])),
+};
+
+const tableSelection = {
+  id: objectRowId(profile.id, "app", "public", "tables", "users"),
+  profileId: profile.id,
+  kind: "table" as const,
+  label: "users",
+  engine: profile.engine,
+  database: "app",
+  schema: "public",
+  objectName: "users",
+};
+
+const tableStructurePreview = (
+  request: DatabaseStructureActionRequest,
+): import("@/types/contracts").DatabaseStructureDdlPreview => {
+  const object = {
+    kind:
+      request.kind === "drop_column" ||
+      request.kind === "add_column" ||
+      request.kind === "alter_column" ||
+      request.kind === "rename_column"
+        ? ("column" as const)
+        : request.kind === "create_index" ||
+            request.kind === "rename_index" ||
+            request.kind === "drop_index"
+          ? ("index" as const)
+          : request.kind === "add_constraint" || request.kind === "drop_constraint"
+            ? ("constraint" as const)
+            : ("table" as const),
+    database: "app",
+    schema: "public",
+    table:
+      request.kind === "create_table"
+        ? request.name
+        : request.kind === "rename_table" ||
+            request.kind === "duplicate_table" ||
+            request.kind === "truncate_table" ||
+            request.kind === "drop_table"
+          ? request.name
+          : request.table,
+    name:
+      request.kind === "drop_column" || request.kind === "rename_column"
+        ? request.name
+        : request.kind === "drop_index" || request.kind === "rename_index"
+          ? request.name
+          : request.kind === "drop_constraint"
+            ? request.name
+            : null,
+  };
+  const destructive = request.kind === "drop_column" || request.kind === "drop_table";
+  const ddl = `ALTER TABLE "public"."users" /* ${request.kind} */;`;
+  return {
+    action: request.kind,
+    engine: "postgresql",
+    object,
+    statements: [ddl],
+    ddl,
+    warnings: destructive ? ["Dependent objects may be affected."] : [],
+    destructive,
+    requiresConfirmation: destructive,
+  };
+};
+
+const structureResult = (
+  request: DatabaseStructureActionRequest,
+): DatabaseStructureActionResult => ({
+  action: request.kind,
+  engine: "postgresql",
+  object:
+    request.kind === "drop_table" || request.kind === "truncate_table"
+      ? {
+          kind: "table",
+          database: "app",
+          schema: "public",
+          table: request.name,
+          name: null,
+        }
+      : {
+          kind: "table",
+          database: "app",
+          schema: "public",
+          table: "table" in request ? request.table : request.name,
+          name: null,
+        },
+  targetTable: null,
+  statements: [],
+  warnings: [],
+  verified: true,
+  verification: `Metadata re-read confirms ${request.kind}.`,
+  verificationError: null,
+  metadata: usersTable,
+  durationMs: 3,
+});
+
 const testResult: DatabaseTestResult = {
   profileId: profile.id,
   serverId: server.id,
@@ -395,6 +689,39 @@ function useTwoDatabaseNodes() {
   });
 }
 
+function useSelectedTable(
+  view: DatabaseWorkspaceView,
+  snapshot: DatabaseConnectionSnapshot = connectedSnapshot,
+) {
+  useConnectedServer();
+  useProfileStore({ snapshots: { [profile.id]: snapshot } });
+  useDatabaseWorkspaceStore.getState().openTab(profile);
+  useDatabaseWorkspaceStore.getState().setSelection(profile.id, tableSelection);
+  useDatabaseWorkspaceStore.getState().setActiveView(profile.id, view);
+  useDatabaseExplorerStore.setState({
+    nodes: {
+      [databaseExplorerNodeKey(profile.id, {
+        kind: "tables",
+        database: "app",
+        schema: "public",
+      })]: {
+        status: "ready",
+        payload: tablesPayload,
+        updatedAt: 1,
+      },
+    },
+    error: null,
+    commandError: null,
+  });
+}
+
+function useWorkspaceWithoutTable(view: DatabaseWorkspaceView) {
+  useConnectedServer();
+  useProfileStore();
+  useDatabaseWorkspaceStore.getState().openTab(profile);
+  useDatabaseWorkspaceStore.getState().setActiveView(profile.id, view);
+}
+
 describe("DatabaseManagerPage", () => {
   beforeEach(() => {
     enableTauriRuntime();
@@ -455,6 +782,44 @@ describe("DatabaseManagerPage", () => {
     vi.mocked(setActiveDatabase).mockResolvedValue(actionResult("set_active", "analytics"));
     vi.mocked(refreshExplorerNode).mockReset();
     vi.mocked(refreshExplorerNode).mockResolvedValue(databasesPayload);
+    vi.mocked(listColumns).mockReset();
+    vi.mocked(listColumns).mockResolvedValue({
+      items: columns,
+      limit: 100,
+      offset: 0,
+      hasMore: false,
+      total: columns.length,
+    });
+    vi.mocked(listIndexes).mockReset();
+    vi.mocked(listIndexes).mockResolvedValue({
+      items: indexes,
+      limit: 100,
+      offset: 0,
+      hasMore: false,
+      total: indexes.length,
+    });
+    vi.mocked(listConstraints).mockReset();
+    vi.mocked(listConstraints).mockResolvedValue({
+      items: constraints,
+      limit: 100,
+      offset: 0,
+      hasMore: false,
+      total: constraints.length,
+    });
+    vi.mocked(getTableDependencies).mockReset();
+    vi.mocked(getTableDependencies).mockResolvedValue(dependencies);
+    vi.mocked(previewDatabaseStructureAction).mockReset();
+    vi.mocked(previewDatabaseStructureAction).mockImplementation((_profileId, request) =>
+      Promise.resolve(tableStructurePreview(request)),
+    );
+    vi.mocked(runDatabaseStructureAction).mockReset();
+    vi.mocked(runDatabaseStructureAction).mockImplementation((_profileId, request) =>
+      Promise.resolve(structureResult(request)),
+    );
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: vi.fn().mockResolvedValue(undefined) },
+    });
   });
 
   it("renders the connection list with engine, server, endpoint, status, and runtime details", async () => {
@@ -1107,5 +1472,291 @@ describe("DatabaseManagerPage", () => {
     await user.click(screen.getByRole("button", { name: "Try again" }));
 
     expect(fetchServers).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows table overview, structure, and indexes for the selected table", async () => {
+    const user = userEvent.setup();
+    useSelectedTable("overview");
+    renderPage();
+
+    expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
+    const summary = screen.getByRole("region", { name: "Table summary" });
+    expect(within(summary).getByText("users")).toBeInTheDocument();
+    expect(within(summary).getByText("42")).toBeInTheDocument();
+    expect(within(summary).getByText("16 KB")).toBeInTheDocument();
+
+    const relationships = screen.getByRole("region", { name: "Table relationships" });
+    expect(await within(relationships).findByText("users_team_id_fkey")).toBeInTheDocument();
+    expect(within(relationships).getByText("public.teams (id)")).toBeInTheDocument();
+    expect(await within(relationships).findByText("orders_user_id_fkey")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "Structure" }));
+    const columnsRegion = await screen.findByRole("region", { name: "Table columns" });
+    expect(within(columnsRegion).getByText("email")).toBeInTheDocument();
+    expect(within(columnsRegion).getByText("character varying(255)")).toBeInTheDocument();
+    expect(within(columnsRegion).getByText("Login email")).toBeInTheDocument();
+    const constraintsRegion = screen.getByRole("region", { name: "Table constraints" });
+    expect(within(constraintsRegion).getByText("users_team_id_fkey")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "Indexes" }));
+    const indexesRegion = await screen.findByRole("region", { name: "Table indexes" });
+    expect(within(indexesRegion).getByText("users_email_idx")).toBeInTheDocument();
+    expect(within(indexesRegion).getByText("users_pkey")).toBeInTheDocument();
+  });
+
+  it("previews and copies DDL before adding a column", async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    useSelectedTable("structure");
+    renderPage();
+
+    expect(await screen.findByRole("region", { name: "Table columns" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Add column" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Add column" });
+    const apply = within(dialog).getByRole("button", { name: "Add column" });
+    expect(apply).toBeDisabled();
+
+    await user.type(within(dialog).getByLabelText("Column name"), "nickname");
+    await user.type(within(dialog).getByLabelText("Data type"), "character varying(120)");
+    await user.click(within(dialog).getByRole("button", { name: "Preview DDL" }));
+
+    expect(await within(dialog).findByText(/add_column/)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Copy DDL" }));
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
+      'ALTER TABLE "public"."users" /* add_column */;',
+    );
+    expect(apply).toBeEnabled();
+
+    await user.click(apply);
+
+    await waitFor(() => {
+      expect(runDatabaseStructureAction).toHaveBeenCalledWith(
+        profile.id,
+        expect.objectContaining({
+          kind: "add_column",
+          table: "users",
+          column: expect.objectContaining({ name: "nickname" }),
+        }),
+        false,
+      );
+    });
+  });
+
+  it("sends only changed column properties on PostgreSQL edits", async () => {
+    const user = userEvent.setup();
+    useSelectedTable("structure");
+    renderPage();
+
+    expect(await screen.findByRole("region", { name: "Table columns" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Edit column email" }));
+    const dialog = await screen.findByRole("dialog", { name: "Edit column email" });
+    const comment = within(dialog).getByLabelText("Comment");
+    await user.clear(comment);
+    await user.type(comment, "Updated sign-in address");
+    await user.click(within(dialog).getByRole("button", { name: "Preview DDL" }));
+    expect(await within(dialog).findByText(/alter_column/)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Apply column change" }));
+
+    await waitFor(() => {
+      expect(runDatabaseStructureAction).toHaveBeenCalledTimes(1);
+    });
+    const request = vi.mocked(runDatabaseStructureAction).mock.calls[0][1];
+    expect(request).toMatchObject({
+      kind: "alter_column",
+      name: "email",
+      comment: "Updated sign-in address",
+    });
+    expect(request).not.toHaveProperty("dataType");
+    expect(request).not.toHaveProperty("nullable");
+  });
+
+  it("requires confirmation after showing DDL before dropping a column", async () => {
+    const user = userEvent.setup();
+    useSelectedTable("structure");
+    renderPage();
+
+    expect(await screen.findByRole("region", { name: "Table columns" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Drop column email" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Drop column email?" });
+    expect(await within(dialog).findByText(/drop_column/)).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("Column data will be permanently deleted."),
+    ).toBeInTheDocument();
+    expect(runDatabaseStructureAction).not.toHaveBeenCalled();
+
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog", { name: "Drop column email?" })).not.toBeInTheDocument();
+    expect(runDatabaseStructureAction).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Drop column email" }));
+    const confirmDialog = await screen.findByRole("dialog", { name: "Drop column email?" });
+    expect(await within(confirmDialog).findByText(/drop_column/)).toBeInTheDocument();
+    await user.click(within(confirmDialog).getByRole("button", { name: "Drop column" }));
+
+    await waitFor(() => {
+      expect(runDatabaseStructureAction).toHaveBeenCalledWith(
+        profile.id,
+        expect.objectContaining({ kind: "drop_column", name: "email" }),
+        true,
+      );
+    });
+  });
+
+  it("disables unsupported structure actions and explains why", async () => {
+    const limitedCapabilities: DatabaseCapabilities = {
+      ...capabilities,
+      actions: capabilities.actions.filter(
+        (action) => action !== "rename_column" && action !== "create_check_constraint",
+      ),
+    };
+    useSelectedTable("structure", {
+      ...connectedSnapshot,
+      capabilities: limitedCapabilities,
+    });
+    vi.mocked(getDatabaseConnectionState).mockResolvedValue({
+      ...connectedSnapshot,
+      capabilities: limitedCapabilities,
+    });
+    renderPage();
+
+    const rename = await screen.findByRole("button", { name: "Rename column email" });
+    expect(rename).toBeDisabled();
+    expect(rename).toHaveAttribute(
+      "title",
+      "Column renaming is not supported by PostgreSQL 16.2.0.",
+    );
+    const notice = screen.getByRole("note", { name: "Unavailable structure actions" });
+    expect(notice).toHaveTextContent("Column renaming is not supported by PostgreSQL 16.2.0.");
+    expect(notice).toHaveTextContent(
+      "Check constraint creation is not supported by PostgreSQL 16.2.0.",
+    );
+    expect(screen.getByRole("button", { name: "Add constraint" })).toBeEnabled();
+  });
+
+  it("keeps dependency errors inside the destructive confirmation", async () => {
+    const user = userEvent.setup();
+    vi.mocked(runDatabaseStructureAction).mockRejectedValue({
+      code: "conflict",
+      message: "orders_user_id_fkey still references users.id.",
+      details: "Drop or redefine the incoming foreign key before dropping this column.",
+    });
+    useSelectedTable("structure");
+    renderPage();
+
+    expect(await screen.findByRole("region", { name: "Table columns" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Drop column id" }));
+    const dialog = await screen.findByRole("dialog", { name: "Drop column id?" });
+    expect(await within(dialog).findByText(/drop_column/)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Drop column" }));
+
+    expect(await within(dialog).findByText("Blocked by dependencies")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("orders_user_id_fkey still references users.id."),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(
+        "Drop or redefine the incoming foreign key before dropping this column.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a permission-denied state scoped to the table", async () => {
+    vi.mocked(listColumns).mockRejectedValue({
+      code: "permission",
+      message: "The database account cannot read this table's columns.",
+      scope: { object: "table", name: "users" },
+    });
+    useSelectedTable("structure");
+    renderPage();
+
+    expect(await screen.findByText("Permission denied")).toBeInTheDocument();
+    expect(
+      screen.getByText(/The database account cannot read this table's columns/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Scoped to table users/)).toBeInTheDocument();
+  });
+
+  it("keeps typed permission errors inside the action dialog", async () => {
+    const user = userEvent.setup();
+    vi.mocked(runDatabaseStructureAction).mockRejectedValue({
+      code: "permission",
+      message: "The database account cannot add columns to this table.",
+    });
+    useSelectedTable("structure");
+    renderPage();
+
+    expect(await screen.findByRole("region", { name: "Table columns" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Add column" }));
+    const dialog = await screen.findByRole("dialog", { name: "Add column" });
+    await user.type(within(dialog).getByLabelText("Column name"), "handle");
+    await user.type(within(dialog).getByLabelText("Data type"), "text");
+    await user.click(within(dialog).getByRole("button", { name: "Preview DDL" }));
+    expect(await within(dialog).findByText(/add_column/)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Add column" }));
+
+    expect(await within(dialog).findByText("Permission denied")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("The database account cannot add columns to this table."),
+    ).toBeInTheDocument();
+  });
+
+  it("shows an empty index state when the table has no indexes", async () => {
+    vi.mocked(listIndexes).mockResolvedValue({
+      items: [],
+      limit: 100,
+      offset: 0,
+      hasMore: false,
+      total: 0,
+    });
+    useSelectedTable("indexes");
+    renderPage();
+
+    expect(await screen.findByText("No indexes reported")).toBeInTheDocument();
+  });
+
+  it("shows a disconnected state for a selected table", () => {
+    useSelectedTable("structure", disconnectedSnapshot);
+    renderPage();
+
+    expect(screen.getByText("Connection required")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Connect Primary" })).toBeInTheDocument();
+  });
+
+  it("creates a table from the structure workspace after a DDL preview", async () => {
+    const user = userEvent.setup();
+    useWorkspaceWithoutTable("structure");
+    renderPage();
+
+    expect(screen.getByRole("heading", { name: "No table selected" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Create table" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Create table" });
+    const apply = within(dialog).getByRole("button", { name: "Create table" });
+    expect(apply).toBeDisabled();
+
+    await user.type(within(dialog).getByLabelText("Table name"), "audit_log");
+    await user.type(within(dialog).getByLabelText("Column 1 name"), "id");
+    await user.type(within(dialog).getByLabelText("Column 1 type"), "bigint");
+    await user.click(within(dialog).getByRole("button", { name: "Preview DDL" }));
+    expect(await within(dialog).findByText(/create_table/)).toBeInTheDocument();
+    await user.click(apply);
+
+    await waitFor(() => {
+      expect(runDatabaseStructureAction).toHaveBeenCalledWith(
+        profile.id,
+        expect.objectContaining({
+          kind: "create_table",
+          name: "audit_log",
+          columns: [expect.objectContaining({ name: "id", dataType: "bigint" })],
+        }),
+        false,
+      );
+    });
   });
 });

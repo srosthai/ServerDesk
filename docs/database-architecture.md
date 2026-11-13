@@ -341,8 +341,8 @@ receive validated identifiers, type names, and typed values only. Execution is
 implemented for table create, rename, duplicate, truncate, and drop; column
 add, edit, rename, drop, and engine-supported reorder; index create, rename
 where supported, and drop; and primary-key, unique, foreign-key, and check
-constraint add/drop. The full structure editor remains #174, but it uses this
-same preview/capability/execution contract. Every execution command regenerates
+constraint add/drop. The Structure workspace uses this same
+preview/capability/execution contract. Every execution command regenerates
 the preview before touching the database.
 
 Requests are tagged by `kind` and cover table, column, index, and constraint
@@ -461,7 +461,10 @@ structure commands. It exposes typed preview, table create/rename/duplicate/
 truncate/drop helpers, column add/edit/rename/drop/reorder helpers, and index
 create/rename/drop plus constraint add/drop helpers. Truncate, column drop, drop
 index, drop constraint, and other destructive actions require an explicit
-confirmation argument. The full structure UI remains #174.
+confirmation argument. The structure workspace in
+`src/features/databases/DatabaseStructurePanels.tsx` and
+`DatabaseStructureDialogs.tsx` consumes these helpers; it generates no SQL of
+its own.
 
 ## Discovery command contract
 
