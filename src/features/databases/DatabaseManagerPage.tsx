@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import type { Icon } from "@phosphor-icons/react";
 import {
@@ -35,7 +35,22 @@ import { DatabaseConnectionList, EngineBadge } from "@/features/databases/Databa
 import { DatabaseActionDialog } from "@/features/databases/DatabaseActionDialog";
 import { DatabaseExplorerTree } from "@/features/databases/DatabaseExplorerTree";
 import {
+  DatabaseTableIndexesPanel,
+  DatabaseTableOverviewPanel,
+  DatabaseTableSelectionEmpty,
+  DatabaseTableStructurePanel,
+} from "@/features/databases/DatabaseStructurePanels";
+import { DatabaseStructureActionHost } from "@/features/databases/DatabaseStructureDialogs";
+import {
+  findTableSummary,
+  structureCapabilitiesFor,
+  tableSummaryKey,
+  type DatabaseStructureIntent,
+  type DatabaseTableScope,
+} from "@/features/databases/databaseStructureModel";
+import {
   databaseRowId,
+  objectRowId,
   type DatabaseExplorerSelection,
 } from "@/features/databases/databaseExplorerTreeModel";
 import { DatabaseProfileDialog } from "@/features/databases/DatabaseProfileDialog";
@@ -46,6 +61,7 @@ import {
   formatLatency,
 } from "@/features/databases/databaseProfileForm";
 import { useActiveServer } from "@/hooks/useActiveServer";
+import { useDatabaseTableStructure } from "@/hooks/useDatabaseTableStructure";
 import { getCommandErrorMessage } from "@/lib/errors";
 import { isTauriRuntime } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
@@ -67,6 +83,8 @@ import type {
   DatabaseConnectionState,
   DatabaseDdlPreview,
   DatabaseProfile,
+  DatabaseStructureActionResult,
+  DatabaseTableSummary,
   DatabaseTestResult,
   DatabaseTunnelSnapshot,
   ServerProfile,
@@ -1025,6 +1043,10 @@ function DatabaseManagerPage() {
   } | null>(null);
   const [dropPending, setDropPending] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [structureIntent, setStructureIntent] = useState<DatabaseStructureIntent | null>(null);
+  const [tableSummaryOverrides, setTableSummaryOverrides] = useState<
+    Record<string, DatabaseTableSummary>
+  >({});
 
   const workspaceTabs = useDatabaseWorkspaceStore((state) => state.tabs);
   const workspaceOrder = useDatabaseWorkspaceStore((state) => state.order);
@@ -1034,6 +1056,7 @@ function DatabaseManagerPage() {
   const activateWorkspaceTab = useDatabaseWorkspaceStore((state) => state.activateTab);
   const setWorkspaceView = useDatabaseWorkspaceStore((state) => state.setActiveView);
   const setWorkspaceSelection = useDatabaseWorkspaceStore((state) => state.setSelection);
+  const explorerNodes = useDatabaseExplorerStore((state) => state.nodes);
   const autoOpenedTab = useRef(false);
 
   const workspaceState = workspaceStateFor({
@@ -1061,6 +1084,27 @@ function DatabaseManagerPage() {
   const selectedEngine = selectedProfile?.engine ?? activeTab?.engine ?? null;
   const selectedSchema =
     activeExplorerSelection?.schema ?? (selectedEngine === "mysql" ? selectedDatabase : null);
+  const structureProfile: DatabaseProfile | null = selectedProfile
+    ? selectedProfile
+    : activeTab
+      ? {
+          id: activeTab.profileId,
+          serverId: activeTab.serverId,
+          name: activeTab.name,
+          engine: activeTab.engine,
+          host: activeTab.host,
+          port: activeTab.port,
+          socket: activeTab.socket,
+          databaseName: activeTab.databaseName,
+          username: "",
+          hasCredential: false,
+          readOnly: activeTab.readOnly,
+          sslMode: null,
+          createdAt: 0,
+          updatedAt: 0,
+          lastUsedAt: null,
+        }
+      : null;
   const selectedObject =
     activeExplorerSelection &&
     (activeExplorerSelection.kind === "table" ||
@@ -1074,6 +1118,175 @@ function DatabaseManagerPage() {
   const profilesRecord = profiles.length > 0 ? snapshots : EMPTY_SNAPSHOTS;
   const testResultsRecord = profiles.length > 0 ? testResults : EMPTY_TEST_RESULTS;
   const busyRecord = profiles.length > 0 ? busy : EMPTY_BUSY;
+
+  const selectedTableScope = useMemo<DatabaseTableScope | null>(() => {
+    if (activeExplorerSelection?.kind !== "table") {
+      return null;
+    }
+    const table = activeExplorerSelection.objectName ?? activeExplorerSelection.label;
+    if (!table) {
+      return null;
+    }
+    return {
+      database: activeExplorerSelection.database ?? selectedDatabase,
+      schema: activeExplorerSelection.schema ?? selectedSchema,
+      table,
+    };
+  }, [activeExplorerSelection, selectedDatabase, selectedSchema]);
+
+  const tableWorkspaceScope = useMemo<DatabaseTableScope>(
+    () => selectedTableScope ?? { database: selectedDatabase, schema: selectedSchema, table: "" },
+    [selectedDatabase, selectedSchema, selectedTableScope],
+  );
+
+  const selectedTableSummary = useMemo(() => {
+    if (!selectedTableScope || !selectedProfileId) {
+      return null;
+    }
+    return (
+      tableSummaryOverrides[tableSummaryKey(selectedProfileId, selectedTableScope)] ??
+      findTableSummary(explorerNodes, selectedProfileId, selectedTableScope)
+    );
+  }, [explorerNodes, selectedProfileId, selectedTableScope, tableSummaryOverrides]);
+
+  const selectedEngineForStructure = selectedEngine ?? activeTab?.engine ?? "postgresql";
+  const structureConnected = selectedSnapshot?.state === "connected";
+  const structureCapabilities = useMemo(
+    () =>
+      structureCapabilitiesFor({
+        engine: selectedEngineForStructure,
+        version: selectedSnapshot?.version?.version,
+        connected: structureConnected,
+        readOnly: selectedSnapshot?.readOnly ?? selectedProfile?.readOnly ?? false,
+        actions: selectedSnapshot?.capabilities?.actions,
+        flags: selectedSnapshot?.capabilities?.flags,
+      }),
+    [
+      selectedEngineForStructure,
+      selectedProfile?.readOnly,
+      selectedSnapshot?.capabilities?.actions,
+      selectedSnapshot?.capabilities?.flags,
+      selectedSnapshot?.readOnly,
+      selectedSnapshot?.version?.version,
+      structureConnected,
+    ],
+  );
+
+  const tableStructure = useDatabaseTableStructure({
+    profileId: selectedProfileId,
+    database: tableWorkspaceScope.database,
+    schema: tableWorkspaceScope.schema,
+    table: selectedTableScope?.table ?? null,
+    connected: structureConnected,
+  });
+
+  function selectTableByName(
+    profile: DatabaseProfile,
+    scope: DatabaseTableScope,
+    table: string,
+  ): void {
+    const database = scope.database;
+    if (!database) {
+      return;
+    }
+    setWorkspaceSelection(profile.id, {
+      id: objectRowId(
+        profile.id,
+        database,
+        profile.engine === "mysql" ? null : scope.schema,
+        "tables",
+        table,
+      ),
+      profileId: profile.id,
+      kind: "table",
+      label: table,
+      engine: profile.engine,
+      database,
+      schema: profile.engine === "mysql" ? null : scope.schema,
+      objectName: table,
+    });
+  }
+
+  function selectDatabaseRow(profile: DatabaseProfile, database: string): void {
+    setWorkspaceSelection(profile.id, {
+      id: databaseRowId(profile.id, database),
+      profileId: profile.id,
+      kind: "database",
+      label: database,
+      engine: profile.engine,
+      database,
+      schema: null,
+      objectName: null,
+    });
+  }
+
+  async function refreshTableExplorer(
+    profile: DatabaseProfile,
+    scope: DatabaseTableScope,
+  ): Promise<boolean> {
+    if (!scope.database) {
+      return false;
+    }
+    const payload = await useDatabaseExplorerStore.getState().refreshNode(profile.id, {
+      kind: "tables",
+      database: scope.database,
+      schema: profile.engine === "mysql" ? null : scope.schema,
+    });
+    return payload !== null;
+  }
+
+  async function handleStructureActionCompleted(
+    result: DatabaseStructureActionResult,
+    intent: DatabaseStructureIntent,
+    profile: DatabaseProfile,
+  ): Promise<void> {
+    setActionError(null);
+    const scope: DatabaseTableScope = {
+      database: result.metadata?.database ?? result.object.database ?? tableWorkspaceScope.database,
+      schema: result.metadata?.schema ?? result.object.schema ?? tableWorkspaceScope.schema,
+      table: result.targetTable ?? result.metadata?.name ?? result.object.table,
+    };
+
+    if (result.metadata) {
+      setTableSummaryOverrides((current) => ({
+        ...current,
+        [tableSummaryKey(profile.id, scope)]: result.metadata as DatabaseTableSummary,
+      }));
+    }
+
+    const refreshed = await refreshTableExplorer(profile, tableWorkspaceScope);
+    tableStructure.reload();
+
+    if (!result.verified) {
+      setNotice(null);
+      setActionError(
+        result.verificationError ??
+          result.verification ??
+          "The structure action finished, but metadata verification did not confirm the result.",
+      );
+      return;
+    }
+
+    setNotice(result.verification);
+
+    if (
+      intent.type === "create_table" ||
+      intent.type === "rename_table" ||
+      intent.type === "duplicate_table"
+    ) {
+      selectTableByName(profile, scope, scope.table);
+    } else if (intent.type === "drop_table") {
+      if (tableWorkspaceScope.database) {
+        selectDatabaseRow(profile, tableWorkspaceScope.database);
+      }
+    }
+
+    if (!refreshed) {
+      setActionError(
+        "The structure action was verified, but the Tables node could not refresh. Use Refresh to reload the explorer.",
+      );
+    }
+  }
 
   useEffect(() => {
     if (serverStatus === "idle") {
@@ -1333,6 +1546,16 @@ function DatabaseManagerPage() {
     // by profile id, so resetting one cannot touch another connection's tree.
     closeWorkspaceTab(profileId);
     useDatabaseExplorerStore.getState().resetProfile(profileId);
+    setStructureIntent(null);
+    setTableSummaryOverrides((current) => {
+      const next = { ...current };
+      Object.keys(next).forEach((key) => {
+        if (key.startsWith(`${profileId}::`)) {
+          delete next[key];
+        }
+      });
+      return next;
+    });
 
     if (isTauriRuntime()) {
       // The command is idempotent and also closes a tunnel that exists without
@@ -1566,23 +1789,118 @@ function DatabaseManagerPage() {
                             onRetry={() => void fetchServers()}
                           />
                         ) : tab.value === "overview" ? (
-                          <DatabaseConnectionList
-                            profiles={profiles}
-                            servers={servers}
-                            snapshots={profilesRecord}
-                            testResults={testResultsRecord}
-                            busy={busyRecord}
-                            selectedProfileId={selectedProfileId}
-                            sshConnected={sshConnected}
-                            onOpen={handleOpenWorkspace}
-                            onConnect={(profile) => void handleConnect(profile)}
-                            onReconnect={(profile) => void handleReconnect(profile)}
-                            onDisconnect={(profile) => void handleDisconnect(profile)}
-                            onTest={(profile) => void handleTest(profile)}
-                            onEdit={openEditDialog}
-                            onDelete={setDeleteTarget}
-                            onAdd={openCreateDialog}
-                          />
+                          selectedTableScope && structureProfile ? (
+                            <DatabaseTableOverviewPanel
+                              scope={selectedTableScope}
+                              profileName={structureProfile.name}
+                              engine={selectedEngineForStructure}
+                              connected={structureConnected}
+                              summary={selectedTableSummary}
+                              structure={tableStructure}
+                              capabilities={structureCapabilities}
+                              onIntent={setStructureIntent}
+                              onConnect={() => void handleConnect(structureProfile)}
+                              onRefresh={tableStructure.reload}
+                            />
+                          ) : (
+                            <DatabaseConnectionList
+                              profiles={profiles}
+                              servers={servers}
+                              snapshots={profilesRecord}
+                              testResults={testResultsRecord}
+                              busy={busyRecord}
+                              selectedProfileId={selectedProfileId}
+                              sshConnected={sshConnected}
+                              onOpen={handleOpenWorkspace}
+                              onConnect={(profile) => void handleConnect(profile)}
+                              onReconnect={(profile) => void handleReconnect(profile)}
+                              onDisconnect={(profile) => void handleDisconnect(profile)}
+                              onTest={(profile) => void handleTest(profile)}
+                              onEdit={openEditDialog}
+                              onDelete={setDeleteTarget}
+                              onAdd={openCreateDialog}
+                            />
+                          )
+                        ) : tab.value === "structure" ? (
+                          selectedTableScope && structureProfile ? (
+                            <DatabaseTableStructurePanel
+                              scope={selectedTableScope}
+                              profileName={structureProfile.name}
+                              engine={selectedEngineForStructure}
+                              connected={structureConnected}
+                              summary={selectedTableSummary}
+                              structure={tableStructure}
+                              capabilities={structureCapabilities}
+                              onIntent={setStructureIntent}
+                              onConnect={() => void handleConnect(structureProfile)}
+                              onRefresh={tableStructure.reload}
+                            />
+                          ) : (
+                            <DatabaseTableSelectionEmpty
+                              title="No table selected"
+                              description="Select a table in the explorer to inspect columns, types, defaults, constraints, and relationships. You can also create a table in the selected database."
+                              canCreate={
+                                structureProfile !== null &&
+                                structureCapabilities.createTable.enabled &&
+                                Boolean(tableWorkspaceScope.database)
+                              }
+                              createReason={
+                                !structureProfile
+                                  ? "Open a saved connection before creating a table."
+                                  : !tableWorkspaceScope.database
+                                    ? "Select a database or schema in the explorer before creating a table."
+                                    : structureCapabilities.createTable.reason
+                              }
+                              connected={structureConnected}
+                              profileName={structureProfile?.name ?? "this connection"}
+                              onConnect={() => {
+                                if (structureProfile) {
+                                  void handleConnect(structureProfile);
+                                }
+                              }}
+                              onCreateTable={() => setStructureIntent({ type: "create_table" })}
+                            />
+                          )
+                        ) : tab.value === "indexes" ? (
+                          selectedTableScope && structureProfile ? (
+                            <DatabaseTableIndexesPanel
+                              scope={selectedTableScope}
+                              profileName={structureProfile.name}
+                              engine={selectedEngineForStructure}
+                              connected={structureConnected}
+                              summary={selectedTableSummary}
+                              structure={tableStructure}
+                              capabilities={structureCapabilities}
+                              onIntent={setStructureIntent}
+                              onConnect={() => void handleConnect(structureProfile)}
+                              onRefresh={tableStructure.reload}
+                            />
+                          ) : (
+                            <DatabaseTableSelectionEmpty
+                              title="No indexes to inspect"
+                              description="Select a table in the explorer to review its primary key, unique constraints, and secondary indexes. You can also create a table in the selected database."
+                              canCreate={
+                                structureProfile !== null &&
+                                structureCapabilities.createTable.enabled &&
+                                Boolean(tableWorkspaceScope.database)
+                              }
+                              createReason={
+                                !structureProfile
+                                  ? "Open a saved connection before creating a table."
+                                  : !tableWorkspaceScope.database
+                                    ? "Select a database or schema in the explorer before creating a table."
+                                    : structureCapabilities.createTable.reason
+                              }
+                              connected={structureConnected}
+                              profileName={structureProfile?.name ?? "this connection"}
+                              onConnect={() => {
+                                if (structureProfile) {
+                                  void handleConnect(structureProfile);
+                                }
+                              }}
+                              onCreateTable={() => setStructureIntent({ type: "create_table" })}
+                            />
+                          )
                         ) : tab.value === "sql" ? (
                           <DatabaseSqlWorkspace tab={activeTab} snapshot={selectedSnapshot} />
                         ) : tab.value === "operations" ? (
@@ -1807,6 +2125,25 @@ function DatabaseManagerPage() {
         onConfirm={() => void handleDelete()}
         pending={deletePending}
       />
+
+      {structureProfile && structureIntent ? (
+        <DatabaseStructureActionHost
+          key={`${structureIntent.type}-${selectedTableScope?.table ?? "new"}`}
+          intent={structureIntent}
+          onOpenChange={(open) => {
+            if (!open) {
+              setStructureIntent(null);
+            }
+          }}
+          profile={structureProfile}
+          scope={tableWorkspaceScope}
+          structure={tableStructure}
+          capabilities={structureCapabilities}
+          onCompleted={(result, intent) =>
+            void handleStructureActionCompleted(result, intent, structureProfile)
+          }
+        />
+      ) : null}
     </div>
   );
 }
