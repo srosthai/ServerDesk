@@ -2,14 +2,19 @@ import { invoke } from "@tauri-apps/api/core";
 import { describe, expect, it, vi } from "vitest";
 import {
   addDatabaseColumn,
+  addDatabaseConstraint,
   alterDatabaseColumn,
+  createDatabaseIndex,
   createDatabaseTable,
   databaseStructureCommands,
   dropDatabaseColumn,
+  dropDatabaseConstraint,
+  dropDatabaseIndex,
   dropDatabaseTable,
   duplicateDatabaseTable,
   previewDatabaseStructureAction,
   renameDatabaseColumn,
+  renameDatabaseIndex,
   renameDatabaseTable,
   reorderDatabaseColumn,
   runDatabaseStructureAction,
@@ -314,6 +319,122 @@ describe("database structure service", () => {
         table: "Users",
         column: { name: "id", dataType: "bigint", nullable: false },
         position: { kind: "first" },
+      },
+      confirmed: false,
+    });
+  });
+
+  it("builds typed index and constraint requests with confirmation where required", async () => {
+    vi.mocked(invoke).mockResolvedValue(result);
+
+    await createDatabaseIndex("profile-1", {
+      database: "app",
+      schema: null,
+      table: "Users",
+      name: "users_email_idx",
+      columns: ["email"],
+      unique: true,
+    });
+    await renameDatabaseIndex("profile-1", {
+      database: "app",
+      schema: null,
+      table: "Users",
+      name: "users_email_idx",
+      newName: "users_email_lookup_idx",
+    });
+    await dropDatabaseIndex(
+      "profile-1",
+      { database: "app", schema: null, table: "Users", name: "users_email_idx" },
+      true,
+    );
+    await addDatabaseConstraint("profile-1", {
+      database: "app",
+      schema: null,
+      table: "Orders",
+      constraint: {
+        kind: "foreign_key",
+        name: "orders_user_fk",
+        columns: ["user_id"],
+        referencedTable: "Users",
+        referencedColumns: ["id"],
+        onDelete: "cascade",
+      },
+    });
+    await dropDatabaseConstraint(
+      "profile-1",
+      {
+        database: "app",
+        schema: null,
+        table: "Orders",
+        name: "orders_user_fk",
+        constraintKind: "foreign_key",
+      },
+      false,
+    );
+
+    expect(invoke).toHaveBeenNthCalledWith(1, databaseStructureCommands.run, {
+      profileId: "profile-1",
+      request: {
+        kind: "create_index",
+        database: "app",
+        schema: null,
+        table: "Users",
+        name: "users_email_idx",
+        columns: ["email"],
+        unique: true,
+      },
+      confirmed: false,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, databaseStructureCommands.run, {
+      profileId: "profile-1",
+      request: {
+        kind: "rename_index",
+        database: "app",
+        schema: null,
+        table: "Users",
+        name: "users_email_idx",
+        newName: "users_email_lookup_idx",
+      },
+      confirmed: false,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(3, databaseStructureCommands.run, {
+      profileId: "profile-1",
+      request: {
+        kind: "drop_index",
+        database: "app",
+        schema: null,
+        table: "Users",
+        name: "users_email_idx",
+      },
+      confirmed: true,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(4, databaseStructureCommands.run, {
+      profileId: "profile-1",
+      request: {
+        kind: "add_constraint",
+        database: "app",
+        schema: null,
+        table: "Orders",
+        constraint: {
+          kind: "foreign_key",
+          name: "orders_user_fk",
+          columns: ["user_id"],
+          referencedTable: "Users",
+          referencedColumns: ["id"],
+          onDelete: "cascade",
+        },
+      },
+      confirmed: false,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(5, databaseStructureCommands.run, {
+      profileId: "profile-1",
+      request: {
+        kind: "drop_constraint",
+        database: "app",
+        schema: null,
+        table: "Orders",
+        name: "orders_user_fk",
+        constraintKind: "foreign_key",
       },
       confirmed: false,
     });

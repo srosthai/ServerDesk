@@ -7,8 +7,9 @@
 //! SQL. Engine modules generate the DDL from the validated action.
 //!
 //! Execution always asks an adapter for the same preview first, so capability
-//! checks, read-only checks, and destructive confirmations cannot be bypassed.
-//! Column execution re-reads column metadata before reporting success.
+//! checks, read-only checks, dependency checks, and destructive confirmations
+//! cannot be bypassed. Execution re-reads table, column, index, or constraint
+//! metadata before reporting success.
 
 use std::time::Instant;
 
@@ -23,8 +24,8 @@ use super::{
     pagination::{Bounded, MAX_PAGE_LIMIT, PageRequest},
     service::DatabaseConnectionRegistry,
     traits::{
-        ColumnIdentity, ColumnSummary, ConstraintKind, DatabaseAdapter, DependencySummary,
-        MetadataValue, TableRef, TableSummary,
+        ColumnIdentity, ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter,
+        DependencySummary, IndexSummary, MetadataValue, TableRef, TableSummary,
     },
 };
 
@@ -741,6 +742,14 @@ impl ValidatedStructureAction {
         }
     }
 
+    /// Whether the preview must be confirmed before execution. Dropping an
+    /// index or constraint does not delete rows, but it removes a structural
+    /// guarantee and can invalidate dependent objects, so it still needs an
+    /// explicit confirmation. `destructive` remains reserved for data loss.
+    pub const fn requires_confirmation(&self) -> bool {
+        self.destructive() || matches!(self, Self::DropIndex { .. } | Self::DropConstraint { .. })
+    }
+
     /// Converts a planner result into the shared preview shape.
     pub fn preview(
         &self,
@@ -749,7 +758,6 @@ impl ValidatedStructureAction {
         warnings: Vec<String>,
     ) -> StructureDdlPreview {
         let ddl = statements.join(";\n");
-        let destructive = self.destructive();
         StructureDdlPreview {
             action: self.kind(),
             engine,
@@ -757,8 +765,8 @@ impl ValidatedStructureAction {
             statements,
             ddl,
             warnings,
-            destructive,
-            requires_confirmation: destructive,
+            destructive: self.destructive(),
+            requires_confirmation: self.requires_confirmation(),
         }
     }
 }
@@ -1199,25 +1207,6 @@ pub async fn execute_structure_with_adapter(
     let validated = request.validate()?;
     let preview = preview_structure_with_adapter(adapter, &request).await?;
 
-    if !matches!(
-        validated,
-        ValidatedStructureAction::CreateTable(_)
-            | ValidatedStructureAction::RenameTable { .. }
-            | ValidatedStructureAction::DuplicateTable { .. }
-            | ValidatedStructureAction::TruncateTable { .. }
-            | ValidatedStructureAction::DropTable { .. }
-            | ValidatedStructureAction::AddColumn { .. }
-            | ValidatedStructureAction::AlterColumn { .. }
-            | ValidatedStructureAction::RenameColumn { .. }
-            | ValidatedStructureAction::DropColumn { .. }
-            | ValidatedStructureAction::ReorderColumn { .. }
-    ) {
-        return Err(DatabaseError::capability(
-            "This build executes only table lifecycle and column add, edit, rename, drop, and \
-             reorder actions. Index and constraint execution arrives with the structure editor.",
-        ));
-    }
-
     if preview.requires_confirmation && !confirmed {
         return Err(DatabaseError::cancelled(format!(
             "The {} action for table {} was cancelled because it was not confirmed.",
@@ -1275,10 +1264,28 @@ async fn ensure_no_blocking_dependencies(
     adapter: &dyn DatabaseAdapter,
     action: &ValidatedStructureAction,
 ) -> Result<(), DatabaseError> {
-    let (check_foreign_keys, check_views) = match action {
-        ValidatedStructureAction::DropTable { .. } => (true, true),
-        ValidatedStructureAction::TruncateTable { .. } => (true, false),
-        ValidatedStructureAction::DropColumn { .. } => (true, false),
+    let (check_foreign_keys, check_views, targeted_columns) = match action {
+        ValidatedStructureAction::DropTable { .. } => (true, true, None),
+        ValidatedStructureAction::TruncateTable { .. } => (true, false, None),
+        ValidatedStructureAction::DropColumn { name, .. } => {
+            (true, false, Some(vec![name.as_str().to_string()]))
+        }
+        ValidatedStructureAction::DropConstraint { table, name, kind }
+            if matches!(kind, ConstraintKind::PrimaryKey | ConstraintKind::Unique) =>
+        {
+            match constraint_columns(adapter, table, name, *kind).await? {
+                Some(columns) => (true, false, Some(columns)),
+                // The constraint is not in metadata; the engine's own
+                // dependency error remains the fallback.
+                None => return Ok(()),
+            }
+        }
+        ValidatedStructureAction::DropIndex { table, name } => {
+            match index_backing_constraint(adapter, table, name).await? {
+                Some(columns) => (true, false, Some(columns)),
+                None => return Ok(()),
+            }
+        }
         _ => return Ok(()),
     };
 
@@ -1297,14 +1304,14 @@ async fn ensure_no_blocking_dependencies(
     };
     let mut blockers = Vec::new();
     if check_foreign_keys {
-        match action {
-            ValidatedStructureAction::DropColumn { name, .. } => collect_column_dependency_names(
+        match targeted_columns.as_deref() {
+            Some(columns) => collect_targeted_dependency_names(
                 &mut blockers,
                 "incoming foreign key",
                 &dependencies.incoming_foreign_keys,
-                name,
+                columns,
             ),
-            _ => collect_dependency_names(
+            None => collect_dependency_names(
                 &mut blockers,
                 "incoming foreign key",
                 &dependencies.incoming_foreign_keys,
@@ -1323,14 +1330,16 @@ async fn ensure_no_blocking_dependencies(
         return Ok(());
     }
 
-    let (action_label, object_label) = match action {
-        ValidatedStructureAction::DropTable { .. } => ("drop", "table"),
-        ValidatedStructureAction::DropColumn { .. } => ("drop", "column"),
-        _ => ("truncate", "table"),
-    };
-    let object_name = match action {
-        ValidatedStructureAction::DropColumn { name, .. } => name.as_str(),
-        _ => action.table().name.as_str(),
+    let (action_label, object_label, object_name) = match action {
+        ValidatedStructureAction::DropTable { .. } => {
+            ("drop", "table", action.table().name.as_str())
+        }
+        ValidatedStructureAction::DropColumn { name, .. } => ("drop", "column", name.as_str()),
+        ValidatedStructureAction::DropConstraint { name, .. } => {
+            ("drop", "constraint", name.as_str())
+        }
+        ValidatedStructureAction::DropIndex { name, .. } => ("drop", "index", name.as_str()),
+        _ => ("truncate", "table", action.table().name.as_str()),
     };
     Err(DatabaseError::dependency(format!(
         "Cannot {action_label} {object_label} {object_name} because {} object(s) depend on it.",
@@ -1343,17 +1352,89 @@ async fn ensure_no_blocking_dependencies(
     .with_scope(object_label, object_name))
 }
 
-fn collect_column_dependency_names(
+async fn read_constraint_metadata(
+    adapter: &dyn DatabaseAdapter,
+    table: &TableRef,
+) -> Result<Vec<ConstraintSummary>, DatabaseError> {
+    let page = adapter
+        .list_constraints(table, PageRequest::new(MAX_PAGE_LIMIT, 0))
+        .await?;
+    if page.has_more {
+        return Err(DatabaseError::validation(format!(
+            "The table has more than {MAX_PAGE_LIMIT} constraints, so dependency metadata cannot be \
+             read completely."
+        )));
+    }
+    Ok(page.items)
+}
+
+async fn constraint_columns(
+    adapter: &dyn DatabaseAdapter,
+    table: &TableRef,
+    name: &Identifier,
+    kind: ConstraintKind,
+) -> Result<Option<Vec<String>>, DatabaseError> {
+    let constraints = read_constraint_metadata(adapter, table).await?;
+    let constraint = constraints
+        .iter()
+        .find(|constraint| constraint_matches_name(constraint, name, kind, adapter.engine()));
+    Ok(constraint.map(|constraint| constraint.columns.clone()))
+}
+
+async fn index_backing_constraint(
+    adapter: &dyn DatabaseAdapter,
+    table: &TableRef,
+    name: &Identifier,
+) -> Result<Option<Vec<String>>, DatabaseError> {
+    let indexes = read_index_metadata(adapter, table).await?;
+    let Some(index) = indexes
+        .iter()
+        .find(|index| index.name.eq_ignore_ascii_case(name.as_str()))
+    else {
+        return Ok(None);
+    };
+    if !index.primary && !index.unique {
+        return Ok(None);
+    }
+    let constraints = read_constraint_metadata(adapter, table).await?;
+    let backing = constraints.iter().find(|constraint| {
+        matches!(
+            constraint.kind,
+            ConstraintKind::PrimaryKey | ConstraintKind::Unique
+        ) && (constraint.name.eq_ignore_ascii_case(index.name.as_str())
+            || (index.primary && constraint.kind == ConstraintKind::PrimaryKey))
+    });
+    Ok(backing.map(|constraint| constraint.columns.clone()))
+}
+
+fn constraint_matches_name(
+    constraint: &ConstraintSummary,
+    name: &Identifier,
+    kind: ConstraintKind,
+    engine: DatabaseEngine,
+) -> bool {
+    if constraint.kind != kind {
+        return false;
+    }
+    if constraint.name.eq_ignore_ascii_case(name.as_str()) {
+        return true;
+    }
+    // MySQL reports an unnamed primary key as PRIMARY regardless of the
+    // requested constraint symbol.
+    engine == DatabaseEngine::Mysql && kind == ConstraintKind::PrimaryKey
+}
+
+fn collect_targeted_dependency_names(
     target: &mut Vec<String>,
     label: &str,
     group: &MetadataValue<Bounded<DependencySummary>>,
-    column: &Identifier,
+    columns: &[String],
 ) {
     let Some(group) = group.value() else {
         return;
     };
     for dependency in &group.items {
-        if !dependency_references_column(dependency, column) {
+        if !dependency_references_any_column(dependency, columns) {
             continue;
         }
         let mut name = format!("{label} {}", dependency.name);
@@ -1367,10 +1448,15 @@ fn collect_column_dependency_names(
 }
 
 fn dependency_references_column(dependency: &DependencySummary, column: &Identifier) -> bool {
-    dependency
-        .referenced_columns
-        .iter()
-        .any(|referenced| referenced.eq_ignore_ascii_case(column.as_str()))
+    dependency_references_any_column(dependency, &[column.as_str().to_string()])
+}
+
+fn dependency_references_any_column(dependency: &DependencySummary, columns: &[String]) -> bool {
+    dependency.referenced_columns.iter().any(|referenced| {
+        columns
+            .iter()
+            .any(|column| referenced.eq_ignore_ascii_case(column))
+    })
 }
 
 /// Adds dependency notices to a preview without turning a preview-only request
@@ -1381,6 +1467,109 @@ async fn append_dependency_warnings(
     action: &ValidatedStructureAction,
     preview: &mut StructureDdlPreview,
 ) {
+    if let ValidatedStructureAction::DropIndex { table, name }
+    | ValidatedStructureAction::RenameIndex { table, name, .. } = action
+    {
+        let backing = match index_backing_constraint(adapter, table, name).await {
+            Ok(backing) => backing,
+            Err(_) => {
+                preview.warnings.push(
+                    "Constraint dependencies for this index could not be inspected; the engine \
+                     may still block the change."
+                        .to_string(),
+                );
+                return;
+            }
+        };
+        let Some(columns) = backing else {
+            return;
+        };
+        let change = if matches!(action, ValidatedStructureAction::DropIndex { .. }) {
+            "drop"
+        } else {
+            "rename"
+        };
+        preview.warnings.push(format!(
+            "Index {} backs a primary-key or unique constraint. The engine can block the {change} \
+             while that constraint depends on the index.",
+            name
+        ));
+        if !matches!(action, ValidatedStructureAction::DropIndex { .. }) {
+            return;
+        }
+        match adapter.table_dependencies(table, 20).await {
+            Ok(dependencies) => {
+                let mut blockers = Vec::new();
+                collect_targeted_dependency_names(
+                    &mut blockers,
+                    "incoming foreign key",
+                    &dependencies.incoming_foreign_keys,
+                    &columns,
+                );
+                if !blockers.is_empty() {
+                    preview.warnings.push(format!(
+                        "Incoming foreign keys reference this constraint: {}. The drop is blocked \
+                         until those relationships are removed.",
+                        blockers.join(", ")
+                    ));
+                }
+            }
+            Err(error) if error.kind == DatabaseErrorKind::Validation && table.schema.is_none() => {
+            }
+            Err(_) => preview.warnings.push(
+                "Foreign keys that reference this constraint could not be inspected; the engine \
+                 can still block the drop."
+                    .to_string(),
+            ),
+        }
+        return;
+    }
+
+    if let ValidatedStructureAction::DropConstraint { table, name, kind } = action {
+        if !matches!(kind, ConstraintKind::PrimaryKey | ConstraintKind::Unique) {
+            return;
+        }
+        let columns = match constraint_columns(adapter, table, name, *kind).await {
+            Ok(Some(columns)) => columns,
+            Ok(None) => return,
+            Err(_) => {
+                preview.warnings.push(
+                    "Constraint dependencies could not be inspected; the engine may still block \
+                     the drop."
+                        .to_string(),
+                );
+                return;
+            }
+        };
+        match adapter.table_dependencies(table, 20).await {
+            Ok(dependencies) => {
+                let mut blockers = Vec::new();
+                collect_targeted_dependency_names(
+                    &mut blockers,
+                    "incoming foreign key",
+                    &dependencies.incoming_foreign_keys,
+                    &columns,
+                );
+                if !blockers.is_empty() {
+                    preview.warnings.push(format!(
+                        "Dropping constraint {} affects these incoming foreign keys: {}. The drop \
+                         is blocked until those relationships are changed.",
+                        name,
+                        blockers.join(", ")
+                    ));
+                }
+            }
+            Err(error) if error.kind == DatabaseErrorKind::Validation && table.schema.is_none() => {
+            }
+            Err(_) => preview.warnings.push(
+                "Foreign keys that reference this constraint could not be inspected; the engine \
+                 can still block the drop."
+                    .to_string(),
+            ),
+        }
+        return;
+    }
+
     if !matches!(
         action,
         ValidatedStructureAction::DropTable { .. }
@@ -1712,12 +1901,23 @@ async fn verify_structure_action(
             column,
             position,
         } => verify_reordered_column(adapter, table, column, position).await,
-        // Index and constraint actions keep the preview-only contract from #170.
-        _ => StructureVerification::success(
-            "The structure action finished; no automatic metadata verification applies."
-                .to_string(),
-            None,
-        ),
+        ValidatedStructureAction::CreateIndex(options) => {
+            verify_created_index(adapter, options).await
+        }
+        ValidatedStructureAction::RenameIndex {
+            table,
+            name,
+            new_name,
+        } => verify_renamed_index(adapter, table, name, new_name).await,
+        ValidatedStructureAction::DropIndex { table, name } => {
+            verify_dropped_index(adapter, table, name).await
+        }
+        ValidatedStructureAction::AddConstraint { table, constraint } => {
+            verify_added_constraint(adapter, table, constraint).await
+        }
+        ValidatedStructureAction::DropConstraint { table, name, kind } => {
+            verify_dropped_constraint(adapter, table, name, *kind).await
+        }
     }
 }
 
@@ -1996,6 +2196,477 @@ async fn verify_reordered_column(
             expected.name, expected_ordinal, table.name
         ),
         adapter.table_summary(table).await.ok().flatten(),
+    )
+}
+
+async fn read_index_metadata(
+    adapter: &dyn DatabaseAdapter,
+    table: &TableRef,
+) -> Result<Vec<IndexSummary>, DatabaseError> {
+    let page = adapter
+        .list_indexes(table, PageRequest::new(MAX_PAGE_LIMIT, 0))
+        .await?;
+    if page.has_more {
+        return Err(DatabaseError::validation(format!(
+            "The table has more than {MAX_PAGE_LIMIT} indexes, so the complete index list cannot \
+             be verified."
+        )));
+    }
+    Ok(page.items)
+}
+
+fn find_index<'a>(
+    indexes: &'a [IndexSummary],
+    name: &Identifier,
+    engine: DatabaseEngine,
+) -> Option<&'a IndexSummary> {
+    indexes
+        .iter()
+        .find(|index| index.name == name.as_str())
+        .or_else(|| {
+            (engine == DatabaseEngine::Mysql)
+                .then(|| {
+                    indexes
+                        .iter()
+                        .find(|index| index.name.eq_ignore_ascii_case(name.as_str()))
+                })
+                .flatten()
+        })
+}
+
+fn compare_index_columns(expected: &[Identifier], actual: &[String]) -> Option<String> {
+    if expected.len() != actual.len() {
+        return Some(format!(
+            "Expected {} index column(s), but metadata reports {}.",
+            expected.len(),
+            actual.len()
+        ));
+    }
+    for (expected, actual) in expected.iter().zip(actual) {
+        if !expected.as_str().eq_ignore_ascii_case(actual) {
+            return Some(format!(
+                "Expected index column {}, but metadata reports {actual}.",
+                expected
+            ));
+        }
+    }
+    None
+}
+
+fn index_matches(index: &IndexSummary, expected: &ValidatedCreateIndex) -> Result<(), String> {
+    if index.unique != expected.unique {
+        return Err(format!(
+            "Expected unique={}, but metadata reports unique={}.",
+            expected.unique, index.unique
+        ));
+    }
+    if index.primary {
+        return Err("The created index was reported as the primary key index.".to_string());
+    }
+    if let Some(problem) = compare_index_columns(&expected.columns, &index.columns) {
+        return Err(problem);
+    }
+    if let Some(expected_method) = expected.method.as_deref()
+        && let Some(actual) = index.method.value()
+        && !actual.eq_ignore_ascii_case(expected_method)
+    {
+        return Err(format!(
+            "Expected index method {expected_method}, but metadata reports {actual}."
+        ));
+    }
+    if let Some(expected_predicate) = expected.predicate.as_deref()
+        && let Some(actual) = index.predicate.value()
+        && !expressions_match(expected_predicate, actual.as_deref().unwrap_or_default())
+    {
+        return Err(format!(
+            "Expected index predicate {}, but metadata reports {}.",
+            expected_predicate,
+            actual.as_deref().unwrap_or("none")
+        ));
+    }
+    Ok(())
+}
+
+async fn verify_created_index(
+    adapter: &dyn DatabaseAdapter,
+    expected: &ValidatedCreateIndex,
+) -> StructureVerification {
+    let indexes = match read_index_metadata(adapter, &expected.table).await {
+        Ok(indexes) => indexes,
+        Err(error) => return index_metadata_error(&expected.table, &expected.name, &error),
+    };
+    let Some(index) = find_index(&indexes, &expected.name, adapter.engine()) else {
+        return StructureVerification::failure(
+            format!(
+                "The create_index action finished, but metadata does not list index {} on table {}.",
+                expected.name, expected.table.name
+            ),
+            "The new index was not present in metadata after the action.".to_string(),
+        );
+    };
+    if let Err(problem) = index_matches(index, expected) {
+        return StructureVerification::failure(
+            format!(
+                "The create_index action finished, but index {} on table {} does not match the \
+                 requested definition.",
+                expected.name, expected.table.name
+            ),
+            problem,
+        );
+    }
+
+    StructureVerification::success(
+        format!(
+            "Metadata re-read confirms index {} exists on table {} with the requested columns, \
+             uniqueness, and method.",
+            expected.name, expected.table.name
+        ),
+        adapter.table_summary(&expected.table).await.ok().flatten(),
+    )
+}
+
+async fn verify_renamed_index(
+    adapter: &dyn DatabaseAdapter,
+    table: &TableRef,
+    name: &Identifier,
+    new_name: &Identifier,
+) -> StructureVerification {
+    let indexes = match read_index_metadata(adapter, table).await {
+        Ok(indexes) => indexes,
+        Err(error) => return index_metadata_error(table, new_name, &error),
+    };
+    if find_index(&indexes, new_name, adapter.engine()).is_none() {
+        return StructureVerification::failure(
+            format!(
+                "The rename_index action finished, but metadata does not list index {} on table {}.",
+                new_name, table.name
+            ),
+            "The new index name was not present in metadata after the rename.".to_string(),
+        );
+    }
+    if find_index(&indexes, name, adapter.engine()).is_some() {
+        return StructureVerification::failure(
+            format!(
+                "The rename_index action finished, but metadata still lists both {} and {} on \
+                 table {}.",
+                name, new_name, table.name
+            ),
+            "Both the previous and the new index name are present after the rename.".to_string(),
+        );
+    }
+
+    StructureVerification::success(
+        format!(
+            "Metadata re-read confirms index {} on table {} was renamed to {}.",
+            name, table.name, new_name
+        ),
+        adapter.table_summary(table).await.ok().flatten(),
+    )
+}
+
+async fn verify_dropped_index(
+    adapter: &dyn DatabaseAdapter,
+    table: &TableRef,
+    name: &Identifier,
+) -> StructureVerification {
+    let indexes = match read_index_metadata(adapter, table).await {
+        Ok(indexes) => indexes,
+        Err(error) => return index_metadata_error(table, name, &error),
+    };
+    if find_index(&indexes, name, adapter.engine()).is_some() {
+        return StructureVerification::failure(
+            format!(
+                "The drop_index action finished, but metadata still lists index {} on table {}.",
+                name, table.name
+            ),
+            "The index was still present in metadata after the drop.".to_string(),
+        );
+    }
+
+    StructureVerification::success(
+        format!(
+            "Metadata re-read confirms index {} is no longer present on table {}.",
+            name, table.name
+        ),
+        adapter.table_summary(table).await.ok().flatten(),
+    )
+}
+
+fn index_metadata_error(
+    table: &TableRef,
+    index: &Identifier,
+    error: &DatabaseError,
+) -> StructureVerification {
+    StructureVerification::failure(
+        format!(
+            "The structure action finished, but metadata for index {} on table {} could not be \
+             re-read.",
+            index, table.name
+        ),
+        error.message.clone(),
+    )
+}
+
+fn find_constraint<'a>(
+    constraints: &'a [ConstraintSummary],
+    name: &Identifier,
+    kind: ConstraintKind,
+    engine: DatabaseEngine,
+) -> Option<&'a ConstraintSummary> {
+    constraints
+        .iter()
+        .find(|constraint| constraint_matches_name(constraint, name, kind, engine))
+}
+
+fn compare_constraint_columns(expected: &[Identifier], actual: &[String]) -> Option<String> {
+    if expected.len() != actual.len() {
+        return Some(format!(
+            "Expected {} constraint column(s), but metadata reports {}.",
+            expected.len(),
+            actual.len()
+        ));
+    }
+    for (expected, actual) in expected.iter().zip(actual) {
+        if !expected.as_str().eq_ignore_ascii_case(actual) {
+            return Some(format!(
+                "Expected constraint column {}, but metadata reports {actual}.",
+                expected
+            ));
+        }
+    }
+    None
+}
+
+fn constraint_matches_definition(
+    constraint: &ConstraintSummary,
+    expected: &ValidatedConstraint,
+) -> Result<(), String> {
+    if constraint.kind != expected.kind() {
+        return Err(format!(
+            "Expected constraint kind {:?}, but metadata reports {:?}.",
+            expected.kind(),
+            constraint.kind
+        ));
+    }
+    if !matches!(expected, ValidatedConstraint::Check { .. })
+        && let Some(problem) = compare_constraint_columns(expected.columns(), &constraint.columns)
+    {
+        return Err(problem);
+    }
+    match expected {
+        ValidatedConstraint::ForeignKey {
+            referenced_table,
+            referenced_columns,
+            on_delete,
+            on_update,
+            ..
+        } => {
+            let actual_table = constraint
+                .referenced_table
+                .value()
+                .and_then(Option::as_deref);
+            if actual_table
+                .is_none_or(|actual| !actual.eq_ignore_ascii_case(referenced_table.as_str()))
+            {
+                return Err(format!(
+                    "Expected referenced table {referenced_table}, but metadata reports {}.",
+                    actual_table.unwrap_or("none")
+                ));
+            }
+            if let Some(problem) =
+                compare_referenced_columns(referenced_columns, &constraint.referenced_columns)
+            {
+                return Err(problem);
+            }
+            if let Some(expected_action) = on_delete
+                && !referential_action_matches(*expected_action, &constraint.on_delete)
+            {
+                return Err(format!(
+                    "Expected ON DELETE {}, but metadata reports {}.",
+                    expected_action.as_sql(),
+                    describe_optional_metadata(&constraint.on_delete)
+                ));
+            }
+            if let Some(expected_action) = on_update
+                && !referential_action_matches(*expected_action, &constraint.on_update)
+            {
+                return Err(format!(
+                    "Expected ON UPDATE {}, but metadata reports {}.",
+                    expected_action.as_sql(),
+                    describe_optional_metadata(&constraint.on_update)
+                ));
+            }
+        }
+        ValidatedConstraint::Check { expression, .. } => {
+            if let Some(actual) = constraint.check_expression.value()
+                && !expressions_match(expression, actual.as_deref().unwrap_or_default())
+            {
+                return Err(format!(
+                    "Expected check expression {expression}, but metadata reports {}.",
+                    actual.as_deref().unwrap_or("none")
+                ));
+            }
+        }
+        ValidatedConstraint::PrimaryKey { .. } | ValidatedConstraint::Unique { .. } => {}
+    }
+    Ok(())
+}
+
+fn compare_referenced_columns(expected: &[Identifier], actual: &[String]) -> Option<String> {
+    if expected.len() != actual.len() {
+        return Some(format!(
+            "Expected {} referenced column(s), but metadata reports {}.",
+            expected.len(),
+            actual.len()
+        ));
+    }
+    for (expected, actual) in expected.iter().zip(actual) {
+        if !expected.as_str().eq_ignore_ascii_case(actual) {
+            return Some(format!(
+                "Expected referenced column {}, but metadata reports {actual}.",
+                expected
+            ));
+        }
+    }
+    None
+}
+
+fn referential_action_matches(
+    expected: ReferentialAction,
+    actual: &MetadataValue<Option<String>>,
+) -> bool {
+    actual
+        .value()
+        .and_then(Option::as_deref)
+        .is_some_and(|actual| {
+            actual
+                .replace('_', " ")
+                .eq_ignore_ascii_case(expected.as_sql())
+        })
+}
+
+fn describe_optional_metadata(value: &MetadataValue<Option<String>>) -> &str {
+    value
+        .value()
+        .and_then(Option::as_deref)
+        .unwrap_or("unavailable")
+}
+
+fn expressions_match(expected: &str, actual: &str) -> bool {
+    let expected = normalize_constraint_expression(expected);
+    let actual = normalize_constraint_expression(actual);
+    expected.is_empty()
+        || actual.is_empty()
+        || actual.contains(&expected)
+        || expected.contains(&actual)
+}
+
+fn normalize_constraint_expression(value: &str) -> String {
+    let mut normalized = value.trim().to_ascii_lowercase();
+    if let Some(rest) = normalized.strip_prefix("check") {
+        normalized = rest.trim().to_string();
+    }
+    normalized
+        .replace("::text", "")
+        .replace("::character varying", "")
+        .replace("::bpchar", "")
+        .replace("::varchar", "")
+        .replace(['(', ')'], "")
+        .chars()
+        .filter(|character| !character.is_whitespace() && !matches!(character, '"' | '`'))
+        .collect()
+}
+
+async fn verify_added_constraint(
+    adapter: &dyn DatabaseAdapter,
+    table: &TableRef,
+    expected: &ValidatedConstraint,
+) -> StructureVerification {
+    let constraints = match read_constraint_metadata(adapter, table).await {
+        Ok(constraints) => constraints,
+        Err(error) => return constraint_metadata_error(table, expected.name(), &error),
+    };
+    let Some(constraint) = find_constraint(
+        &constraints,
+        expected.name(),
+        expected.kind(),
+        adapter.engine(),
+    ) else {
+        return StructureVerification::failure(
+            format!(
+                "The add_constraint action finished, but metadata does not list constraint {} on \
+                 table {}.",
+                expected.name(),
+                table.name
+            ),
+            "The new constraint was not present in metadata after the action.".to_string(),
+        );
+    };
+    if let Err(problem) = constraint_matches_definition(constraint, expected) {
+        return StructureVerification::failure(
+            format!(
+                "The add_constraint action finished, but constraint {} on table {} does not match \
+                 the requested definition.",
+                expected.name(),
+                table.name
+            ),
+            problem,
+        );
+    }
+
+    StructureVerification::success(
+        format!(
+            "Metadata re-read confirms constraint {} exists on table {} with the requested kind, \
+             columns, and referenced actions.",
+            expected.name(),
+            table.name
+        ),
+        adapter.table_summary(table).await.ok().flatten(),
+    )
+}
+
+async fn verify_dropped_constraint(
+    adapter: &dyn DatabaseAdapter,
+    table: &TableRef,
+    name: &Identifier,
+    kind: ConstraintKind,
+) -> StructureVerification {
+    let constraints = match read_constraint_metadata(adapter, table).await {
+        Ok(constraints) => constraints,
+        Err(error) => return constraint_metadata_error(table, name, &error),
+    };
+    if find_constraint(&constraints, name, kind, adapter.engine()).is_some() {
+        return StructureVerification::failure(
+            format!(
+                "The drop_constraint action finished, but metadata still lists constraint {} on \
+                 table {}.",
+                name, table.name
+            ),
+            "The constraint was still present in metadata after the drop.".to_string(),
+        );
+    }
+
+    StructureVerification::success(
+        format!(
+            "Metadata re-read confirms constraint {} is no longer present on table {}.",
+            name, table.name
+        ),
+        adapter.table_summary(table).await.ok().flatten(),
+    )
+}
+
+fn constraint_metadata_error(
+    table: &TableRef,
+    constraint: &Identifier,
+    error: &DatabaseError,
+) -> StructureVerification {
+    StructureVerification::failure(
+        format!(
+            "The structure action finished, but metadata for constraint {} on table {} could not \
+             be re-read.",
+            constraint, table.name
+        ),
+        error.message.clone(),
     )
 }
 
