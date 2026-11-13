@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  DatabaseConstraintInput,
+  DatabaseConstraintKind,
   DatabaseStructureActionRequest,
   DatabaseStructureActionResult,
   DatabaseStructureDdlPreview,
@@ -167,4 +169,70 @@ export function reorderDatabaseColumn(
   } & TableColumnScope,
 ): Promise<DatabaseStructureActionResult> {
   return runDatabaseStructureAction(profileId, { kind: "reorder_column", ...input });
+}
+
+/**
+ * Creates a secondary or unique index. The backend previews the exact DDL and
+ * rejects partial indexes when the selected engine/version cannot express
+ * them. Rename is available on MySQL 5.7+ and PostgreSQL 9.2+; a caller that
+ * targets an older server should disable the action and show the capability
+ * explanation instead of offering a no-op.
+ */
+export function createDatabaseIndex(
+  profileId: string,
+  input: {
+    table: string;
+    name: string;
+    columns: string[];
+    unique?: boolean;
+    method?: string | null;
+    predicate?: string | null;
+  } & TableScope,
+): Promise<DatabaseStructureActionResult> {
+  return runDatabaseStructureAction(profileId, { kind: "create_index", ...input });
+}
+
+export function renameDatabaseIndex(
+  profileId: string,
+  input: { table: string; name: string; newName: string } & TableScope,
+): Promise<DatabaseStructureActionResult> {
+  return runDatabaseStructureAction(profileId, { kind: "rename_index", ...input });
+}
+
+/**
+ * Dropping an index removes a structural optimization and requires an explicit
+ * confirmation. The preview also names a blocking constraint or incoming
+ * foreign key before the drop is attempted.
+ */
+export function dropDatabaseIndex(
+  profileId: string,
+  input: { table: string; name: string } & TableScope,
+  confirmed: boolean,
+): Promise<DatabaseStructureActionResult> {
+  return runDatabaseStructureAction(profileId, { kind: "drop_index", ...input }, confirmed);
+}
+
+/**
+ * Adds a primary-key, unique, foreign-key, or check constraint. The backend
+ * verifies the constraint kind, ordered columns, referenced table/columns, and
+ * update/delete actions after execution.
+ */
+export function addDatabaseConstraint(
+  profileId: string,
+  input: { table: string; constraint: DatabaseConstraintInput } & TableScope,
+): Promise<DatabaseStructureActionResult> {
+  return runDatabaseStructureAction(profileId, { kind: "add_constraint", ...input });
+}
+
+/**
+ * Drops one inspected constraint by name and kind. The caller must pass the
+ * kind shown by metadata so the backend can verify the exact object and avoid
+ * dropping a different constraint with the same name.
+ */
+export function dropDatabaseConstraint(
+  profileId: string,
+  input: { table: string; name: string; constraintKind: DatabaseConstraintKind } & TableScope,
+  confirmed: boolean,
+): Promise<DatabaseStructureActionResult> {
+  return runDatabaseStructureAction(profileId, { kind: "drop_constraint", ...input }, confirmed);
 }

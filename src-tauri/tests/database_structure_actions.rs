@@ -10,9 +10,10 @@ use std::time::Duration;
 use serverdesk_lib::{
     database::{
         ColumnDefaultRequest, ColumnDefinitionRequest, ColumnIdentity, ColumnPositionRequest,
-        DatabaseAdapter, DatabaseConnectRequest, DatabaseErrorKind, DatabasePassword,
-        FakeDatabaseAdapter, StructureActionRequest, TableOptionsRequest, TableRef,
-        UniqueKeyRequest, execute_structure_with_adapter, preview_structure_with_adapter,
+        ConstraintKind, ConstraintRequest, DatabaseAdapter, DatabaseConnectRequest,
+        DatabaseErrorKind, DatabasePassword, FakeDatabaseAdapter, ReferentialAction,
+        StructureActionRequest, TableOptionsRequest, TableRef, UniqueKeyRequest,
+        execute_structure_with_adapter, preview_structure_with_adapter,
     },
     storage::DatabaseEngine,
 };
@@ -217,6 +218,76 @@ fn reorder_column_request(
         table: table.to_string(),
         column,
         position,
+    }
+}
+
+fn create_index_request(
+    engine: DatabaseEngine,
+    table: &str,
+    name: &str,
+    unique: bool,
+) -> StructureActionRequest {
+    StructureActionRequest::CreateIndex {
+        database: Some("app".to_string()),
+        schema: (engine == DatabaseEngine::Postgresql).then(|| "public".to_string()),
+        table: table.to_string(),
+        name: name.to_string(),
+        columns: vec!["email".to_string()],
+        unique,
+        method: Some("btree".to_string()),
+        predicate: None,
+    }
+}
+
+fn rename_index_request(
+    engine: DatabaseEngine,
+    table: &str,
+    name: &str,
+    new_name: &str,
+) -> StructureActionRequest {
+    StructureActionRequest::RenameIndex {
+        database: Some("app".to_string()),
+        schema: (engine == DatabaseEngine::Postgresql).then(|| "public".to_string()),
+        table: table.to_string(),
+        name: name.to_string(),
+        new_name: new_name.to_string(),
+    }
+}
+
+fn drop_index_request(engine: DatabaseEngine, table: &str, name: &str) -> StructureActionRequest {
+    StructureActionRequest::DropIndex {
+        database: Some("app".to_string()),
+        schema: (engine == DatabaseEngine::Postgresql).then(|| "public".to_string()),
+        table: table.to_string(),
+        name: name.to_string(),
+    }
+}
+
+fn add_constraint_request(
+    engine: DatabaseEngine,
+    table: &str,
+    constraint: ConstraintRequest,
+) -> StructureActionRequest {
+    StructureActionRequest::AddConstraint {
+        database: Some("app".to_string()),
+        schema: (engine == DatabaseEngine::Postgresql).then(|| "public".to_string()),
+        table: table.to_string(),
+        constraint,
+    }
+}
+
+fn drop_constraint_request(
+    engine: DatabaseEngine,
+    table: &str,
+    name: &str,
+    kind: ConstraintKind,
+) -> StructureActionRequest {
+    StructureActionRequest::DropConstraint {
+        database: Some("app".to_string()),
+        schema: (engine == DatabaseEngine::Postgresql).then(|| "public".to_string()),
+        table: table.to_string(),
+        name: name.to_string(),
+        kind,
     }
 }
 
@@ -902,5 +973,475 @@ async fn capability_snapshot_exposes_duplicate_table() {
                 .contains(&serverdesk_lib::database::DatabaseAction::DuplicateTable)
         );
         assert!(snapshot.flags.table_duplicate);
+    }
+}
+
+fn relation_create_request(engine: DatabaseEngine, table: &str) -> StructureActionRequest {
+    StructureActionRequest::CreateTable {
+        database: Some("app".to_string()),
+        schema: (engine == DatabaseEngine::Postgresql).then(|| "public".to_string()),
+        name: table.to_string(),
+        columns: vec![
+            column("id", "bigint", false),
+            column("email", "varchar(320)", false),
+            column("user_id", "bigint", false),
+        ],
+        primary_key: Vec::new(),
+        unique_keys: Vec::new(),
+        options: None,
+    }
+}
+
+#[tokio::test]
+async fn index_and_constraint_lifecycle_is_verified_for_mysql_and_postgres() {
+    for engine in [DatabaseEngine::Mysql, DatabaseEngine::Postgresql] {
+        let mut adapter = connected(engine, false).await;
+        let table = format!("serverdesk_schema_{}", engine.as_str());
+        execute_structure_with_adapter(
+            &mut adapter,
+            relation_create_request(engine, &table),
+            false,
+        )
+        .await
+        .expect("create relation table");
+
+        let index_name = format!("{table}_email_idx");
+        let renamed_index = format!("{table}_email_lookup_idx");
+        let created_index = execute_structure_with_adapter(
+            &mut adapter,
+            create_index_request(engine, &table, &index_name, true),
+            false,
+        )
+        .await
+        .expect("create index");
+        assert!(created_index.verified, "{}", created_index.verification);
+        let indexes = adapter
+            .list_indexes(
+                &table_ref(engine, &table),
+                serverdesk_lib::database::PageRequest::new(500, 0),
+            )
+            .await
+            .expect("list indexes");
+        assert!(
+            indexes
+                .items
+                .iter()
+                .any(|index| index.name == index_name && index.unique)
+        );
+
+        let renamed = execute_structure_with_adapter(
+            &mut adapter,
+            rename_index_request(engine, &table, &index_name, &renamed_index),
+            false,
+        )
+        .await
+        .expect("rename index");
+        assert!(renamed.verified, "{}", renamed.verification);
+        let indexes = adapter
+            .list_indexes(
+                &table_ref(engine, &table),
+                serverdesk_lib::database::PageRequest::new(500, 0),
+            )
+            .await
+            .expect("list renamed indexes");
+        assert!(
+            indexes
+                .items
+                .iter()
+                .any(|index| index.name == renamed_index)
+        );
+        assert!(indexes.items.iter().all(|index| index.name != index_name));
+
+        let dropped_index = execute_structure_with_adapter(
+            &mut adapter,
+            drop_index_request(engine, &table, &renamed_index),
+            true,
+        )
+        .await
+        .expect("drop index");
+        assert!(dropped_index.verified, "{}", dropped_index.verification);
+
+        let primary_name = format!("{table}_pkey");
+        let added_pk = execute_structure_with_adapter(
+            &mut adapter,
+            add_constraint_request(
+                engine,
+                &table,
+                ConstraintRequest::PrimaryKey {
+                    name: primary_name.clone(),
+                    columns: vec!["id".to_string()],
+                },
+            ),
+            false,
+        )
+        .await
+        .expect("add primary key");
+        assert!(added_pk.verified, "{}", added_pk.verification);
+        let dropped_pk = execute_structure_with_adapter(
+            &mut adapter,
+            drop_constraint_request(engine, &table, &primary_name, ConstraintKind::PrimaryKey),
+            true,
+        )
+        .await
+        .expect("drop primary key");
+        assert!(dropped_pk.verified, "{}", dropped_pk.verification);
+
+        let unique_name = format!("{table}_email_key");
+        let added_unique = execute_structure_with_adapter(
+            &mut adapter,
+            add_constraint_request(
+                engine,
+                &table,
+                ConstraintRequest::Unique {
+                    name: unique_name.clone(),
+                    columns: vec!["email".to_string()],
+                },
+            ),
+            false,
+        )
+        .await
+        .expect("add unique constraint");
+        assert!(added_unique.verified, "{}", added_unique.verification);
+        let dropped_unique = execute_structure_with_adapter(
+            &mut adapter,
+            drop_constraint_request(engine, &table, &unique_name, ConstraintKind::Unique),
+            true,
+        )
+        .await
+        .expect("drop unique constraint");
+        assert!(dropped_unique.verified, "{}", dropped_unique.verification);
+
+        let foreign_key_name = format!("{table}_user_fk");
+        let added_fk = execute_structure_with_adapter(
+            &mut adapter,
+            add_constraint_request(
+                engine,
+                &table,
+                ConstraintRequest::ForeignKey {
+                    name: foreign_key_name.clone(),
+                    columns: vec!["user_id".to_string()],
+                    referenced_schema: (engine == DatabaseEngine::Postgresql)
+                        .then(|| "public".to_string()),
+                    referenced_table: "users".to_string(),
+                    referenced_columns: vec!["id".to_string()],
+                    on_delete: Some(ReferentialAction::Cascade),
+                    on_update: Some(ReferentialAction::Restrict),
+                },
+            ),
+            false,
+        )
+        .await
+        .expect("add foreign key");
+        assert!(added_fk.verified, "{}", added_fk.verification);
+        let constraints = adapter
+            .list_constraints(
+                &table_ref(engine, &table),
+                serverdesk_lib::database::PageRequest::new(500, 0),
+            )
+            .await
+            .expect("list constraints after foreign key");
+        let foreign_key = constraints
+            .items
+            .iter()
+            .find(|constraint| constraint.name == foreign_key_name)
+            .expect("foreign key metadata");
+        assert_eq!(
+            foreign_key
+                .referenced_table
+                .value()
+                .and_then(|value| value.as_deref()),
+            Some("users")
+        );
+        assert_eq!(foreign_key.referenced_columns, ["id"]);
+        assert_eq!(
+            foreign_key.on_delete,
+            serverdesk_lib::database::MetadataValue::available(Some("CASCADE".to_string()))
+        );
+        assert_eq!(
+            foreign_key.on_update,
+            serverdesk_lib::database::MetadataValue::available(Some("RESTRICT".to_string()))
+        );
+        let dropped_fk = execute_structure_with_adapter(
+            &mut adapter,
+            drop_constraint_request(
+                engine,
+                &table,
+                &foreign_key_name,
+                ConstraintKind::ForeignKey,
+            ),
+            true,
+        )
+        .await
+        .expect("drop foreign key");
+        assert!(dropped_fk.verified, "{}", dropped_fk.verification);
+
+        let check_name = format!("{table}_user_check");
+        let added_check = execute_structure_with_adapter(
+            &mut adapter,
+            add_constraint_request(
+                engine,
+                &table,
+                ConstraintRequest::Check {
+                    name: check_name.clone(),
+                    expression: "user_id > 0".to_string(),
+                },
+            ),
+            false,
+        )
+        .await
+        .expect("add check constraint");
+        assert!(added_check.verified, "{}", added_check.verification);
+        let dropped_check = execute_structure_with_adapter(
+            &mut adapter,
+            drop_constraint_request(engine, &table, &check_name, ConstraintKind::Check),
+            true,
+        )
+        .await
+        .expect("drop check constraint");
+        assert!(dropped_check.verified, "{}", dropped_check.verification);
+
+        let _ =
+            execute_structure_with_adapter(&mut adapter, drop_request(engine, &table), true).await;
+    }
+}
+
+#[tokio::test]
+async fn index_and_constraint_drops_require_confirmation() {
+    for engine in [DatabaseEngine::Mysql, DatabaseEngine::Postgresql] {
+        let mut adapter = connected(engine, false).await;
+        let index = match engine {
+            DatabaseEngine::Mysql => "PRIMARY",
+            DatabaseEngine::Postgresql => "users_pkey",
+        };
+        let error = execute_structure_with_adapter(
+            &mut adapter,
+            drop_index_request(engine, "users", index),
+            false,
+        )
+        .await
+        .expect_err("drop index must be confirmed");
+        assert_eq!(error.kind, DatabaseErrorKind::Cancelled);
+        assert_eq!(adapter.structure_execution_count(), 0);
+
+        let error = execute_structure_with_adapter(
+            &mut adapter,
+            drop_constraint_request(engine, "users", index, ConstraintKind::PrimaryKey),
+            false,
+        )
+        .await
+        .expect_err("drop constraint must be confirmed");
+        assert_eq!(error.kind, DatabaseErrorKind::Cancelled);
+        assert_eq!(adapter.structure_execution_count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn index_and_constraint_capabilities_reject_before_execution() {
+    let mut mysql = FakeDatabaseAdapter::new(DatabaseEngine::Mysql, Some("5.7.44"));
+    mysql
+        .connect(connect_request(DatabaseEngine::Mysql, false))
+        .await
+        .expect("fake connect");
+
+    let error = execute_structure_with_adapter(
+        &mut mysql,
+        add_constraint_request(
+            DatabaseEngine::Mysql,
+            "users",
+            ConstraintRequest::Check {
+                name: "users_email_check".to_string(),
+                expression: "email <> ''".to_string(),
+            },
+        ),
+        false,
+    )
+    .await
+    .expect_err("MySQL 5.7 has no check constraints");
+    assert_eq!(error.kind, DatabaseErrorKind::Capability);
+    assert_eq!(mysql.structure_execution_count(), 0);
+
+    let mut mysql_56 = FakeDatabaseAdapter::new(DatabaseEngine::Mysql, Some("5.6.51"));
+    mysql_56
+        .connect(connect_request(DatabaseEngine::Mysql, false))
+        .await
+        .expect("fake connect");
+    let error = preview_structure_with_adapter(
+        &mysql_56,
+        &rename_index_request(DatabaseEngine::Mysql, "users", "PRIMARY", "users_pk_idx"),
+    )
+    .await
+    .expect_err("MySQL 5.6 cannot rename an index");
+    assert_eq!(error.kind, DatabaseErrorKind::Capability);
+    assert_eq!(mysql_56.structure_execution_count(), 0);
+
+    let mut mysql_partial = FakeDatabaseAdapter::new(DatabaseEngine::Mysql, Some("8.0.36"));
+    mysql_partial
+        .connect(connect_request(DatabaseEngine::Mysql, false))
+        .await
+        .expect("fake connect");
+    let error = preview_structure_with_adapter(
+        &mysql_partial,
+        &StructureActionRequest::CreateIndex {
+            database: Some("app".to_string()),
+            schema: None,
+            table: "users".to_string(),
+            name: "users_active_idx".to_string(),
+            columns: vec!["email".to_string()],
+            unique: false,
+            method: None,
+            predicate: Some("email IS NOT NULL".to_string()),
+        },
+    )
+    .await
+    .expect_err("MySQL has no partial indexes");
+    assert_eq!(error.kind, DatabaseErrorKind::Capability);
+    assert_eq!(mysql_partial.structure_execution_count(), 0);
+}
+
+#[tokio::test]
+async fn read_only_profiles_reject_index_and_constraint_changes() {
+    for engine in [DatabaseEngine::Mysql, DatabaseEngine::Postgresql] {
+        let mut adapter = connected(engine, true).await;
+        let index = match engine {
+            DatabaseEngine::Mysql => "PRIMARY",
+            DatabaseEngine::Postgresql => "users_pkey",
+        };
+
+        for request in [
+            create_index_request(engine, "users", "users_email_idx", false),
+            drop_index_request(engine, "users", index),
+            add_constraint_request(
+                engine,
+                "users",
+                ConstraintRequest::Check {
+                    name: "users_email_check".to_string(),
+                    expression: "email <> ''".to_string(),
+                },
+            ),
+            drop_constraint_request(engine, "users", index, ConstraintKind::PrimaryKey),
+        ] {
+            let error = execute_structure_with_adapter(&mut adapter, request, true)
+                .await
+                .expect_err("read-only profile must reject structure changes");
+            assert_eq!(error.kind, DatabaseErrorKind::Permission);
+            assert!(error.message.contains("read-only"));
+        }
+        assert_eq!(adapter.structure_execution_count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn index_and_constraint_dependencies_are_reported_before_destructive_changes() {
+    for engine in [DatabaseEngine::Mysql, DatabaseEngine::Postgresql] {
+        let mut adapter = connected(engine, false).await;
+        let index_name = match engine {
+            DatabaseEngine::Mysql => "PRIMARY",
+            DatabaseEngine::Postgresql => "users_pkey",
+        };
+        let constraint_name = match engine {
+            DatabaseEngine::Mysql => "PRIMARY",
+            DatabaseEngine::Postgresql => "users_pkey",
+        };
+
+        let preview = preview_structure_with_adapter(
+            &adapter,
+            &drop_index_request(engine, "users", index_name),
+        )
+        .await
+        .expect("drop index preview");
+        assert!(preview.requires_confirmation);
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("orders_user_fk")),
+            "dependency warning missing: {:?}",
+            preview.warnings
+        );
+
+        let error = execute_structure_with_adapter(
+            &mut adapter,
+            drop_index_request(engine, "users", index_name),
+            true,
+        )
+        .await
+        .expect_err("the primary index is referenced by an incoming foreign key");
+        assert_eq!(error.kind, DatabaseErrorKind::Dependency);
+        assert!(error.message.contains("drop index"));
+        assert!(
+            error
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("orders_user_fk"))
+        );
+        assert_eq!(adapter.structure_execution_count(), 0);
+
+        let preview = preview_structure_with_adapter(
+            &adapter,
+            &drop_constraint_request(engine, "users", constraint_name, ConstraintKind::PrimaryKey),
+        )
+        .await
+        .expect("drop constraint preview");
+        assert!(preview.requires_confirmation);
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("orders_user_fk")),
+            "dependency warning missing: {:?}",
+            preview.warnings
+        );
+
+        let error = execute_structure_with_adapter(
+            &mut adapter,
+            drop_constraint_request(engine, "users", constraint_name, ConstraintKind::PrimaryKey),
+            true,
+        )
+        .await
+        .expect_err("the primary key is referenced by an incoming foreign key");
+        assert_eq!(error.kind, DatabaseErrorKind::Dependency);
+        assert!(error.message.contains("drop constraint"));
+        assert!(
+            error
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("orders_user_fk"))
+        );
+        assert_eq!(adapter.structure_execution_count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn index_and_constraint_verification_detects_unapplied_execution() {
+    for engine in [DatabaseEngine::Mysql, DatabaseEngine::Postgresql] {
+        let mut adapter = connected(engine, false).await.without_structure_execution();
+        let result = execute_structure_with_adapter(
+            &mut adapter,
+            create_index_request(engine, "users", "users_email_idx", false),
+            false,
+        )
+        .await
+        .expect("execution itself reports success");
+        assert!(!result.verified);
+        assert!(result.verification.contains("does not list index"));
+        assert!(result.verification_error.is_some());
+
+        let result = execute_structure_with_adapter(
+            &mut adapter,
+            add_constraint_request(
+                engine,
+                "users",
+                ConstraintRequest::Check {
+                    name: "users_email_check".to_string(),
+                    expression: "email <> ''".to_string(),
+                },
+            ),
+            false,
+        )
+        .await
+        .expect("execution itself reports success");
+        assert!(!result.verified);
+        assert!(result.verification.contains("does not list constraint"));
+        assert!(result.verification_error.is_some());
     }
 }
