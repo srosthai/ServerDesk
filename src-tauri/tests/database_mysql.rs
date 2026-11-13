@@ -10,12 +10,16 @@ use std::{
     time::Duration,
 };
 
+use sqlx::{Connection, MySqlConnection, mysql::MySqlConnectOptions};
+
 use serverdesk_lib::{
     database::{
         ColumnDefaultRequest, ColumnDefinitionRequest, ColumnIdentity, ColumnPositionRequest,
         ConstraintKind, ConstraintRequest, DatabaseAction, DatabaseActionRequest, DatabaseAdapter,
         DatabaseConnectRequest, DatabaseErrorKind, DatabasePassword, Identifier, MetadataScope,
-        MetadataValue, MysqlDatabaseAdapter, PageRequest, ReferentialAction,
+        MetadataValue, MysqlDatabaseAdapter, PageRequest, ReferentialAction, RowFilter,
+        RowFilterOperator, RowFilterValue, RowIdentityKind, RowPageRequest, RowQueryControl,
+        RowQueryRegistry, RowReadOnlyReason, RowReadRequest, RowSearch, RowSort, RowSortDirection,
         StructureActionRequest, TableOptionsRequest, TableRef, UniqueKeyRequest,
         execute_structure_with_adapter, execute_with_adapter, preview_structure_with_adapter,
         preview_with_adapter,
@@ -1019,6 +1023,272 @@ async fn live_mysql_read_only_profile_rejects_table_changes() {
     .expect_err("read-only profile must reject table changes");
     assert_eq!(error.kind, DatabaseErrorKind::Permission);
     assert!(error.message.contains("read-only"));
+
+    adapter.close().await.expect("close fixture");
+}
+
+#[tokio::test]
+async fn live_mysql_row_browser_filters_sorts_counts_cancels_and_flags_missing_identity() {
+    let Some(fixture) = LiveMysql::from_env() else {
+        eprintln!("skipping live MySQL row browser test: fixture environment is not set");
+        return;
+    };
+
+    let mut adapter = MysqlDatabaseAdapter::new();
+    adapter
+        .connect(fixture.request(false))
+        .await
+        .expect("connect to fixture");
+
+    let table = "serverdesk_row_ops";
+    let no_identity = "serverdesk_row_ops_no_identity";
+    for leftover in [table, no_identity] {
+        let _ = execute_structure_with_adapter(
+            &mut adapter,
+            StructureActionRequest::DropTable {
+                database: Some(fixture.database.clone()),
+                schema: None,
+                name: leftover.to_string(),
+            },
+            true,
+        )
+        .await;
+    }
+
+    let create = StructureActionRequest::CreateTable {
+        database: Some(fixture.database.clone()),
+        schema: None,
+        name: table.to_string(),
+        columns: vec![
+            ColumnDefinitionRequest {
+                name: "id".to_string(),
+                data_type: "bigint unsigned".to_string(),
+                nullable: false,
+                default: None,
+                comment: None,
+                generated: None,
+                identity: Some(ColumnIdentity::AutoIncrement),
+            },
+            ColumnDefinitionRequest {
+                name: "name".to_string(),
+                data_type: "varchar(120)".to_string(),
+                nullable: false,
+                default: None,
+                comment: None,
+                generated: None,
+                identity: None,
+            },
+            ColumnDefinitionRequest {
+                name: "score".to_string(),
+                data_type: "int".to_string(),
+                nullable: false,
+                default: None,
+                comment: None,
+                generated: None,
+                identity: None,
+            },
+            ColumnDefinitionRequest {
+                name: "note".to_string(),
+                data_type: "text".to_string(),
+                nullable: true,
+                default: None,
+                comment: None,
+                generated: None,
+                identity: None,
+            },
+        ],
+        primary_key: vec!["id".to_string()],
+        unique_keys: Vec::new(),
+        options: None,
+    };
+    let created = execute_structure_with_adapter(&mut adapter, create, false)
+        .await
+        .expect("create row fixture table");
+    assert!(created.verified, "{}", created.verification);
+
+    let options = MySqlConnectOptions::new()
+        .host(&fixture.host)
+        .port(fixture.port)
+        .username(&fixture.username)
+        .password(&fixture.password)
+        .database(&fixture.database);
+    let mut raw = MySqlConnection::connect_with(&options)
+        .await
+        .expect("raw fixture connection");
+    sqlx::query(
+        "INSERT INTO `serverdesk_row_ops` (`name`, `score`, `note`) VALUES \
+         (?, ?, ?), (?, ?, ?), (?, ?, ?)",
+    )
+    .bind("ann")
+    .bind(10_i32)
+    .bind(Some("first"))
+    .bind("bob")
+    .bind(30_i32)
+    .bind(None::<String>)
+    .bind("anna")
+    .bind(20_i32)
+    .bind(Some("third"))
+    .execute(&mut raw)
+    .await
+    .expect("insert row fixture values");
+    raw.close().await.expect("close raw fixture connection");
+
+    let mut request = RowReadRequest {
+        table: TableRef::new(Some(&fixture.database), None, table).expect("table ref"),
+        page: RowPageRequest::try_new(1, 0).expect("page"),
+        visible_columns: vec![
+            Identifier::new("name").expect("name"),
+            Identifier::new("score").expect("score"),
+        ],
+        sort: vec![RowSort {
+            column: Identifier::new("score").expect("score"),
+            direction: RowSortDirection::Desc,
+        }],
+        filters: vec![RowFilter {
+            column: Identifier::new("name").expect("name"),
+            operator: RowFilterOperator::Contains,
+            value: Some(RowFilterValue::Text("ANN".to_string())),
+            values: Vec::new(),
+        }],
+        search: None,
+        include_exact_count: true,
+    };
+
+    let first = adapter
+        .read_rows(&request, &RowQueryControl::default())
+        .await
+        .expect("first live row page");
+    assert_eq!(first.rows.len(), 1);
+    assert!(first.page.has_more);
+    assert_eq!(first.rows[0].cells[0].value.as_deref(), Some("anna"));
+    assert_eq!(first.rows[0].cells[1].value.as_deref(), Some("20"));
+    assert_eq!(first.rows[0].identity[0].value.as_deref(), Some("3"));
+    assert_eq!(first.identity.kind, RowIdentityKind::PrimaryKey);
+    assert!(first.counts.estimated_table_rows.is_available());
+    assert_eq!(first.counts.exact_rows.expect("exact count").value, 2);
+    assert!(first.editable);
+    assert!(
+        first
+            .visible_columns
+            .iter()
+            .any(|name| name.as_str() == "name")
+    );
+
+    request.page = RowPageRequest::try_new(1, 1).expect("page");
+    let second = adapter
+        .read_rows(&request, &RowQueryControl::default())
+        .await
+        .expect("second live row page");
+    assert_eq!(second.rows[0].cells[0].value.as_deref(), Some("ann"));
+    assert!(!second.page.has_more);
+
+    let mut injection = request.clone();
+    injection.filters = vec![RowFilter {
+        column: Identifier::new("name").expect("name"),
+        operator: RowFilterOperator::Equals,
+        value: Some(RowFilterValue::Text(
+            "x' OR 1=1; DROP TABLE serverdesk_row_ops; --".to_string(),
+        )),
+        values: Vec::new(),
+    }];
+    injection.search = None;
+    injection.include_exact_count = false;
+    let result = adapter
+        .read_rows(&injection, &RowQueryControl::default())
+        .await
+        .expect("injection attempts remain bound values");
+    assert!(result.rows.is_empty());
+    assert_eq!(
+        adapter
+            .table_summary(&TableRef::new(Some(&fixture.database), None, table).expect("table"))
+            .await
+            .expect("table still exists")
+            .map(|summary| summary.name),
+        Some(table.to_string())
+    );
+
+    let registry = RowQueryRegistry::default();
+    let guard = registry.begin("live-mysql-row-read").expect("begin");
+    guard.cancellation().cancel();
+    let control = RowQueryControl::new(Duration::from_secs(5), Some(guard.cancellation()));
+    let cancelled = adapter
+        .read_rows(&request, &control)
+        .await
+        .expect_err("cancelled read");
+    assert_eq!(cancelled.kind, DatabaseErrorKind::Cancelled);
+
+    let create_no_identity = StructureActionRequest::CreateTable {
+        database: Some(fixture.database.clone()),
+        schema: None,
+        name: no_identity.to_string(),
+        columns: vec![
+            ColumnDefinitionRequest {
+                name: "code".to_string(),
+                data_type: "varchar(64)".to_string(),
+                nullable: false,
+                default: None,
+                comment: None,
+                generated: None,
+                identity: None,
+            },
+            ColumnDefinitionRequest {
+                name: "note".to_string(),
+                data_type: "text".to_string(),
+                nullable: true,
+                default: None,
+                comment: None,
+                generated: None,
+                identity: None,
+            },
+        ],
+        primary_key: Vec::new(),
+        unique_keys: Vec::new(),
+        options: None,
+    };
+    execute_structure_with_adapter(&mut adapter, create_no_identity, false)
+        .await
+        .expect("create no-identity table");
+    let no_identity_result = adapter
+        .read_rows(
+            &RowReadRequest {
+                table: TableRef::new(Some(&fixture.database), None, no_identity).expect("table"),
+                page: RowPageRequest::try_new(10, 0).expect("page"),
+                visible_columns: Vec::new(),
+                sort: Vec::new(),
+                filters: Vec::new(),
+                search: Some(RowSearch {
+                    query: "anything".to_string(),
+                    columns: Vec::new(),
+                }),
+                include_exact_count: true,
+            },
+            &RowQueryControl::default(),
+        )
+        .await
+        .expect("no-identity row page");
+    assert!(!no_identity_result.editable);
+    assert_eq!(
+        no_identity_result.read_only_reasons,
+        [RowReadOnlyReason::NoStableIdentity]
+    );
+    assert_eq!(no_identity_result.identity.kind, RowIdentityKind::None);
+    assert_eq!(
+        no_identity_result.counts.exact_rows.expect("exact").value,
+        0
+    );
+
+    for leftover in [table, no_identity] {
+        let _ = execute_structure_with_adapter(
+            &mut adapter,
+            StructureActionRequest::DropTable {
+                database: Some(fixture.database.clone()),
+                schema: None,
+                name: leftover.to_string(),
+            },
+            true,
+        )
+        .await;
+    }
 
     adapter.close().await.expect("close fixture");
 }

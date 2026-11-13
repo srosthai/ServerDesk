@@ -35,6 +35,7 @@ src-tauri/src/commands/database/
   capabilities.rs   engine/version capability document
   discovery.rs      lazy explorer-node metadata commands
   profiles.rs       saved profile CRUD, test, connect, reconnect, disconnect
+  rows.rs           bounded row reads and cancellation commands
   structure.rs      structure preview and table lifecycle execution + audit
   tunnels.rs        loopback SSH tunnel inspection commands
 
@@ -44,6 +45,8 @@ src-tauri/src/database/
   actions.rs        lifecycle requests, DDL preview, verified result service
   structure.rs      table/column/index/constraint validation, DDL previews, and table execution
   discovery.rs      explorer-node request/response and metadata service
+  row_service.rs    row-read service over the connection registry
+  rows.rs           row request model, safe planning, cancellation, and page/result types
   capabilities.rs   action model, flags, version parsing
   dialect.rs        identifier validation/quoting and value binding
   errors.rs         shared database error taxonomy
@@ -56,14 +59,16 @@ src-tauri/src/database/
     ddl.rs          MySQL table/column/index/constraint DDL planning
     adapter.rs      live SQLx MySQL adapter and error mapping
     capabilities.rs MySQL version gates
-    sql.rs          MySQL-only metadata SQL
+    rows.rs         MySQL row metadata, query builders, and bounded reads
+    sql.rs          MySQL-only metadata and row-browser SQL
   postgres/
     mod.rs          PostgreSQL dialect
     actions.rs      PostgreSQL create/rename/drop/set-active planning
     ddl.rs          PostgreSQL table/column/index/constraint DDL planning
     adapter.rs      live SQLx PostgreSQL adapter and error mapping
     capabilities.rs PostgreSQL version gates
-    sql.rs          PostgreSQL-only metadata SQL
+    rows.rs         PostgreSQL row metadata, query builders, and bounded reads
+    sql.rs          PostgreSQL-only metadata and row-browser SQL
 ```
 
 The existing tunnel implementation remains in `src-tauri/src/core/ssh/tunnel.rs`
@@ -88,6 +93,8 @@ same adapter contract.
 - table, view, sequence, column, index, and constraint metadata;
 - bounded dependency inventories for one table before destructive changes;
 - bounded object counts for one explorer node;
+- hard-bounded, parameterized row reads with stable-identity detection,
+  exact/estimated counts, cancellation, and query timeouts;
 - capability checks through `require_capability`;
 - connection checks through `require_connection`.
 
@@ -588,6 +595,7 @@ the engine's baseline and every newer supported version.
 | `browse_columns`            | Both                               | Both                            |
 | `browse_indexes`            | Both                               | Both                            |
 | `browse_constraints`        | Both                               | Both                            |
+| `browse_rows`               | Both                               | Both                            |
 | `browse_views`              | Both                               | Both                            |
 | `browse_materialized_views` | Not supported                      | 9.3+                            |
 | `browse_sequences`          | Not supported                      | Both                            |
@@ -700,12 +708,174 @@ Commands convert `DatabaseError` to `AppError`. `tunnel`, `database_auth`,
 details are bounded and pass through the central redactor before crossing the
 Tauri boundary.
 
+## Row browsing commands
+
+`src-tauri/src/commands/database/rows.rs` owns the data-browser backend
+contract. The data grid itself is #176; this slice provides bounded reads and
+the typed state the grid consumes.
+
+| Command                    | Purpose                                                      |
+| -------------------------- | ------------------------------------------------------------ |
+| `read_database_table_rows` | Read one hard-bounded page with filters, search, and sorting |
+| `cancel_database_row_read` | Cancel one in-flight read by caller-generated request id     |
+
+A request names one table and one page:
+
+```json
+{
+  "profileId": "profile-id",
+  "requestId": "0f0e4e8d-2f4c-4b5d-9e1a-3f4f0d8b1c11",
+  "database": "app",
+  "schema": "public",
+  "table": "users",
+  "visibleColumns": ["id", "email", "created_at"],
+  "sort": [{ "column": "created_at", "direction": "desc" }],
+  "filters": [
+    {
+      "column": "email",
+      "operator": "contains",
+      "value": { "kind": "text", "value": "example.com" }
+    }
+  ],
+  "search": { "query": "ann", "columns": [] },
+  "limit": 100,
+  "offset": 0,
+  "includeExactCount": true,
+  "timeoutMs": 10000
+}
+```
+
+The response carries the engine, table reference, all column metadata (name,
+engine type, classified kind, nullability, ordinal position, primary-key
+membership, identity kind, generated flag, and sort/filter/search support), the
+visible column order, stable identity, per-row cells and identity values, page
+info, estimated table rows, and an optional exact count:
+
+```json
+{
+  "engine": "postgresql",
+  "table": { "database": "app", "schema": "public", "name": "users" },
+  "columns": [
+    {
+      "name": "id",
+      "dataType": "bigint",
+      "kind": "integer",
+      "primaryKey": true,
+      "sortable": true,
+      "filterable": true,
+      "searchable": false
+    }
+  ],
+  "visibleColumns": ["email"],
+  "identity": { "kind": "primary_key", "columns": ["id"], "stable": true },
+  "editable": true,
+  "readOnlyReasons": [],
+  "rows": [
+    {
+      "cells": [{ "value": "ann@example.com", "truncated": false }],
+      "identity": [{ "column": "id", "value": "42" }]
+    }
+  ],
+  "page": { "limit": 100, "offset": 0, "returned": 1, "hasMore": false },
+  "counts": {
+    "estimatedTableRows": { "status": "available", "value": 12000 },
+    "exactRows": { "value": 1, "filtered": true }
+  }
+}
+```
+
+### Bounds and safety
+
+| Bound                            | Value        |
+| -------------------------------- | ------------ |
+| Default row page limit           | 100          |
+| Maximum row page limit           | 200 (reject) |
+| Maximum page offset              | 1,000,000    |
+| Maximum filters                  | 16           |
+| Maximum values in an `in` filter | 50           |
+| Maximum filter value length      | 512 chars    |
+| Maximum sort columns             | 8            |
+| Maximum search term length       | 256 chars    |
+| Maximum searched columns         | 32           |
+| Maximum visible columns          | 256          |
+| Maximum table columns            | 1,024        |
+| Maximum non-identity cell length | 4,096 chars  |
+| Default / maximum query timeout  | 10 / 30 sec  |
+
+A page limit or offset above the hard bound is a typed `validation` error, not a
+clamped request. Page queries request `limit + 1` rows so `hasMore` is known
+without a second count query. No request can select every row by default.
+
+Identifiers are validated by `Identifier`, resolved against live column metadata,
+and quoted by the engine dialect. A sort, filter, search, or visible column that
+does not exist is rejected before SQL is generated. Sort direction is a closed
+enum, never SQL text. Filter and search values are always bound parameters:
+MySQL uses `?`, PostgreSQL uses `$n`, and PostgreSQL adds fixed casts for
+temporal, numeric, and UUID comparisons. A request id is bounded ASCII and is
+used only as an in-memory cancellation key.
+
+`contains`, `starts_with`, `ends_with`, and search use `LOWER(...) LIKE
+LOWER(?) ESCAPE '='`; `%`, `_`, and `=` are escaped in the bound pattern.
+Case-insensitive matching is used for those text operations; equality and
+ordering keep engine collation semantics.
+
+### Counts
+
+`estimatedTableRows` comes from MySQL `information_schema.TABLES.TABLE_ROWS` or
+PostgreSQL `pg_class.reltuples`. It is labelled as an estimate and is
+`unavailable` when the engine cannot report it (for example, a freshly created
+PostgreSQL table that has not been analyzed). `exactRows` is present only when
+the caller opts in with `includeExactCount: true`; it runs a separate
+`COUNT(*)` with the same filters/search, and `filtered` says whether the count
+covers a filtered set. The estimate is never substituted for an exact count.
+
+### Stable row identity
+
+A table is editable when it has a primary key or a complete unique index whose
+columns are all `NOT NULL` and are plain stored columns. MySQL prefix indexes and
+PostgreSQL partial or expression indexes are not accepted as stable identities.
+When no such identity exists, `identity.kind` is `none`, `identity.stable` is
+false, `editable` is false, and `readOnlyReasons` contains `no_stable_identity`.
+A read-only profile adds `session_read_only`. Row identity values are returned
+for every row even when the identity columns are hidden; they are read in full
+because unique-index size bounds them, while other cells may be explicitly
+truncated.
+
+### Cancellation and timeouts
+
+Every call has a server-side bound (default 10 seconds, hard maximum 30
+seconds). The command registers the caller's `requestId` in `RowQueryRegistry`
+before reading and removes it when the call finishes. `cancel_database_row_read`
+sets the handle and wakes the in-flight `tokio::select!`; the adapter returns a
+typed `cancelled` error. A cancellation that arrives before SQL starts does not
+touch the connection. If an in-flight query or timeout drops a driver future,
+the adapter closes the session instead of reusing a protocol stream in an
+unknown state.
+
+`src/services/databaseRows.ts` is the only React module that invokes the
+commands. `src/stores/databaseRowStore.ts` owns one current page per
+connection/table, query state, in-flight request ids, stale-response rejection,
+cancelled state, and profile resets. The data grid UI is #176.
+
+### Tests
+
+`src-tauri/tests/database_rows.rs` uses the fake adapter and pure engine SQL
+builders for deterministic MySQL and PostgreSQL coverage: empty tables, hard
+page bounds, large pages, filters, search, sorting, exact/estimated counts,
+stable-identity detection, read-only sessions, cancellation, timeouts, and
+injection attempts in identifiers and values. `src-tauri/tests/database_mysql.rs`
+and `src-tauri/tests/database_postgres.rs` add opt-in live row-browser tests
+that exercise pagination, filtering, sorting, temporal casts, exact counts,
+cancellation, injection attempts, and tables without a stable identity.
+
 ## Fake adapter
 
 `FakeDatabaseAdapter` implements the full trait with deterministic fixture
 metadata for MySQL and PostgreSQL. It records connect, ping, and close calls,
-can inject a typed connect failure, and returns bounded pages. Tests use it as a
-trait object to prove that commands can depend on `DatabaseAdapter` alone
+can inject a typed connect failure, returns bounded pages, and can carry
+`FakeRowTable` row fixtures with deterministic filtering, search, sorting,
+pagination, counts, cancellation, and injected row-read errors. Tests use it as
+a trait object to prove that commands can depend on `DatabaseAdapter` alone
 without a real database.
 
 Run the focused suites with:
@@ -761,10 +931,11 @@ fields, bounded index and constraint metadata, incoming-foreign-key and trigger
 dependencies, typed authentication failure, database create/set-active/drop
 verification, table create/duplicate/rename/truncate/drop verification, column
 add/edit/rename/drop/reorder verification, read-only lifecycle and table
-permission denial, the unsupported rename explanation, and the unavailable-host
-path. They bind no public port; the container mapping is explicit `127.0.0.1`.
-The live path has been exercised against both MariaDB 11.4 and MySQL 8.4
-containers.
+permission denial, the unsupported rename explanation, the unavailable-host
+path, and bounded row reads with filters, sorting, exact counts, cancellation,
+injection attempts, and no-identity fallback. They bind no public port; the
+container mapping is explicit `127.0.0.1`. The live path has been exercised
+against both MariaDB 11.4 and MySQL 8.4 containers.
 
 ### Live PostgreSQL fixture
 
@@ -805,8 +976,10 @@ incoming foreign keys, dependent views, owned sequences, triggers,
 create/rename/set-active/drop verification, table
 create/duplicate/rename/truncate/drop verification, read-only lifecycle and
 table permission denial, active-catalog rename rejection, typed authentication
-failure, and the unavailable-host path. They bind no public port. The live path
-has been exercised against a PostgreSQL 18 container.
+failure, the unavailable-host path, and bounded row reads with filters,
+temporal casts, sorting, exact counts, cancellation, injection attempts, and
+no-identity fallback. They bind no public port. The live path has been exercised
+against a PostgreSQL 18 container.
 
 ## Current limitations
 
@@ -824,6 +997,16 @@ has been exercised against a PostgreSQL 18 container.
   but not rows or foreign keys. Copying data is deferred to the import/export
   slice so a duplicate cannot unexpectedly copy a large table.
 - MySQL table row counts are engine estimates (`TABLE_ROWS`); they are not exact.
+- The row browser reads base tables, not views. Row-level insert, edit, and
+  delete are deferred to the editing slice; this slice only exposes stable
+  identity and read-only markers.
+- Row-browser cells are text representations. Non-identity cells longer than
+  4,096 characters are returned as an explicit truncated value; identity values
+  are read in full. Binary values are base64 and spatial values are WKT.
+- Exact row counts run a separate `COUNT(*)` and can be expensive on large
+  tables; they are opt-in and share the request timeout.
+- MySQL prefix unique indexes and PostgreSQL partial/expression unique indexes
+  are not treated as stable row identities even when they are unique.
 - PostgreSQL `reltuples` can remain `-1` until the table is analyzed, so a
   freshly created table reports estimated rows and statistics refresh time as
   unavailable rather than zero.

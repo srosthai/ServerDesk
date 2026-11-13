@@ -17,6 +17,7 @@ pub mod actions;
 pub mod adapter;
 pub mod capabilities;
 pub mod ddl;
+pub mod rows;
 pub mod sql;
 
 pub use adapter::MysqlDatabaseAdapter;
@@ -83,6 +84,10 @@ mod tests {
 
         assert!(sql::TABLE_INCOMING_FOREIGN_KEYS.contains("REFERENCED_TABLE_NAME"));
         assert!(sql::TABLE_TRIGGERS.contains("information_schema.TRIGGERS"));
+        assert!(sql::ROW_TABLE_ESTIMATE.contains("TABLE_ROWS"));
+        assert!(sql::ROW_TABLE_COLUMNS.contains("COLUMN_TYPE"));
+        assert!(sql::ROW_TABLE_COLUMNS.contains("LIMIT ?"));
+        assert!(sql::ROW_UNIQUE_INDEXES.contains("SUB_PART"));
     }
 
     #[test]
