@@ -16,6 +16,7 @@ pub mod actions;
 pub mod adapter;
 pub mod capabilities;
 pub mod ddl;
+pub mod rows;
 pub mod sql;
 
 pub use adapter::PostgresDatabaseAdapter;
@@ -82,6 +83,9 @@ mod tests {
         assert!(sql::TABLE_DEPENDENT_VIEWS.contains("pg_depend"));
         assert!(sql::TABLE_OWNED_SEQUENCES.contains("deptype IN ('a', 'i')"));
         assert!(sql::TABLE_TRIGGERS.contains("tgisinternal"));
+        assert!(sql::ROW_TABLE_ESTIMATE.contains("reltuples"));
+        assert!(sql::ROW_TABLE_COLUMNS.contains("format_type"));
+        assert!(sql::ROW_UNIQUE_INDEXES.contains("indisvalid"));
         for statement in [
             sql::TABLE_INCOMING_FOREIGN_KEYS,
             sql::TABLE_DEPENDENT_VIEWS,

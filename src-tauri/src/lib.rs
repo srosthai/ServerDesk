@@ -14,7 +14,7 @@ use crate::{
         ssh::{ConnectionManager, ConnectionTimeouts, RusshTransport, TunnelManager},
         terminal::TerminalManager,
     },
-    database::DatabaseConnectionRegistry,
+    database::{DatabaseConnectionRegistry, RowQueryRegistry},
 };
 
 async fn release_connections(app: &tauri::AppHandle) {
@@ -129,6 +129,7 @@ pub fn run() {
             ));
             let tunnels = TunnelManager::new(Arc::clone(&connections));
             app.manage(DatabaseConnectionRegistry::new(Arc::clone(&tunnels)));
+            app.manage(RowQueryRegistry::default());
             app.manage(Arc::clone(&connections));
             app.manage(tunnels);
             app.manage(Arc::new(FileTransferManager::new(
@@ -181,6 +182,8 @@ pub fn run() {
             commands::database::discovery::get_database_object_counts,
             commands::database::discovery::load_database_explorer_node,
             commands::database::discovery::refresh_database_explorer_node,
+            commands::database::rows::read_database_table_rows,
+            commands::database::rows::cancel_database_row_read,
             commands::database::profiles::list_database_profiles,
             commands::database::profiles::get_database_profile,
             commands::database::profiles::create_database_profile,

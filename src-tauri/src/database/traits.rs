@@ -16,6 +16,7 @@ use super::{
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
     pagination::{Bounded, Page, PageRequest},
+    rows::{RowQueryControl, RowReadRequest, RowReadResult},
     structure::{StructureDdlPreview, ValidatedStructureAction},
 };
 
@@ -513,6 +514,17 @@ pub trait DatabaseAdapter: Send + Sync {
         table: &TableRef,
         page: PageRequest,
     ) -> Result<Page<ConstraintSummary>, DatabaseError>;
+
+    /// Reads one hard-bounded page of table rows. Filters and search values are
+    /// parameterized, sort columns are resolved against live metadata, and the
+    /// result carries column metadata, stable identity, and exact/estimated
+    /// counts. The control bounds the whole request with a timeout and an
+    /// optional cancellation handle.
+    async fn read_rows(
+        &self,
+        request: &RowReadRequest,
+        control: &RowQueryControl,
+    ) -> Result<RowReadResult, DatabaseError>;
 
     /// Returns a bounded dependency inventory for one table. Callers use it
     /// before destructive structure changes so the UI can name the foreign

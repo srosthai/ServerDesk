@@ -278,6 +278,7 @@ export type DatabaseAction =
   | "browse_columns"
   | "browse_indexes"
   | "browse_constraints"
+  | "browse_rows"
   | "browse_views"
   | "browse_materialized_views"
   | "browse_sequences"
@@ -556,6 +557,147 @@ export type DatabaseDiscoveryScope = {
 export type DatabaseDiscoveryPage = {
   limit?: number;
   offset?: number;
+};
+
+export type DatabaseRowColumnKind =
+  | "text"
+  | "integer"
+  | "float"
+  | "decimal"
+  | "boolean"
+  | "temporal"
+  | "uuid"
+  | "json"
+  | "binary"
+  | "other";
+
+export type DatabaseRowFilterOperator =
+  | "equals"
+  | "not_equals"
+  | "contains"
+  | "starts_with"
+  | "ends_with"
+  | "greater_than"
+  | "greater_than_or_equal"
+  | "less_than"
+  | "less_than_or_equal"
+  | "in"
+  | "is_null"
+  | "is_not_null";
+
+export type DatabaseRowFilterValue =
+  | { kind: "text"; value: string }
+  | { kind: "integer"; value: number }
+  | { kind: "float"; value: number }
+  | { kind: "boolean"; value: boolean };
+
+export type DatabaseRowFilter = {
+  column: string;
+  operator: DatabaseRowFilterOperator;
+  value?: DatabaseRowFilterValue;
+  values?: DatabaseRowFilterValue[];
+};
+
+export type DatabaseRowSortDirection = "asc" | "desc";
+
+export type DatabaseRowSort = {
+  column: string;
+  direction: DatabaseRowSortDirection;
+};
+
+export type DatabaseRowSearch = {
+  query: string;
+  columns?: string[];
+};
+
+export type DatabaseRowTable = DatabaseDiscoveryScope & {
+  table: string;
+};
+
+export type DatabaseRowOptions = {
+  visibleColumns?: string[];
+  sort?: DatabaseRowSort[];
+  filters?: DatabaseRowFilter[];
+  search?: DatabaseRowSearch | null;
+  limit?: number;
+  offset?: number;
+  includeExactCount?: boolean;
+  timeoutMs?: number;
+};
+
+export type DatabaseRowIdentityKind = "primary_key" | "unique_index" | "none";
+
+export type DatabaseRowIdentity = {
+  kind: DatabaseRowIdentityKind;
+  columns: string[];
+  index?: string;
+  stable: boolean;
+};
+
+export type DatabaseRowReadOnlyReason = "no_stable_identity" | "session_read_only";
+
+export type DatabaseRowColumn = {
+  name: string;
+  dataType: string;
+  kind: DatabaseRowColumnKind;
+  nullable: boolean;
+  ordinalPosition: number;
+  primaryKey: boolean;
+  identity: DatabaseColumnIdentity;
+  generated: boolean;
+  sortable: boolean;
+  filterable: boolean;
+  searchable: boolean;
+};
+
+export type DatabaseRowCell = {
+  value: string | null;
+  truncated: boolean;
+};
+
+export type DatabaseRowIdentityValue = {
+  column: string;
+  value: string | null;
+};
+
+export type DatabaseRowRecord = {
+  cells: DatabaseRowCell[];
+  identity: DatabaseRowIdentityValue[];
+};
+
+export type DatabaseRowExactCount = {
+  value: number;
+  filtered: boolean;
+};
+
+export type DatabaseRowCounts = {
+  estimatedTableRows: DatabaseMetadataValue<number>;
+  exactRows?: DatabaseRowExactCount;
+};
+
+export type DatabaseRowPageInfo = {
+  limit: number;
+  offset: number;
+  returned: number;
+  hasMore: boolean;
+};
+
+export type DatabaseRowReadResult = {
+  engine: DatabaseEngine;
+  table: DatabaseDiscoveryScope & { name: string };
+  columns: DatabaseRowColumn[];
+  visibleColumns: string[];
+  identity: DatabaseRowIdentity;
+  editable: boolean;
+  readOnlyReasons: DatabaseRowReadOnlyReason[];
+  rows: DatabaseRowRecord[];
+  page: DatabaseRowPageInfo;
+  counts: DatabaseRowCounts;
+};
+
+export type DatabaseRowCancellationResult = {
+  requestId: string;
+  cancelled: boolean;
 };
 
 export type DatabaseExplorerNode =
