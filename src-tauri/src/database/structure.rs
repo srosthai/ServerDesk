@@ -6,9 +6,9 @@
 //! bounded, and every user value is represented by a typed value instead of raw
 //! SQL. Engine modules generate the DDL from the validated action.
 //!
-//! This module deliberately does not execute anything. DDL generation is a pure
-//! planning step; a future execution command must ask an adapter for the same
-//! preview first so capability checks and read-only checks cannot be bypassed.
+//! Execution always asks an adapter for the same preview first, so capability
+//! checks, read-only checks, and destructive confirmations cannot be bypassed.
+//! Column execution re-reads column metadata before reporting success.
 
 use std::time::Instant;
 
@@ -23,8 +23,8 @@ use super::{
     pagination::{Bounded, MAX_PAGE_LIMIT, PageRequest},
     service::DatabaseConnectionRegistry,
     traits::{
-        ColumnIdentity, ConstraintKind, DatabaseAdapter, DependencySummary, MetadataValue,
-        TableRef, TableSummary,
+        ColumnIdentity, ColumnSummary, ConstraintKind, DatabaseAdapter, DependencySummary,
+        MetadataValue, TableRef, TableSummary,
     },
 };
 
@@ -1183,7 +1183,9 @@ pub async fn preview_structure_with_adapter(
     request: &StructureActionRequest,
 ) -> Result<StructureDdlPreview, DatabaseError> {
     let validated = request.validate()?;
-    adapter.preview_structure_action(&validated).await
+    let mut preview = adapter.preview_structure_action(&validated).await?;
+    append_dependency_warnings(adapter, &validated, &mut preview).await;
+    Ok(preview)
 }
 
 /// Executes one validated structure action and re-reads metadata before
@@ -1195,7 +1197,7 @@ pub async fn execute_structure_with_adapter(
 ) -> Result<StructureActionResult, DatabaseError> {
     let started = Instant::now();
     let validated = request.validate()?;
-    let preview = adapter.preview_structure_action(&validated).await?;
+    let preview = preview_structure_with_adapter(adapter, &request).await?;
 
     if !matches!(
         validated,
@@ -1204,10 +1206,15 @@ pub async fn execute_structure_with_adapter(
             | ValidatedStructureAction::DuplicateTable { .. }
             | ValidatedStructureAction::TruncateTable { .. }
             | ValidatedStructureAction::DropTable { .. }
+            | ValidatedStructureAction::AddColumn { .. }
+            | ValidatedStructureAction::AlterColumn { .. }
+            | ValidatedStructureAction::RenameColumn { .. }
+            | ValidatedStructureAction::DropColumn { .. }
+            | ValidatedStructureAction::ReorderColumn { .. }
     ) {
         return Err(DatabaseError::capability(
-            "This build executes only table create, rename, duplicate, truncate, and drop. Column, \
-             index, and constraint execution arrives with the structure editor.",
+            "This build executes only table lifecycle and column add, edit, rename, drop, and \
+             reorder actions. Index and constraint execution arrives with the structure editor.",
         ));
     }
 
@@ -1225,7 +1232,7 @@ pub async fn execute_structure_with_adapter(
 
     if adapter.is_read_only() {
         return Err(DatabaseError::permission(
-            "The database connection profile is read-only; table structure changes require a \
+            "The database connection profile is read-only; database structure changes require a \
              writable connection.",
         )
         .with_scope("table", validated.table().name.as_str()));
@@ -1271,10 +1278,11 @@ async fn ensure_no_blocking_dependencies(
     let (check_foreign_keys, check_views) = match action {
         ValidatedStructureAction::DropTable { .. } => (true, true),
         ValidatedStructureAction::TruncateTable { .. } => (true, false),
+        ValidatedStructureAction::DropColumn { .. } => (true, false),
         _ => return Ok(()),
     };
 
-    let dependencies = match adapter.table_dependencies(action.table(), 20).await {
+    let dependencies = match adapter.table_dependencies(action.table(), 50).await {
         Ok(dependencies) => dependencies,
         // Unqualified names resolve through the connection's active
         // database/search_path. The adapter cannot inventory dependencies
@@ -1289,11 +1297,19 @@ async fn ensure_no_blocking_dependencies(
     };
     let mut blockers = Vec::new();
     if check_foreign_keys {
-        collect_dependency_names(
-            &mut blockers,
-            "incoming foreign key",
-            &dependencies.incoming_foreign_keys,
-        );
+        match action {
+            ValidatedStructureAction::DropColumn { name, .. } => collect_column_dependency_names(
+                &mut blockers,
+                "incoming foreign key",
+                &dependencies.incoming_foreign_keys,
+                name,
+            ),
+            _ => collect_dependency_names(
+                &mut blockers,
+                "incoming foreign key",
+                &dependencies.incoming_foreign_keys,
+            ),
+        }
     }
     if check_views {
         collect_dependency_names(
@@ -1307,21 +1323,149 @@ async fn ensure_no_blocking_dependencies(
         return Ok(());
     }
 
-    let action_label = if matches!(action, ValidatedStructureAction::DropTable { .. }) {
-        "drop"
-    } else {
-        "truncate"
+    let (action_label, object_label) = match action {
+        ValidatedStructureAction::DropTable { .. } => ("drop", "table"),
+        ValidatedStructureAction::DropColumn { .. } => ("drop", "column"),
+        _ => ("truncate", "table"),
+    };
+    let object_name = match action {
+        ValidatedStructureAction::DropColumn { name, .. } => name.as_str(),
+        _ => action.table().name.as_str(),
     };
     Err(DatabaseError::dependency(format!(
-        "Cannot {action_label} table {} because {} object(s) depend on it.",
-        action.table().name,
+        "Cannot {action_label} {object_label} {object_name} because {} object(s) depend on it.",
         blockers.len()
     ))
     .with_details(format!(
         "Remove or retarget these dependencies first: {}.",
         blockers.join(", ")
     ))
-    .with_scope("table", action.table().name.as_str()))
+    .with_scope(object_label, object_name))
+}
+
+fn collect_column_dependency_names(
+    target: &mut Vec<String>,
+    label: &str,
+    group: &MetadataValue<Bounded<DependencySummary>>,
+    column: &Identifier,
+) {
+    let Some(group) = group.value() else {
+        return;
+    };
+    for dependency in &group.items {
+        if !dependency_references_column(dependency, column) {
+            continue;
+        }
+        let mut name = format!("{label} {}", dependency.name);
+        if let Some(table) = dependency.table.as_deref()
+            && table != dependency.name
+        {
+            name.push_str(&format!(" on {table}"));
+        }
+        target.push(name);
+    }
+}
+
+fn dependency_references_column(dependency: &DependencySummary, column: &Identifier) -> bool {
+    dependency
+        .referenced_columns
+        .iter()
+        .any(|referenced| referenced.eq_ignore_ascii_case(column.as_str()))
+}
+
+/// Adds dependency notices to a preview without turning a preview-only request
+/// into an execution. Unqualified PostgreSQL names cannot be inspected without
+/// a schema; the engine's own dependency error remains the fallback on execute.
+async fn append_dependency_warnings(
+    adapter: &dyn DatabaseAdapter,
+    action: &ValidatedStructureAction,
+    preview: &mut StructureDdlPreview,
+) {
+    if !matches!(
+        action,
+        ValidatedStructureAction::DropTable { .. }
+            | ValidatedStructureAction::TruncateTable { .. }
+            | ValidatedStructureAction::DropColumn { .. }
+    ) {
+        return;
+    }
+
+    let dependencies = match adapter.table_dependencies(action.table(), 20).await {
+        Ok(dependencies) => dependencies,
+        Err(error)
+            if error.kind == DatabaseErrorKind::Validation && action.table().schema.is_none() =>
+        {
+            return;
+        }
+        Err(_) => {
+            preview.warnings.push(
+                "Dependencies could not be inspected in this preview; the engine may still block \
+                 the change or invalidate a dependent object."
+                    .to_string(),
+            );
+            return;
+        }
+    };
+
+    match action {
+        ValidatedStructureAction::DropColumn { name, .. } => {
+            if let Some(group) = dependencies.incoming_foreign_keys.value() {
+                for dependency in &group.items {
+                    if dependency_references_column(dependency, name) {
+                        preview.warnings.push(format!(
+                            "Dependent foreign key {} on table {} references column {}; the drop \
+                             is blocked until that relationship is removed.",
+                            dependency.name,
+                            dependency.table.as_deref().unwrap_or("another table"),
+                            name
+                        ));
+                    }
+                }
+            }
+            if let Some(group) = dependencies.dependent_views.value() {
+                for dependency in &group.items {
+                    preview.warnings.push(format!(
+                        "Dependent view {} may reference column {}; the engine can block dropping \
+                         a column used by a view.",
+                        dependency.name, name
+                    ));
+                }
+            }
+            if let Some(group) = dependencies.owned_sequences.value() {
+                for dependency in &group.items {
+                    preview.warnings.push(format!(
+                        "Column {} owns sequence {}; dropping the column also drops or detaches \
+                         the sequence.",
+                        name, dependency.name
+                    ));
+                }
+            }
+            if let Some(group) = dependencies.triggers.value() {
+                for dependency in &group.items {
+                    preview.warnings.push(format!(
+                        "Trigger {} is defined on this table and may reference column {}.",
+                        dependency.name, name
+                    ));
+                }
+            }
+        }
+        _ => {
+            let mut names = Vec::new();
+            collect_dependency_names(
+                &mut names,
+                "incoming foreign key",
+                &dependencies.incoming_foreign_keys,
+            );
+            collect_dependency_names(&mut names, "dependent view", &dependencies.dependent_views);
+            if !names.is_empty() {
+                preview.warnings.push(format!(
+                    "Dependency check also found: {}. The engine can block the change or leave \
+                     these objects invalid.",
+                    names.join(", ")
+                ));
+            }
+        }
+    }
 }
 
 fn collect_dependency_names(
@@ -1547,12 +1691,555 @@ async fn verify_structure_action(
             ),
             Err(error) => verification_error(&table.name, &error),
         },
-        // Non-table actions keep the preview-only contract from #170.
+        ValidatedStructureAction::AddColumn { table, column, .. } => {
+            verify_added_column(adapter, table, column).await
+        }
+        ValidatedStructureAction::AlterColumn {
+            table,
+            name,
+            changes,
+        } => verify_altered_column(adapter, table, name, changes).await,
+        ValidatedStructureAction::RenameColumn {
+            table,
+            name,
+            new_name,
+        } => verify_renamed_column(adapter, table, name, new_name).await,
+        ValidatedStructureAction::DropColumn { table, name } => {
+            verify_dropped_column(adapter, table, name).await
+        }
+        ValidatedStructureAction::ReorderColumn {
+            table,
+            column,
+            position,
+        } => verify_reordered_column(adapter, table, column, position).await,
+        // Index and constraint actions keep the preview-only contract from #170.
         _ => StructureVerification::success(
-            "The structure action finished; no automatic table verification applies.".to_string(),
+            "The structure action finished; no automatic metadata verification applies."
+                .to_string(),
             None,
         ),
     }
+}
+
+async fn read_column_metadata(
+    adapter: &dyn DatabaseAdapter,
+    table: &TableRef,
+) -> Result<Vec<ColumnSummary>, DatabaseError> {
+    let page = adapter
+        .list_columns(table, PageRequest::new(MAX_PAGE_LIMIT, 0))
+        .await?;
+    if page.has_more {
+        return Err(DatabaseError::validation(format!(
+            "The table has more than {MAX_PAGE_LIMIT} columns, so the complete column list cannot \
+             be verified."
+        )));
+    }
+    Ok(page.items)
+}
+
+fn find_column<'a>(
+    columns: &'a [ColumnSummary],
+    name: &Identifier,
+    engine: DatabaseEngine,
+) -> Option<&'a ColumnSummary> {
+    columns
+        .iter()
+        .find(|column| column.name == name.as_str())
+        .or_else(|| {
+            (engine == DatabaseEngine::Mysql)
+                .then(|| {
+                    columns
+                        .iter()
+                        .find(|column| column.name.eq_ignore_ascii_case(name.as_str()))
+                })
+                .flatten()
+        })
+}
+
+fn column_metadata_error(
+    table: &TableRef,
+    column: &Identifier,
+    error: &DatabaseError,
+) -> StructureVerification {
+    StructureVerification::failure(
+        format!(
+            "The structure action finished, but metadata for column {} on table {} could not be \
+             re-read.",
+            column, table.name
+        ),
+        error.message.clone(),
+    )
+}
+
+async fn verify_added_column(
+    adapter: &dyn DatabaseAdapter,
+    table: &TableRef,
+    expected: &ValidatedColumnDefinition,
+) -> StructureVerification {
+    let columns = match read_column_metadata(adapter, table).await {
+        Ok(columns) => columns,
+        Err(error) => return column_metadata_error(table, &expected.name, &error),
+    };
+    let Some(actual) = find_column(&columns, &expected.name, adapter.engine()) else {
+        return StructureVerification::failure(
+            format!(
+                "The add_column action finished, but metadata does not list column {} on table {}.",
+                expected.name, table.name
+            ),
+            "The new column was not present in metadata after the action.".to_string(),
+        );
+    };
+    if let Some(problem) = compare_column_definition(adapter.engine(), expected, actual) {
+        return StructureVerification::failure(
+            format!(
+                "The add_column action finished, but column {} on table {} does not match the \
+                 requested definition.",
+                expected.name, table.name
+            ),
+            problem,
+        );
+    }
+
+    StructureVerification::success(
+        format!(
+            "Metadata re-read confirms column {} was added to table {} with the requested type, \
+             nullability, default, identity/generated options, and comment.",
+            expected.name, table.name
+        ),
+        adapter.table_summary(table).await.ok().flatten(),
+    )
+}
+
+async fn verify_altered_column(
+    adapter: &dyn DatabaseAdapter,
+    table: &TableRef,
+    name: &Identifier,
+    changes: &ValidatedColumnChanges,
+) -> StructureVerification {
+    let columns = match read_column_metadata(adapter, table).await {
+        Ok(columns) => columns,
+        Err(error) => return column_metadata_error(table, name, &error),
+    };
+    let Some(actual) = find_column(&columns, name, adapter.engine()) else {
+        return StructureVerification::failure(
+            format!(
+                "The alter_column action finished, but metadata does not list column {} on table \
+                 {}.",
+                name, table.name
+            ),
+            "The edited column was not present in metadata after the action.".to_string(),
+        );
+    };
+    if let Some(problem) = compare_column_changes(adapter.engine(), changes, actual) {
+        return StructureVerification::failure(
+            format!(
+                "The alter_column action finished, but column {} on table {} does not match the \
+                 requested changes.",
+                name, table.name
+            ),
+            problem,
+        );
+    }
+
+    StructureVerification::success(
+        format!(
+            "Metadata re-read confirms column {} on table {} now has the requested type, \
+             nullability, default, and comment.",
+            name, table.name
+        ),
+        adapter.table_summary(table).await.ok().flatten(),
+    )
+}
+
+async fn verify_renamed_column(
+    adapter: &dyn DatabaseAdapter,
+    table: &TableRef,
+    name: &Identifier,
+    new_name: &Identifier,
+) -> StructureVerification {
+    let columns = match read_column_metadata(adapter, table).await {
+        Ok(columns) => columns,
+        Err(error) => return column_metadata_error(table, new_name, &error),
+    };
+    if find_column(&columns, new_name, adapter.engine()).is_none() {
+        return StructureVerification::failure(
+            format!(
+                "The rename_column action finished, but metadata does not list column {} on table \
+                 {}.",
+                new_name, table.name
+            ),
+            "The new column name was not present in metadata after the rename.".to_string(),
+        );
+    }
+    if find_column(&columns, name, adapter.engine()).is_some() {
+        return StructureVerification::failure(
+            format!(
+                "The rename_column action finished, but metadata still lists both {} and {} on \
+                 table {}.",
+                name, new_name, table.name
+            ),
+            "Both the previous and the new column name are present after the rename.".to_string(),
+        );
+    }
+
+    StructureVerification::success(
+        format!(
+            "Metadata re-read confirms column {} on table {} was renamed to {}.",
+            name, table.name, new_name
+        ),
+        adapter.table_summary(table).await.ok().flatten(),
+    )
+}
+
+async fn verify_dropped_column(
+    adapter: &dyn DatabaseAdapter,
+    table: &TableRef,
+    name: &Identifier,
+) -> StructureVerification {
+    match adapter.table_summary(table).await {
+        Ok(None) => {
+            return StructureVerification::failure(
+                format!(
+                    "The drop_column action finished, but table {} is no longer listed in \
+                     metadata.",
+                    table.name
+                ),
+                "The table itself disappeared while verifying the column drop.".to_string(),
+            );
+        }
+        Ok(Some(_)) => {}
+        Err(error) => return column_metadata_error(table, name, &error),
+    }
+
+    let columns = match read_column_metadata(adapter, table).await {
+        Ok(columns) => columns,
+        Err(error) => return column_metadata_error(table, name, &error),
+    };
+    if find_column(&columns, name, adapter.engine()).is_some() {
+        return StructureVerification::failure(
+            format!(
+                "The drop_column action finished, but metadata still lists column {} on table {}.",
+                name, table.name
+            ),
+            "The column was still present in metadata after the drop.".to_string(),
+        );
+    }
+
+    StructureVerification::success(
+        format!(
+            "Metadata re-read confirms column {} is no longer present on table {}.",
+            name, table.name
+        ),
+        adapter.table_summary(table).await.ok().flatten(),
+    )
+}
+
+async fn verify_reordered_column(
+    adapter: &dyn DatabaseAdapter,
+    table: &TableRef,
+    expected: &ValidatedColumnDefinition,
+    position: &ColumnPosition,
+) -> StructureVerification {
+    let columns = match read_column_metadata(adapter, table).await {
+        Ok(columns) => columns,
+        Err(error) => return column_metadata_error(table, &expected.name, &error),
+    };
+    let Some(actual) = find_column(&columns, &expected.name, adapter.engine()) else {
+        return StructureVerification::failure(
+            format!(
+                "The reorder_column action finished, but metadata does not list column {} on table \
+                 {}.",
+                expected.name, table.name
+            ),
+            "The reordered column was not present in metadata after the action.".to_string(),
+        );
+    };
+    let expected_ordinal = match position {
+        ColumnPosition::First => 1,
+        ColumnPosition::After { column } => {
+            let Some(anchor) = find_column(&columns, column, adapter.engine()) else {
+                return StructureVerification::failure(
+                    format!(
+                        "The reorder_column action finished, but metadata does not list anchor \
+                         column {} on table {}.",
+                        column, table.name
+                    ),
+                    "The column that should follow the reordered column was not found.".to_string(),
+                );
+            };
+            anchor.ordinal_position.saturating_add(1)
+        }
+    };
+    if actual.ordinal_position != expected_ordinal {
+        return StructureVerification::failure(
+            format!(
+                "The reorder_column action finished, but column {} on table {} reports ordinal \
+                 position {} instead of {}.",
+                expected.name, table.name, actual.ordinal_position, expected_ordinal
+            ),
+            "The engine did not place the column at the requested ordinal position.".to_string(),
+        );
+    }
+    if let Some(problem) = compare_column_definition(adapter.engine(), expected, actual) {
+        return StructureVerification::failure(
+            format!(
+                "The reorder_column action finished, but column {} on table {} changed definition.",
+                expected.name, table.name
+            ),
+            problem,
+        );
+    }
+
+    StructureVerification::success(
+        format!(
+            "Metadata re-read confirms column {} is at ordinal position {} on table {}.",
+            expected.name, expected_ordinal, table.name
+        ),
+        adapter.table_summary(table).await.ok().flatten(),
+    )
+}
+
+fn compare_column_definition(
+    engine: DatabaseEngine,
+    expected: &ValidatedColumnDefinition,
+    actual: &ColumnSummary,
+) -> Option<String> {
+    if !data_types_match(engine, &expected.data_type, &actual.data_type) {
+        return Some(format!(
+            "Expected type {}, but metadata reports {}.",
+            expected.data_type, actual.data_type
+        ));
+    }
+    if expected.nullable != actual.nullable {
+        return Some(format!(
+            "Expected nullable={}, but metadata reports nullable={}.",
+            expected.nullable, actual.nullable
+        ));
+    }
+    if let Some(actual_default) = actual.default_value.value()
+        && !defaults_match(expected.default.as_ref(), actual_default.as_deref())
+    {
+        return Some(format!(
+            "Expected default {}, but metadata reports {}.",
+            describe_expected_default(expected.default.as_ref()),
+            actual_default.as_deref().unwrap_or("no default")
+        ));
+    }
+    if let Some(actual_comment) = actual.comment.value()
+        && expected.comment.as_deref() != actual_comment.as_deref()
+    {
+        return Some(format!(
+            "Expected comment {}, but metadata reports {}.",
+            expected.comment.as_deref().unwrap_or("no comment"),
+            actual_comment.as_deref().unwrap_or("no comment")
+        ));
+    }
+    if let Some(actual_generated) = actual.generated.value()
+        && *actual_generated != expected.generated.is_some()
+    {
+        return Some(format!(
+            "Expected generated={}, but metadata reports generated={actual_generated}.",
+            expected.generated.is_some()
+        ));
+    }
+    if let Some(actual_expression) = actual.generation_expression.value()
+        && let Some(expected_generated) = expected.generated.as_ref()
+    {
+        let actual_expression = actual_expression.as_deref().unwrap_or_default();
+        if normalize_expression(&expected_generated.expression)
+            != normalize_expression(actual_expression)
+        {
+            return Some(format!(
+                "Expected generation expression {}, but metadata reports {}.",
+                expected_generated.expression, actual_expression
+            ));
+        }
+    }
+    if let Some(actual_identity) = actual.identity.value()
+        && *actual_identity != expected.identity
+    {
+        return Some(format!(
+            "Expected identity {:?}, but metadata reports {:?}.",
+            expected.identity, actual_identity
+        ));
+    }
+    None
+}
+
+fn compare_column_changes(
+    engine: DatabaseEngine,
+    changes: &ValidatedColumnChanges,
+    actual: &ColumnSummary,
+) -> Option<String> {
+    if let Some(expected) = changes.data_type.as_deref()
+        && !data_types_match(engine, expected, &actual.data_type)
+    {
+        return Some(format!(
+            "Expected type {expected}, but metadata reports {}.",
+            actual.data_type
+        ));
+    }
+    if let Some(expected) = changes.nullable
+        && expected != actual.nullable
+    {
+        return Some(format!(
+            "Expected nullable={expected}, but metadata reports nullable={}.",
+            actual.nullable
+        ));
+    }
+    if (changes.default.is_some() || changes.drop_default)
+        && let Some(actual_default) = actual.default_value.value()
+        && !defaults_match(changes.default.as_ref(), actual_default.as_deref())
+    {
+        return Some(format!(
+            "Expected default {}, but metadata reports {}.",
+            describe_expected_default(changes.default.as_ref()),
+            actual_default.as_deref().unwrap_or("no default")
+        ));
+    }
+    if (changes.comment.is_some() || changes.drop_comment)
+        && let Some(actual_comment) = actual.comment.value()
+        && changes.comment.as_deref() != actual_comment.as_deref()
+    {
+        return Some(format!(
+            "Expected comment {}, but metadata reports {}.",
+            changes.comment.as_deref().unwrap_or("no comment"),
+            actual_comment.as_deref().unwrap_or("no comment")
+        ));
+    }
+    None
+}
+
+fn data_types_match(engine: DatabaseEngine, expected: &str, actual: &str) -> bool {
+    normalize_data_type(engine, expected) == normalize_data_type(engine, actual)
+}
+
+fn normalize_data_type(engine: DatabaseEngine, value: &str) -> String {
+    let mut normalized = value
+        .trim()
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalized = normalized
+        .replace(" (", "(")
+        .replace("( ", "(")
+        .replace(" )", ")")
+        .replace(" ,", ",")
+        .replace(", ", ",");
+    if engine == DatabaseEngine::Postgresql {
+        normalized = normalized
+            .replace("character varying", "varchar")
+            .replace("character(", "char(")
+            .replace("timestamp without time zone", "timestamp")
+            .replace("timestamp with time zone", "timestamptz")
+            .replace("time without time zone", "time")
+            .replace("time with time zone", "timetz")
+            .replace("integer", "int")
+            .replace("decimal", "numeric")
+            .replace("boolean", "bool");
+    } else {
+        for base in ["tinyint", "smallint", "mediumint", "int", "bigint"] {
+            if let Some(rest) = normalized.strip_prefix(base)
+                && let Some(after_width) = rest.strip_prefix('(')
+                && let Some((_, tail)) = after_width.split_once(')')
+            {
+                normalized = format!("{base}{tail}");
+                break;
+            }
+        }
+    }
+    normalized
+}
+
+fn defaults_match(expected: Option<&ColumnDefault>, actual: Option<&str>) -> bool {
+    let actual = actual.map(str::trim).filter(|value| !value.is_empty());
+    match expected {
+        None | Some(ColumnDefault::Null) => {
+            actual.is_none() || actual.is_some_and(|value| value.eq_ignore_ascii_case("null"))
+        }
+        Some(ColumnDefault::String(value)) => actual.is_some_and(|actual| {
+            sql_string_literal_value(actual).map_or_else(
+                || actual.eq_ignore_ascii_case(value),
+                |literal| literal == *value,
+            )
+        }),
+        Some(ColumnDefault::Number(value)) => actual.is_some_and(|actual| {
+            let actual = strip_default_cast(actual);
+            actual == value
+                || actual
+                    .parse::<f64>()
+                    .ok()
+                    .zip(value.parse::<f64>().ok())
+                    .is_some_and(|(left, right)| (left - right).abs() < f64::EPSILON)
+        }),
+        Some(ColumnDefault::Boolean(value)) => actual.is_some_and(|actual| {
+            let actual = strip_default_cast(actual).to_ascii_lowercase();
+            match actual.as_str() {
+                "1" | "true" | "b'1'" => *value,
+                "0" | "false" | "b'0'" => !*value,
+                _ => false,
+            }
+        }),
+        Some(ColumnDefault::CurrentTimestamp) => actual.is_some_and(|actual| {
+            let actual = actual.to_ascii_lowercase().replace(['_', ' '], "");
+            actual.contains("currenttimestamp")
+                || actual.contains("now()")
+                || actual.contains("localtimestamp")
+        }),
+    }
+}
+
+fn strip_default_cast(value: &str) -> &str {
+    let mut value = value.trim();
+    while value.starts_with('(') && value.ends_with(')') {
+        value = value[1..value.len().saturating_sub(1)].trim();
+    }
+    value.split("::").next().unwrap_or(value).trim()
+}
+
+fn sql_string_literal_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    let start = value.find('\'')?;
+    let mut literal = String::new();
+    let mut characters = value[start + 1..].chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\'' => {
+                if characters.peek() == Some(&'\'') {
+                    literal.push('\'');
+                    characters.next();
+                } else {
+                    return Some(literal);
+                }
+            }
+            '\\' => {
+                if let Some(escaped) = characters.next() {
+                    literal.push(escaped);
+                }
+            }
+            _ => literal.push(character),
+        }
+    }
+    None
+}
+
+fn describe_expected_default(expected: Option<&ColumnDefault>) -> String {
+    match expected {
+        None | Some(ColumnDefault::Null) => "no default".to_string(),
+        Some(ColumnDefault::String(value)) => format!("string {value:?}"),
+        Some(ColumnDefault::Number(value)) => value.clone(),
+        Some(ColumnDefault::Boolean(value)) => value.to_string(),
+        Some(ColumnDefault::CurrentTimestamp) => "CURRENT_TIMESTAMP".to_string(),
+    }
+}
+
+fn normalize_expression(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_whitespace() && !matches!(character, '"' | '`'))
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 async fn verify_table_columns(

@@ -116,7 +116,8 @@ pub fn preview(action: &ValidatedStructureAction) -> Result<StructureDdlPreview,
                 POSTGRES_DIALECT.quote_qualified_name(&table_name(table)?)
             )],
             vec![
-                "Dropping a table permanently removes every row and its schema definition."
+                "Data loss: dropping a table permanently removes every row and its schema \
+                 definition."
                     .to_string(),
                 "Incoming foreign keys, views, and triggers can block the drop or become invalid; \
                  inspect table dependencies first."
@@ -130,7 +131,8 @@ pub fn preview(action: &ValidatedStructureAction) -> Result<StructureDdlPreview,
                 POSTGRES_DIALECT.quote_qualified_name(&table_name(table)?)
             )],
             vec![
-                "TRUNCATE TABLE removes every row but keeps the table definition.".to_string(),
+                "Data loss: TRUNCATE TABLE removes every row but keeps the table definition."
+                    .to_string(),
                 "PostgreSQL can roll TRUNCATE back inside a transaction, but the rows are gone \
                  after commit."
                     .to_string(),
@@ -179,6 +181,11 @@ pub fn preview(action: &ValidatedStructureAction) -> Result<StructureDdlPreview,
                 statements.push(format!(
                     "ALTER TABLE {qualified} ALTER COLUMN {column} TYPE {data_type}"
                 ));
+                warnings.push(
+                    "Data loss risk: changing a column type can truncate values or fail when \
+                     existing rows cannot be converted safely."
+                        .to_string(),
+                );
                 warnings.push(
                     "PostgreSQL may need a USING expression for an incompatible type change and \
                      can rewrite the table."
@@ -252,7 +259,8 @@ pub fn preview(action: &ValidatedStructureAction) -> Result<StructureDdlPreview,
                 POSTGRES_DIALECT.quote_identifier(name)
             )],
             vec![
-                "Dropping a column permanently removes its data.".to_string(),
+                "Data loss: dropping a column permanently removes every value stored in it."
+                    .to_string(),
                 "Dependent views, indexes, and constraints block the drop unless they are removed \
                  first."
                     .to_string(),

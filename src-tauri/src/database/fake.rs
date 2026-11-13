@@ -21,7 +21,10 @@ use super::{
     mysql,
     pagination::{Bounded, Page, PageRequest},
     postgres,
-    structure::{StructureDdlPreview, ValidatedStructureAction},
+    structure::{
+        ColumnDefault, ColumnPosition, StructureDdlPreview, ValidatedColumnChanges,
+        ValidatedColumnDefinition, ValidatedStructureAction,
+    },
     traits::{
         ColumnIdentity, ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter,
         DatabaseConnectRequest, DatabaseConnectionInfo, DatabasePing, DatabaseSummary,
@@ -206,6 +209,102 @@ impl FakeDatabaseAdapter {
                 DatabaseEngine::Postgresql => "public".to_string(),
             });
         (database, schema)
+    }
+
+    fn column_index(
+        columns: &[ColumnSummary],
+        name: &str,
+        engine: DatabaseEngine,
+    ) -> Option<usize> {
+        columns
+            .iter()
+            .position(|column| column.name == name)
+            .or_else(|| {
+                (engine == DatabaseEngine::Mysql)
+                    .then(|| {
+                        columns
+                            .iter()
+                            .position(|column| column.name.eq_ignore_ascii_case(name))
+                    })
+                    .flatten()
+            })
+    }
+
+    fn default_metadata(default: Option<&ColumnDefault>) -> MetadataValue<Option<String>> {
+        MetadataValue::available(match default {
+            None | Some(ColumnDefault::Null) => None,
+            Some(ColumnDefault::String(value)) => Some(value.clone()),
+            Some(ColumnDefault::Number(value)) => Some(value.clone()),
+            Some(ColumnDefault::Boolean(value)) => Some(value.to_string()),
+            Some(ColumnDefault::CurrentTimestamp) => Some("CURRENT_TIMESTAMP".to_string()),
+        })
+    }
+
+    fn definition_summary(
+        column: &ValidatedColumnDefinition,
+        ordinal_position: u32,
+    ) -> ColumnSummary {
+        ColumnSummary {
+            name: column.name.as_str().to_string(),
+            data_type: column.data_type.clone(),
+            length: MetadataValue::available(None),
+            precision: MetadataValue::available(None),
+            scale: MetadataValue::available(None),
+            nullable: column.nullable,
+            default_value: Self::default_metadata(column.default.as_ref()),
+            ordinal_position,
+            primary_key: false,
+            identity: MetadataValue::available(column.identity),
+            generated: MetadataValue::available(column.generated.is_some()),
+            generation_expression: MetadataValue::available(
+                column
+                    .generated
+                    .as_ref()
+                    .map(|generated| generated.expression.clone()),
+            ),
+            comment: MetadataValue::available(column.comment.clone()),
+            collation: MetadataValue::available(None),
+        }
+    }
+
+    fn apply_definition(target: &mut ColumnSummary, definition: &ValidatedColumnDefinition) {
+        target.data_type = definition.data_type.clone();
+        target.nullable = definition.nullable;
+        target.default_value = Self::default_metadata(definition.default.as_ref());
+        target.comment = MetadataValue::available(definition.comment.clone());
+        target.identity = MetadataValue::available(definition.identity);
+        target.generated = MetadataValue::available(definition.generated.is_some());
+        target.generation_expression = MetadataValue::available(
+            definition
+                .generated
+                .as_ref()
+                .map(|generated| generated.expression.clone()),
+        );
+    }
+
+    fn apply_changes(target: &mut ColumnSummary, changes: &ValidatedColumnChanges) {
+        if let Some(data_type) = changes.data_type.as_ref() {
+            target.data_type = data_type.clone();
+        }
+        if let Some(nullable) = changes.nullable {
+            target.nullable = nullable;
+        }
+        if changes.default.is_some() {
+            target.default_value = Self::default_metadata(changes.default.as_ref());
+        } else if changes.drop_default {
+            target.default_value = Self::default_metadata(None);
+        }
+        if changes.comment.is_some() {
+            target.comment = MetadataValue::available(changes.comment.clone());
+        } else if changes.drop_comment {
+            target.comment = MetadataValue::available(None);
+        }
+    }
+
+    fn renumber_columns(columns: &mut [ColumnSummary]) {
+        for (index, column) in columns.iter_mut().enumerate() {
+            column.ordinal_position = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        }
     }
 }
 
@@ -723,8 +822,146 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
                 }
                 self.created_tables.remove(table.name.as_str());
             }
-            // Other structure actions are covered by the preview contract in
-            // this fixture; only table lifecycle needs mutable metadata here.
+            ValidatedStructureAction::AddColumn {
+                table,
+                column,
+                position,
+            } => {
+                let engine = self.engine;
+                let columns = self
+                    .created_tables
+                    .get_mut(table.name.as_str())
+                    .ok_or_else(|| {
+                        DatabaseError::query(format!("Table {} does not exist.", table.name))
+                    })?;
+                if Self::column_index(columns, column.name.as_str(), engine).is_some() {
+                    return Err(DatabaseError::query(format!(
+                        "Column {} already exists on table {}.",
+                        column.name, table.name
+                    )));
+                }
+                let insert_at = match position {
+                    Some(ColumnPosition::First) => 0,
+                    Some(ColumnPosition::After { column: after }) => {
+                        Self::column_index(columns, after.as_str(), engine)
+                            .map(|index| index + 1)
+                            .ok_or_else(|| {
+                                DatabaseError::query(format!(
+                                    "Column {after} does not exist on table {}.",
+                                    table.name
+                                ))
+                            })?
+                    }
+                    None => columns.len(),
+                };
+                let ordinal = u32::try_from(insert_at + 1).unwrap_or(u32::MAX);
+                columns.insert(insert_at, Self::definition_summary(column, ordinal));
+                Self::renumber_columns(columns);
+            }
+            ValidatedStructureAction::AlterColumn {
+                table,
+                name,
+                changes,
+            } => {
+                let engine = self.engine;
+                let columns = self
+                    .created_tables
+                    .get_mut(table.name.as_str())
+                    .ok_or_else(|| {
+                        DatabaseError::query(format!("Table {} does not exist.", table.name))
+                    })?;
+                let index =
+                    Self::column_index(columns, name.as_str(), engine).ok_or_else(|| {
+                        DatabaseError::query(format!(
+                            "Column {} does not exist on table {}.",
+                            name, table.name
+                        ))
+                    })?;
+                Self::apply_changes(&mut columns[index], changes);
+            }
+            ValidatedStructureAction::RenameColumn {
+                table,
+                name,
+                new_name,
+            } => {
+                let engine = self.engine;
+                let columns = self
+                    .created_tables
+                    .get_mut(table.name.as_str())
+                    .ok_or_else(|| {
+                        DatabaseError::query(format!("Table {} does not exist.", table.name))
+                    })?;
+                let index =
+                    Self::column_index(columns, name.as_str(), engine).ok_or_else(|| {
+                        DatabaseError::query(format!(
+                            "Column {} does not exist on table {}.",
+                            name, table.name
+                        ))
+                    })?;
+                if Self::column_index(columns, new_name.as_str(), engine).is_some() {
+                    return Err(DatabaseError::query(format!(
+                        "Column {} already exists on table {}.",
+                        new_name, table.name
+                    )));
+                }
+                columns[index].name = new_name.as_str().to_string();
+            }
+            ValidatedStructureAction::DropColumn { table, name } => {
+                let engine = self.engine;
+                let columns = self
+                    .created_tables
+                    .get_mut(table.name.as_str())
+                    .ok_or_else(|| {
+                        DatabaseError::query(format!("Table {} does not exist.", table.name))
+                    })?;
+                let index =
+                    Self::column_index(columns, name.as_str(), engine).ok_or_else(|| {
+                        DatabaseError::query(format!(
+                            "Column {} does not exist on table {}.",
+                            name, table.name
+                        ))
+                    })?;
+                columns.remove(index);
+                Self::renumber_columns(columns);
+            }
+            ValidatedStructureAction::ReorderColumn {
+                table,
+                column,
+                position,
+            } => {
+                let engine = self.engine;
+                let columns = self
+                    .created_tables
+                    .get_mut(table.name.as_str())
+                    .ok_or_else(|| {
+                        DatabaseError::query(format!("Table {} does not exist.", table.name))
+                    })?;
+                let index =
+                    Self::column_index(columns, column.name.as_str(), engine).ok_or_else(|| {
+                        DatabaseError::query(format!(
+                            "Column {} does not exist on table {}.",
+                            column.name, table.name
+                        ))
+                    })?;
+                let mut moved = columns.remove(index);
+                Self::apply_definition(&mut moved, column);
+                let insert_at = match position {
+                    ColumnPosition::First => 0,
+                    ColumnPosition::After { column: after } => {
+                        Self::column_index(columns, after.as_str(), engine)
+                            .map(|index| index + 1)
+                            .ok_or_else(|| {
+                                DatabaseError::query(format!(
+                                    "Column {after} does not exist on table {}.",
+                                    table.name
+                                ))
+                            })?
+                    }
+                };
+                columns.insert(insert_at, moved);
+                Self::renumber_columns(columns);
+            }
+            // Index and constraint actions remain preview-only in this fixture.
             _ => {}
         }
 

@@ -6,6 +6,8 @@ import type {
   DatabaseTableOptionsInput,
   DatabaseUniqueKeyInput,
   DatabaseColumnDefinitionInput,
+  DatabaseColumnDefaultInput,
+  DatabaseColumnPositionInput,
 } from "@/types/contracts";
 
 export const databaseStructureCommands = {
@@ -92,4 +94,77 @@ export function dropDatabaseTable(
   confirmed: boolean,
 ): Promise<DatabaseStructureActionResult> {
   return runDatabaseStructureAction(profileId, { kind: "drop_table", ...input }, confirmed);
+}
+
+type TableColumnScope = TableScope & { table: string };
+
+/**
+ * Adds one column with a type, optional length/precision, nullability,
+ * default, generated/identity option, and comment. MySQL can place the column
+ * with `position`; PostgreSQL appends and rejects a position.
+ */
+export function addDatabaseColumn(
+  profileId: string,
+  input: {
+    column: DatabaseColumnDefinitionInput;
+    position?: DatabaseColumnPositionInput | null;
+  } & TableColumnScope,
+  confirmed = false,
+): Promise<DatabaseStructureActionResult> {
+  return runDatabaseStructureAction(profileId, { kind: "add_column", ...input }, confirmed);
+}
+
+/**
+ * Edits supported column properties. MySQL needs the complete type and
+ * nullability because MODIFY COLUMN replaces the whole definition; the backend
+ * rejects a partial request with a capability explanation.
+ */
+export function alterDatabaseColumn(
+  profileId: string,
+  input: {
+    name: string;
+    dataType?: string | null;
+    nullable?: boolean | null;
+    default?: DatabaseColumnDefaultInput | null;
+    dropDefault?: boolean;
+    comment?: string | null;
+    dropComment?: boolean;
+  } & TableColumnScope,
+  confirmed = false,
+): Promise<DatabaseStructureActionResult> {
+  return runDatabaseStructureAction(profileId, { kind: "alter_column", ...input }, confirmed);
+}
+
+export function renameDatabaseColumn(
+  profileId: string,
+  input: { name: string; newName: string } & TableColumnScope,
+): Promise<DatabaseStructureActionResult> {
+  return runDatabaseStructureAction(profileId, { kind: "rename_column", ...input });
+}
+
+/**
+ * Dropping a column is destructive and always requires an explicit
+ * confirmation argument.
+ */
+export function dropDatabaseColumn(
+  profileId: string,
+  input: { name: string } & TableColumnScope,
+  confirmed: boolean,
+): Promise<DatabaseStructureActionResult> {
+  return runDatabaseStructureAction(profileId, { kind: "drop_column", ...input }, confirmed);
+}
+
+/**
+ * Reorders one column where the engine supports a safe move. PostgreSQL
+ * rejects this action; callers should rely on the capability snapshot and the
+ * preview error instead of hiding the limitation in the client.
+ */
+export function reorderDatabaseColumn(
+  profileId: string,
+  input: {
+    column: DatabaseColumnDefinitionInput;
+    position: DatabaseColumnPositionInput;
+  } & TableColumnScope,
+): Promise<DatabaseStructureActionResult> {
+  return runDatabaseStructureAction(profileId, { kind: "reorder_column", ...input });
 }

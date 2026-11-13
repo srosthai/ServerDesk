@@ -1,12 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 import { describe, expect, it, vi } from "vitest";
 import {
+  addDatabaseColumn,
+  alterDatabaseColumn,
   createDatabaseTable,
   databaseStructureCommands,
+  dropDatabaseColumn,
   dropDatabaseTable,
   duplicateDatabaseTable,
   previewDatabaseStructureAction,
+  renameDatabaseColumn,
   renameDatabaseTable,
+  reorderDatabaseColumn,
   runDatabaseStructureAction,
   truncateDatabaseTable,
 } from "@/services/databaseStructure";
@@ -192,6 +197,124 @@ describe("database structure service", () => {
     expect(invoke).toHaveBeenNthCalledWith(2, databaseStructureCommands.run, {
       profileId: "profile-1",
       request: { kind: "drop_table", database: "app", name: "users" },
+      confirmed: false,
+    });
+  });
+
+  it("builds typed column add, edit, rename, drop, and reorder requests", async () => {
+    vi.mocked(invoke).mockResolvedValue(result);
+
+    await addDatabaseColumn("profile-1", {
+      database: "app",
+      schema: null,
+      table: "Users",
+      column: {
+        name: "Display Name",
+        dataType: "varchar(120)",
+        nullable: false,
+        default: { kind: "string", value: "n/a" },
+        comment: "Shown in lists",
+      },
+      position: { kind: "after", column: "Email" },
+    });
+    await alterDatabaseColumn(
+      "profile-1",
+      {
+        database: "app",
+        schema: null,
+        table: "Users",
+        name: "Email",
+        dataType: "varchar(500)",
+        nullable: false,
+        comment: "Primary address",
+      },
+      true,
+    );
+    await renameDatabaseColumn("profile-1", {
+      database: "app",
+      schema: null,
+      table: "Users",
+      name: "Display Name",
+      newName: "Nickname",
+    });
+    await dropDatabaseColumn(
+      "profile-1",
+      { database: "app", schema: null, table: "Users", name: "Nickname" },
+      true,
+    );
+    await reorderDatabaseColumn("profile-1", {
+      database: "app",
+      schema: null,
+      table: "Users",
+      column: { name: "id", dataType: "bigint", nullable: false },
+      position: { kind: "first" },
+    });
+
+    expect(invoke).toHaveBeenNthCalledWith(1, databaseStructureCommands.run, {
+      profileId: "profile-1",
+      request: {
+        kind: "add_column",
+        database: "app",
+        schema: null,
+        table: "Users",
+        column: {
+          name: "Display Name",
+          dataType: "varchar(120)",
+          nullable: false,
+          default: { kind: "string", value: "n/a" },
+          comment: "Shown in lists",
+        },
+        position: { kind: "after", column: "Email" },
+      },
+      confirmed: false,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, databaseStructureCommands.run, {
+      profileId: "profile-1",
+      request: {
+        kind: "alter_column",
+        database: "app",
+        schema: null,
+        table: "Users",
+        name: "Email",
+        dataType: "varchar(500)",
+        nullable: false,
+        comment: "Primary address",
+      },
+      confirmed: true,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(3, databaseStructureCommands.run, {
+      profileId: "profile-1",
+      request: {
+        kind: "rename_column",
+        database: "app",
+        schema: null,
+        table: "Users",
+        name: "Display Name",
+        newName: "Nickname",
+      },
+      confirmed: false,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(4, databaseStructureCommands.run, {
+      profileId: "profile-1",
+      request: {
+        kind: "drop_column",
+        database: "app",
+        schema: null,
+        table: "Users",
+        name: "Nickname",
+      },
+      confirmed: true,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(5, databaseStructureCommands.run, {
+      profileId: "profile-1",
+      request: {
+        kind: "reorder_column",
+        database: "app",
+        schema: null,
+        table: "Users",
+        column: { name: "id", dataType: "bigint", nullable: false },
+        position: { kind: "first" },
+      },
       confirmed: false,
     });
   });
