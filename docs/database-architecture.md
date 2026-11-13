@@ -41,6 +41,7 @@ src-tauri/src/database/
   mod.rs            public re-exports and dialect/capability factories
   traits.rs         DatabaseAdapter and typed metadata
   actions.rs        lifecycle requests, DDL preview, verified result service
+  structure.rs      table/column/index/constraint validation and DDL previews
   discovery.rs      explorer-node request/response and metadata service
   capabilities.rs   action model, flags, version parsing
   dialect.rs        identifier validation/quoting and value binding
@@ -51,12 +52,14 @@ src-tauri/src/database/
   mysql/
     mod.rs          MySQL dialect
     actions.rs      MySQL create/drop/set-active planning
+    ddl.rs          MySQL table/column/index/constraint DDL planning
     adapter.rs      live SQLx MySQL adapter and error mapping
     capabilities.rs MySQL version gates
     sql.rs          MySQL-only metadata SQL
   postgres/
     mod.rs          PostgreSQL dialect
     actions.rs      PostgreSQL create/rename/drop/set-active planning
+    ddl.rs          PostgreSQL table/column/index/constraint DDL planning
     adapter.rs      live SQLx PostgreSQL adapter and error mapping
     capabilities.rs PostgreSQL version gates
     sql.rs          PostgreSQL-only metadata SQL
@@ -76,6 +79,8 @@ same adapter contract.
 - database and schema listing;
 - one exact database summary re-read after a lifecycle action;
 - engine-specific DDL previews for create, rename, drop, and set-active;
+- engine-specific structure previews for table, column, index, and constraint
+  changes, with no execution path;
 - lifecycle execution and read-only detection;
 - table, view, sequence, column, index, and constraint metadata;
 - bounded dependency inventories for one table before destructive changes;
@@ -315,6 +320,74 @@ rename, and the drop confirmation names the server, engine, database, exact
 `DROP DATABASE` action, and previewed DDL. After any action the explorer
 refreshes the databases node and selects the created, renamed, or active
 database.
+
+## Structure preview commands
+
+`src-tauri/src/commands/database/structure.rs` owns the preview-only structure
+surface:
+
+| Command                             | Purpose                                                        |
+| ----------------------------------- | -------------------------------------------------------------- |
+| `preview_database_structure_action` | Validate and generate DDL for one structure change, no execute |
+
+`src-tauri/src/database/structure.rs` validates requests into
+`ValidatedStructureAction` values and asks the adapter for a
+`StructureDdlPreview`. `mysql::ddl` and `postgres::ddl` are pure planners: they
+receive validated identifiers, type names, and typed values only. There is
+deliberately no execute command in this slice; the structure editor in #174
+will add one and must call the same preview/capability path first.
+
+Requests are tagged by `kind` and cover table, column, index, and constraint
+changes:
+
+```json
+{ "kind": "add_column", "database": "app", "table": "users", "column": { "name": "email", "dataType": "varchar(320)", "nullable": false }, "position": { "kind": "after", "column": "id" } }
+{ "kind": "create_index", "database": "app", "table": "users", "name": "users_email_idx", "columns": ["email"], "unique": true }
+{ "kind": "add_constraint", "table": "orders", "constraint": { "kind": "foreign_key", "name": "orders_user_fk", "columns": ["user_id"], "referencedTable": "users", "referencedColumns": ["id"], "onDelete": "cascade" } }
+```
+
+Responses carry the action, engine, a structured affected object, statements,
+display DDL, warnings, and destructive/confirmation markers:
+
+```json
+{
+  "action": "add_column",
+  "engine": "mysql",
+  "object": { "kind": "column", "database": "app", "table": "users", "name": "email" },
+  "statements": ["ALTER TABLE `app`.`users` ADD COLUMN `email` varchar(320) NOT NULL"],
+  "ddl": "...",
+  "warnings": [],
+  "destructive": false,
+  "requiresConfirmation": false
+}
+```
+
+Identifiers are validated by the shared `Identifier` rules and quoted by the
+selected engine dialect. They are never passed as bind values. User values such
+as defaults are typed (`null`, `string`, `number`, `boolean`, or
+`current_timestamp`) and rendered as escaped literals; arbitrary default
+expressions are not accepted. Generated-column, check, and partial-index
+expressions must be a single balanced expression with no statement separator,
+comment, or top-level comma. A request that is not a single expression fails
+validation before an engine planner runs.
+
+Capabilities gate type changes, column reorder, table/column/index rename,
+generated columns, identity columns, auto-increment columns, check constraints,
+and partial indexes. MySQL and PostgreSQL add their own restrictions: MySQL
+requires the full column definition for `MODIFY COLUMN`, does not support
+standard identity columns or partial indexes, and has no safe reorder syntax
+other than replacing the full definition; PostgreSQL does not support
+`AUTO_INCREMENT`, virtual generated columns, or stored-column reordering.
+Unsupported actions return a typed `capability` error before any DDL is
+generated. Destructive previews (drop table, truncate, drop column, and type
+changes) set `destructive` and `requiresConfirmation`; previews never execute
+SQL or touch the live session beyond the connection check.
+
+Golden DDL fixtures live in `src-tauri/tests/fixtures/database_structure/` and
+are compared through the fake adapter by `src-tauri/tests/database_structure_ddl.rs`.
+
+`src/services/databaseStructure.ts` is the only React module that invokes the
+preview command. No structure UI is added in this slice.
 
 ## Discovery command contract
 
