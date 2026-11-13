@@ -288,6 +288,75 @@ WHERE c.contype IN ('p', 'u', 'f', 'c', 'x')
 ORDER BY n.nspname, t.relname, c.conname
 LIMIT $3 OFFSET $4"#;
 
+/// One table's row estimate plus the resolved schema. `reltuples` is an engine
+/// estimate and is `NULL` until statistics exist; it is never an exact count.
+/// Two rows are requested so an unqualified table name that exists in more than
+/// one schema can be rejected before a row query runs.
+pub const ROW_TABLE_ESTIMATE: &str = r#"SELECT current_database() AS database_name,
+    n.nspname AS schema_name,
+    CASE WHEN c.reltuples >= 0 THEN c.reltuples::bigint END AS estimated_rows
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r', 'p', 'f')
+  AND c.relname = $2
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND ($1::text IS NULL OR n.nspname = $1)
+ORDER BY n.nspname
+LIMIT 2"#;
+
+/// Column metadata for one row-browser table, bounded by the caller's limit.
+pub const ROW_TABLE_COLUMNS: &str = r#"SELECT current_database() AS database_name,
+    n.nspname AS schema_name,
+    a.attname AS name,
+    pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+    NOT a.attnotnull AS nullable,
+    a.attnum::bigint AS ordinal_position,
+    EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_index i
+        WHERE i.indrelid = a.attrelid
+          AND i.indisprimary
+          AND a.attnum = ANY (i.indkey)
+    ) AS primary_key,
+    COALESCE(row_to_json(a)->>'attidentity', '') AS identity_generation,
+    COALESCE(row_to_json(a)->>'attgenerated', '') <> '' AS generated
+FROM pg_catalog.pg_attribute a
+JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE a.attnum > 0
+  AND NOT a.attisdropped
+  AND c.relkind IN ('r', 'p', 'f')
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND ($1::text IS NULL OR n.nspname = $1)
+  AND c.relname = $2
+ORDER BY a.attnum
+LIMIT $3"#;
+
+/// Unique indexes that can identify one row for editing. Partial and
+/// expression indexes are returned with their unsupported marker so the
+/// adapter rejects them instead of guessing.
+pub const ROW_UNIQUE_INDEXES: &str = r#"SELECT i.relname AS index_name,
+    a.attname AS column_name,
+    key.position::bigint AS ordinal_position,
+    ix.indnkeyatts::bigint AS key_column_count,
+    (ix.indpred IS NOT NULL OR ix.indexprs IS NOT NULL) AS unsupported
+FROM pg_catalog.pg_index ix
+JOIN pg_catalog.pg_class i ON i.oid = ix.indexrelid
+JOIN pg_catalog.pg_class t ON t.oid = ix.indrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS key(attnum, position)
+LEFT JOIN pg_catalog.pg_attribute a
+       ON a.attrelid = t.oid AND a.attnum = key.attnum
+WHERE ix.indisunique
+  AND ix.indisvalid
+  AND ix.indisready
+  AND NOT ix.indisprimary
+  AND key.position <= ix.indnkeyatts
+  AND n.nspname = $1
+  AND t.relname = $2
+ORDER BY i.relname, key.position
+LIMIT $3"#;
+
 /// Incoming foreign keys are the primary dependency to inspect before
 /// dropping or rewriting a referenced table or column.
 pub const TABLE_INCOMING_FOREIGN_KEYS: &str = r#"SELECT c.conname AS name,

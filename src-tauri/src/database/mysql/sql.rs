@@ -179,6 +179,35 @@ pub const LIST_CONSTRAINTS_WITHOUT_CHECKS: &str = "SELECT tc.CONSTRAINT_NAME AS 
     AND (? IS NULL OR tc.TABLE_NAME = ?) \
     ORDER BY tc.TABLE_SCHEMA, tc.TABLE_NAME, tc.CONSTRAINT_NAME, kcu.ORDINAL_POSITION";
 
+/// One table's row estimate plus the resolved database. `TABLE_ROWS` is an
+/// engine estimate, never an exact count. The row browser labels it separately.
+pub const ROW_TABLE_ESTIMATE: &str = "SELECT TABLE_SCHEMA AS database_name, \
+    CAST(TABLE_ROWS AS SIGNED) AS estimated_rows \
+    FROM information_schema.TABLES \
+    WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ? \
+    AND TABLE_TYPE = 'BASE TABLE' LIMIT 1";
+
+/// Column metadata for one row-browser table, bounded by the caller's limit.
+pub const ROW_TABLE_COLUMNS: &str = "SELECT TABLE_SCHEMA AS database_name, \
+    COLUMN_NAME AS name, COLUMN_TYPE AS data_type, IS_NULLABLE = 'YES' AS nullable, \
+    CAST(ORDINAL_POSITION AS SIGNED) AS ordinal_position, \
+    COLUMN_KEY = 'PRI' AS primary_key, \
+    EXTRA LIKE '%auto_increment%' AS auto_increment, \
+    EXTRA LIKE '%GENERATED%' AS `generated` \
+    FROM information_schema.COLUMNS \
+    WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ? \
+    ORDER BY ORDINAL_POSITION LIMIT ?";
+
+/// Unique indexes that can identify one row for editing. Prefix indexes are
+/// returned so the adapter can reject them as incomplete identities.
+pub const ROW_UNIQUE_INDEXES: &str = "SELECT INDEX_NAME AS index_name, \
+    COLUMN_NAME AS column_name, CAST(SEQ_IN_INDEX AS SIGNED) AS ordinal_position, \
+    SUB_PART AS sub_part \
+    FROM information_schema.STATISTICS \
+    WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ? \
+    AND NON_UNIQUE = 0 AND INDEX_NAME <> 'PRIMARY' \
+    ORDER BY INDEX_NAME, SEQ_IN_INDEX LIMIT ?";
+
 pub const TABLE_INCOMING_FOREIGN_KEYS: &str = "SELECT kcu.CONSTRAINT_NAME AS name, \
     kcu.TABLE_SCHEMA AS database_name, kcu.TABLE_NAME AS table_name, \
     kcu.COLUMN_NAME AS column_name, kcu.REFERENCED_COLUMN_NAME AS referenced_column, \

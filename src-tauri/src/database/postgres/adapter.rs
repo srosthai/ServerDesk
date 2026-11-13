@@ -24,13 +24,16 @@ use tokio::{
 
 use crate::storage::DatabaseEngine;
 
-use super::{POSTGRES_DIALECT, actions as engine_actions, ddl as engine_ddl, sql};
+use super::{
+    POSTGRES_DIALECT, actions as engine_actions, ddl as engine_ddl, rows as engine_rows, sql,
+};
 use crate::database::{
     actions::{DatabaseDdlPreview, ValidatedDatabaseAction},
     capabilities::{DatabaseAction, DatabaseCapabilities, DatabaseVersion},
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
     pagination::{Bounded, Page, PageRequest},
+    rows::{RowQueryControl, RowReadRequest, RowReadResult},
     structure::{StructureDdlPreview, ValidatedStructureAction},
     traits::{
         ColumnIdentity, ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter,
@@ -892,6 +895,36 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
         Ok(Page::from_items(constraints, page, None))
     }
 
+    async fn read_rows(
+        &self,
+        request: &RowReadRequest,
+        control: &RowQueryControl,
+    ) -> Result<RowReadResult, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseRows)?;
+        if control.is_cancelled() {
+            return Err(DatabaseError::cancelled("The row read was cancelled."));
+        }
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let result = engine_rows::read_rows(connection, request, control, self.read_only)
+            .await
+            .map_err(|error| error.scoped_permission("table", request.table.name.as_str()));
+
+        if matches!(&result, Err(error) if matches!(
+            error.kind,
+            crate::database::DatabaseErrorKind::Cancelled
+                | crate::database::DatabaseErrorKind::Timeout
+        )) {
+            // A dropped query future can leave the protocol stream in an
+            // unknown state. Close the session instead of risking a later
+            // statement reading leftover messages.
+            self.connected.store(false, Ordering::SeqCst);
+            drop(guard.take());
+        }
+
+        result
+    }
+
     async fn table_dependencies(
         &self,
         table: &TableRef,
@@ -1334,7 +1367,7 @@ fn constraint_kind(kind: &str) -> ConstraintKind {
     }
 }
 
-fn decode<'r, T>(row: &'r PgRow, column: &str) -> Result<T, DatabaseError>
+pub(crate) fn decode<'r, T>(row: &'r PgRow, column: &str) -> Result<T, DatabaseError>
 where
     T: sqlx::Decode<'r, Postgres> + sqlx::Type<Postgres>,
 {
@@ -1348,7 +1381,7 @@ where
 /// Maps SQLx errors into the shared taxonomy without exposing the raw driver
 /// display text. Authentication failures intentionally omit the server
 /// message, which can echo the account, host, or connection string.
-fn map_sqlx_error(error: sqlx::Error) -> DatabaseError {
+pub(crate) fn map_sqlx_error(error: sqlx::Error) -> DatabaseError {
     match error {
         sqlx::Error::Database(database_error) => {
             if let Some(postgres_error) =
