@@ -12,11 +12,12 @@ use std::{
 
 use serverdesk_lib::{
     database::{
-        ColumnDefinitionRequest, ColumnIdentity, DatabaseAction, DatabaseActionRequest,
-        DatabaseAdapter, DatabaseConnectRequest, DatabaseErrorKind, DatabasePassword,
-        MetadataScope, MetadataValue, PageRequest, PostgresDatabaseAdapter, StructureActionRequest,
-        TableOptionsRequest, UniqueKeyRequest, execute_structure_with_adapter,
-        execute_with_adapter, preview_structure_with_adapter, preview_with_adapter,
+        ColumnDefaultRequest, ColumnDefinitionRequest, ColumnIdentity, DatabaseAction,
+        DatabaseActionRequest, DatabaseAdapter, DatabaseConnectRequest, DatabaseErrorKind,
+        DatabasePassword, MetadataScope, MetadataValue, PageRequest, PostgresDatabaseAdapter,
+        StructureActionRequest, TableOptionsRequest, UniqueKeyRequest,
+        execute_structure_with_adapter, execute_with_adapter, preview_structure_with_adapter,
+        preview_with_adapter,
     },
     storage::DatabaseEngine,
 };
@@ -526,6 +527,168 @@ async fn live_postgres_table_lifecycle_is_verified() {
     let dropped = execute_structure_with_adapter(&mut adapter, drop, true)
         .await
         .expect("drop table");
+    assert!(dropped.verified, "{}", dropped.verification);
+
+    let _ = execute_structure_with_adapter(
+        &mut adapter,
+        StructureActionRequest::DropTable {
+            database: Some(fixture.database.clone()),
+            schema: Some("public".to_string()),
+            name: table.to_string(),
+        },
+        true,
+    )
+    .await;
+
+    adapter.close().await.expect("close fixture");
+}
+
+#[tokio::test]
+async fn live_postgres_column_lifecycle_is_verified() {
+    let Some(fixture) = LivePostgres::from_env() else {
+        eprintln!("skipping live PostgreSQL column lifecycle test: fixture environment is not set");
+        return;
+    };
+
+    let mut adapter = PostgresDatabaseAdapter::new();
+    adapter
+        .connect(fixture.request(false))
+        .await
+        .expect("connect to fixture");
+
+    let table = "serverdesk_column_ops";
+    let _ = execute_structure_with_adapter(
+        &mut adapter,
+        StructureActionRequest::DropTable {
+            database: Some(fixture.database.clone()),
+            schema: Some("public".to_string()),
+            name: table.to_string(),
+        },
+        true,
+    )
+    .await;
+
+    let create = StructureActionRequest::CreateTable {
+        database: Some(fixture.database.clone()),
+        schema: Some("public".to_string()),
+        name: table.to_string(),
+        columns: vec![
+            ColumnDefinitionRequest {
+                name: "id".to_string(),
+                data_type: "bigint".to_string(),
+                nullable: false,
+                default: None,
+                comment: None,
+                generated: None,
+                identity: Some(ColumnIdentity::ByDefault),
+            },
+            ColumnDefinitionRequest {
+                name: "email".to_string(),
+                data_type: "varchar(320)".to_string(),
+                nullable: false,
+                default: None,
+                comment: Some("Login address".to_string()),
+                generated: None,
+                identity: None,
+            },
+        ],
+        primary_key: vec!["id".to_string()],
+        unique_keys: Vec::new(),
+        options: None,
+    };
+    let created = execute_structure_with_adapter(&mut adapter, create, false)
+        .await
+        .expect("create column fixture table");
+    assert!(created.verified, "{}", created.verification);
+
+    let display = ColumnDefinitionRequest {
+        name: "Display Name".to_string(),
+        data_type: "varchar(120)".to_string(),
+        nullable: true,
+        default: Some(ColumnDefaultRequest::String {
+            value: "anonymous".to_string(),
+        }),
+        comment: Some("Shown in lists".to_string()),
+        generated: None,
+        identity: None,
+    };
+    let add = StructureActionRequest::AddColumn {
+        database: Some(fixture.database.clone()),
+        schema: Some("public".to_string()),
+        table: table.to_string(),
+        column: display,
+        position: None,
+    };
+    let preview = preview_structure_with_adapter(&adapter, &add)
+        .await
+        .expect("add column preview");
+    assert!(preview.ddl.contains("ADD COLUMN \"Display Name\""));
+    assert!(preview.ddl.contains("COMMENT ON COLUMN"));
+    let added = execute_structure_with_adapter(&mut adapter, add, false)
+        .await
+        .expect("add column");
+    assert!(added.verified, "{}", added.verification);
+
+    let alter = StructureActionRequest::AlterColumn {
+        database: Some(fixture.database.clone()),
+        schema: Some("public".to_string()),
+        table: table.to_string(),
+        name: "email".to_string(),
+        data_type: Some("varchar(500)".to_string()),
+        nullable: Some(false),
+        default: Some(ColumnDefaultRequest::String {
+            value: "n/a".to_string(),
+        }),
+        drop_default: false,
+        comment: Some("Primary address".to_string()),
+        drop_comment: false,
+    };
+    let alter_preview = preview_structure_with_adapter(&adapter, &alter)
+        .await
+        .expect("alter column preview");
+    assert!(alter_preview.destructive);
+    assert!(
+        alter_preview
+            .warnings
+            .iter()
+            .any(|warning| warning.to_ascii_lowercase().contains("data loss"))
+    );
+    let altered = execute_structure_with_adapter(&mut adapter, alter, true)
+        .await
+        .expect("alter column");
+    assert!(altered.verified, "{}", altered.verification);
+
+    let rename = StructureActionRequest::RenameColumn {
+        database: Some(fixture.database.clone()),
+        schema: Some("public".to_string()),
+        table: table.to_string(),
+        name: "Display Name".to_string(),
+        new_name: "Nickname".to_string(),
+    };
+    let renamed = execute_structure_with_adapter(&mut adapter, rename, false)
+        .await
+        .expect("rename column");
+    assert!(renamed.verified, "{}", renamed.verification);
+
+    let drop = StructureActionRequest::DropColumn {
+        database: Some(fixture.database.clone()),
+        schema: Some("public".to_string()),
+        table: table.to_string(),
+        name: "Nickname".to_string(),
+    };
+    let drop_preview = preview_structure_with_adapter(&adapter, &drop)
+        .await
+        .expect("drop column preview");
+    assert!(drop_preview.destructive);
+    assert!(
+        drop_preview
+            .warnings
+            .iter()
+            .any(|warning| warning.to_ascii_lowercase().contains("data loss"))
+    );
+    let dropped = execute_structure_with_adapter(&mut adapter, drop, true)
+        .await
+        .expect("drop column");
     assert!(dropped.verified, "{}", dropped.verification);
 
     let _ = execute_structure_with_adapter(

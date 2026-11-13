@@ -99,7 +99,8 @@ pub fn preview(action: &ValidatedStructureAction) -> Result<StructureDdlPreview,
                 MYSQL_DIALECT.quote_qualified_name(&table_name(table)?)
             )],
             vec![
-                "Dropping a table permanently removes every row and its schema definition."
+                "Data loss: dropping a table permanently removes every row and its schema \
+                 definition."
                     .to_string(),
                 "Incoming foreign keys, views, and triggers can block the drop or become invalid; \
                  inspect table dependencies first."
@@ -113,8 +114,8 @@ pub fn preview(action: &ValidatedStructureAction) -> Result<StructureDdlPreview,
                 MYSQL_DIALECT.quote_qualified_name(&table_name(table)?)
             )],
             vec![
-                "TRUNCATE TABLE permanently removes every row and resets MySQL auto-increment \
-                 counters."
+                "Data loss: TRUNCATE TABLE permanently removes every row and resets MySQL \
+                 auto-increment counters."
                     .to_string(),
                 "MySQL commits TRUNCATE TABLE immediately; it cannot be rolled back.".to_string(),
             ],
@@ -161,7 +162,7 @@ pub fn preview(action: &ValidatedStructureAction) -> Result<StructureDdlPreview,
             changes,
         } => {
             let Some(data_type) = changes.data_type.as_deref() else {
-                return Err(DatabaseError::validation(
+                return Err(DatabaseError::capability(
                     "MySQL requires the full column type when a column is changed.",
                 )
                 .with_details(
@@ -170,7 +171,7 @@ pub fn preview(action: &ValidatedStructureAction) -> Result<StructureDdlPreview,
                 ));
             };
             let Some(nullable) = changes.nullable else {
-                return Err(DatabaseError::validation(
+                return Err(DatabaseError::capability(
                     "MySQL requires explicit nullability when a column is changed.",
                 )
                 .with_details(
@@ -195,6 +196,9 @@ pub fn preview(action: &ValidatedStructureAction) -> Result<StructureDdlPreview,
             let mut warnings = vec![
                 "MySQL MODIFY COLUMN replaces the entire column definition; attributes not \
                  supplied in this preview revert to their type defaults."
+                    .to_string(),
+                "Data loss risk: changing a column type can truncate values or fail when existing \
+                 rows cannot be converted safely."
                     .to_string(),
             ];
             if changes.comment.is_none() && !changes.drop_comment {
@@ -246,7 +250,8 @@ pub fn preview(action: &ValidatedStructureAction) -> Result<StructureDdlPreview,
                 MYSQL_DIALECT.quote_identifier(name)
             )],
             vec![
-                "Dropping a column permanently removes its data.".to_string(),
+                "Data loss: dropping a column permanently removes every value stored in it."
+                    .to_string(),
                 "Indexes, foreign keys, generated columns, and views that reference the column can \
                  block the drop or become invalid."
                     .to_string(),
