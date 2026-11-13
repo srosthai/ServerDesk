@@ -16,6 +16,7 @@ use super::{
 pub mod actions;
 pub mod adapter;
 pub mod capabilities;
+pub mod ddl;
 pub mod sql;
 
 pub use adapter::MysqlDatabaseAdapter;

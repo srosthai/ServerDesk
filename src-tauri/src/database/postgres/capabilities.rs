@@ -32,11 +32,19 @@ pub fn flags_for(version: Option<DatabaseVersion>) -> CapabilityFlags {
         generated_columns: at_least(version, 12, 0, 0),
         // Identity columns were added in PostgreSQL 10.
         identity_columns: at_least(version, 10, 0, 0),
+        // PostgreSQL does not use AUTO_INCREMENT.
+        auto_increment_columns: false,
+        column_type_change: true,
+        // ALTER TABLE ... RENAME COLUMN has been available since before 9.2.
+        column_rename: true,
+        table_rename: true,
         // PostgreSQL does not support reordering stored columns.
         column_reorder: false,
         database_rename: true,
         // ALTER INDEX ... RENAME was added in PostgreSQL 9.2.
         index_rename: at_least(version, 9, 2, 0),
+        // Partial-index predicates are supported at every supported version.
+        partial_indexes: true,
         query_timeout: true,
     }
 }

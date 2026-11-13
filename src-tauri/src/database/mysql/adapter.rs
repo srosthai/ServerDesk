@@ -25,13 +25,14 @@ use tokio::{
 
 use crate::storage::DatabaseEngine;
 
-use super::{MYSQL_DIALECT, actions as engine_actions, sql};
+use super::{MYSQL_DIALECT, actions as engine_actions, ddl as engine_ddl, sql};
 use crate::database::{
     actions::{DatabaseDdlPreview, ValidatedDatabaseAction},
     capabilities::{DatabaseAction, DatabaseCapabilities, DatabaseVersion},
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
     pagination::{Bounded, Page, PageRequest},
+    structure::{StructureDdlPreview, ValidatedStructureAction},
     traits::{
         ColumnIdentity, ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter,
         DatabaseConnectRequest, DatabaseConnectionInfo, DatabasePing, DatabaseSummary,
@@ -511,6 +512,15 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
             ));
         }
         engine_actions::preview(action)
+    }
+
+    async fn preview_structure_action(
+        &self,
+        action: &ValidatedStructureAction,
+    ) -> Result<StructureDdlPreview, DatabaseError> {
+        self.require_connection()?;
+        action.ensure_supported(&self.capabilities)?;
+        engine_ddl::preview(action)
     }
 
     async fn execute_database_action(
