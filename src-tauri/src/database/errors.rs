@@ -25,6 +25,8 @@ pub enum DatabaseErrorKind {
     Timeout,
     /// The database account lacks the privilege required for the operation.
     Permission,
+    /// A foreign key, view, sequence, or trigger blocks the operation.
+    Dependency,
     /// The engine rejected SQL or a metadata request while executing it.
     Query,
     /// The engine or version does not support the requested action.
@@ -40,11 +42,12 @@ pub enum DatabaseErrorKind {
 }
 
 impl DatabaseErrorKind {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Tunnel,
         Self::DatabaseAuth,
         Self::Timeout,
         Self::Permission,
+        Self::Dependency,
         Self::Query,
         Self::Capability,
         Self::Cancelled,
@@ -59,6 +62,7 @@ impl DatabaseErrorKind {
             Self::DatabaseAuth => "database_auth",
             Self::Timeout => "timeout",
             Self::Permission => "permission",
+            Self::Dependency => "dependency",
             Self::Query => "query",
             Self::Capability => "capability",
             Self::Cancelled => "cancelled",
@@ -141,6 +145,10 @@ impl DatabaseError {
         Self::new(DatabaseErrorKind::Permission, message)
     }
 
+    pub fn dependency(message: impl Into<String>) -> Self {
+        Self::new(DatabaseErrorKind::Dependency, message)
+    }
+
     pub fn query(message: impl Into<String>) -> Self {
         Self::new(DatabaseErrorKind::Query, message)
     }
@@ -185,6 +193,7 @@ impl From<DatabaseError> for AppError {
             DatabaseErrorKind::DatabaseAuth => ErrorCode::DatabaseAuth,
             DatabaseErrorKind::Timeout => ErrorCode::Timeout,
             DatabaseErrorKind::Permission => ErrorCode::Permission,
+            DatabaseErrorKind::Dependency => ErrorCode::Conflict,
             DatabaseErrorKind::Query => ErrorCode::Query,
             DatabaseErrorKind::Capability => ErrorCode::Capability,
             DatabaseErrorKind::Cancelled => ErrorCode::Cancelled,
@@ -223,6 +232,11 @@ mod tests {
                 DatabaseErrorKind::Permission,
                 "permission",
                 ErrorCode::Permission,
+            ),
+            (
+                DatabaseErrorKind::Dependency,
+                "dependency",
+                ErrorCode::Conflict,
             ),
             (DatabaseErrorKind::Query, "query", ErrorCode::Query),
             (

@@ -33,12 +33,32 @@ pub fn preview(action: &ValidatedStructureAction) -> Result<StructureDdlPreview,
                     quote_column_list(&options.primary_key)
                 ));
             }
+            for key in &options.unique_keys {
+                definitions.push(format!(
+                    "CONSTRAINT {} UNIQUE ({})",
+                    POSTGRES_DIALECT.quote_identifier(&key.name),
+                    quote_column_list(&key.columns)
+                ));
+            }
             let mut statements = vec![format!(
-                "CREATE TABLE {} (\n  {}\n)",
+                "CREATE {}TABLE {} (\n  {}\n){}",
+                if options.options.unlogged {
+                    "UNLOGGED "
+                } else {
+                    ""
+                },
                 POSTGRES_DIALECT.quote_qualified_name(&table),
-                definitions.join(",\n  ")
+                definitions.join(",\n  "),
+                render_table_options(&options.options)?
             )];
             statements.extend(comment_statements(&table, &options.columns));
+            if let Some(comment) = options.options.comment.as_deref() {
+                statements.push(format!(
+                    "COMMENT ON TABLE {} IS {}",
+                    POSTGRES_DIALECT.quote_qualified_name(&table),
+                    string_literal(comment)
+                ));
+            }
 
             action.preview(
                 POSTGRES_DIALECT.engine(),
@@ -65,6 +85,26 @@ pub fn preview(action: &ValidatedStructureAction) -> Result<StructureDdlPreview,
                         .to_string(),
                     "PostgreSQL updates dependent views, indexes, and constraints when the table \
                      is renamed."
+                        .to_string(),
+                ],
+            )
+        }
+        ValidatedStructureAction::DuplicateTable { table, new_name } => {
+            let old_name = table_name(table)?;
+            let new_name = table_name_with(table, new_name)?;
+            action.preview(
+                POSTGRES_DIALECT.engine(),
+                vec![format!(
+                    "CREATE TABLE {} (LIKE {} INCLUDING ALL)",
+                    POSTGRES_DIALECT.quote_qualified_name(&new_name),
+                    POSTGRES_DIALECT.quote_qualified_name(&old_name)
+                )],
+                vec![
+                    "The duplicate copies columns, indexes, defaults, constraints, comments, and \
+                     identity options. Rows are not copied."
+                        .to_string(),
+                    "Foreign keys are not copied by CREATE TABLE ... LIKE; add them explicitly if \
+                     the duplicate needs the same relationships."
                         .to_string(),
                 ],
             )
@@ -331,6 +371,35 @@ fn table_name(table: &TableRef) -> Result<QualifiedName, DatabaseError> {
     }
 }
 
+fn table_name_with(
+    table: &TableRef,
+    new_name: &Identifier,
+) -> Result<QualifiedName, DatabaseError> {
+    match &table.schema {
+        Some(schema) => QualifiedName::new([schema.clone(), new_name.clone()]),
+        None => QualifiedName::new([new_name.clone()]),
+    }
+}
+
+fn render_table_options(
+    options: &crate::database::structure::ValidatedTableOptions,
+) -> Result<String, DatabaseError> {
+    if options.engine.is_some() || options.charset.is_some() || options.collation.is_some() {
+        return Err(DatabaseError::capability(
+            "PostgreSQL does not support a MySQL-style storage engine or per-table character set \
+             and collation option. Use the database encoding, collation, or a per-column collation \
+             instead.",
+        ));
+    }
+
+    let mut suffix = String::new();
+    if let Some(tablespace) = options.tablespace.as_ref() {
+        suffix.push_str(" TABLESPACE ");
+        suffix.push_str(&POSTGRES_DIALECT.quote_identifier(tablespace));
+    }
+    Ok(suffix)
+}
+
 fn index_name(table: &TableRef, index: &Identifier) -> Result<QualifiedName, DatabaseError> {
     match &table.schema {
         Some(schema) => QualifiedName::new([schema.clone(), index.clone()]),
@@ -520,7 +589,10 @@ mod tests {
     use crate::database::{
         DatabaseErrorKind, ReferentialAction, TableRef,
         capabilities::DatabaseCapabilities,
-        structure::{ColumnDefinitionRequest, ConstraintRequest, StructureActionRequest},
+        structure::{
+            ColumnDefinitionRequest, ConstraintRequest, StructureActionRequest,
+            TableOptionsRequest, UniqueKeyRequest,
+        },
     };
     use crate::storage::DatabaseEngine;
 
@@ -567,6 +639,8 @@ mod tests {
             name: "Users".to_string(),
             columns: vec![id, slug, email],
             primary_key: vec!["ID".to_string()],
+            unique_keys: Vec::new(),
+            options: None,
         });
         action
             .ensure_supported(&capabilities("16.2"))
@@ -788,5 +862,79 @@ mod tests {
             POSTGRES_DIALECT.quote_qualified_name(&table_name(&table).expect("name")),
             "\"public\".\"users\""
         );
+    }
+
+    #[test]
+    fn create_table_applies_postgres_keys_options_and_table_comment() {
+        let action = validate(StructureActionRequest::CreateTable {
+            database: Some("app".to_string()),
+            schema: Some("public".to_string()),
+            name: "Users".to_string(),
+            columns: vec![column("ID", "bigint"), column("Email", "varchar(320)")],
+            primary_key: vec!["ID".to_string()],
+            unique_keys: vec![UniqueKeyRequest {
+                name: "Users Email Key".to_string(),
+                columns: vec!["Email".to_string()],
+            }],
+            options: Some(TableOptionsRequest {
+                tablespace: Some("fast".to_string()),
+                unlogged: true,
+                comment: Some("Users table".to_string()),
+                ..TableOptionsRequest::default()
+            }),
+        });
+        action
+            .ensure_supported(&capabilities("16.2"))
+            .expect("supported");
+        let preview = preview(&action).expect("preview");
+
+        assert!(preview.statements[0].starts_with("CREATE UNLOGGED TABLE \"public\".\"Users\""));
+        assert!(
+            preview.statements[0].contains("CONSTRAINT \"Users Email Key\" UNIQUE (\"Email\")")
+        );
+        assert!(preview.statements[0].contains("TABLESPACE \"fast\""));
+        assert!(preview.statements.iter().any(|statement| {
+            statement == "COMMENT ON TABLE \"public\".\"Users\" IS 'Users table'"
+        }));
+    }
+
+    #[test]
+    fn duplicate_table_uses_postgres_like_including_all() {
+        let action = validate(StructureActionRequest::DuplicateTable {
+            database: Some("app".to_string()),
+            schema: Some("public".to_string()),
+            name: "Users".to_string(),
+            new_name: "Accounts".to_string(),
+        });
+        let preview = preview(&action).expect("duplicate preview");
+        assert_eq!(
+            preview.statements,
+            ["CREATE TABLE \"public\".\"Accounts\" (LIKE \"public\".\"Users\" INCLUDING ALL)"]
+        );
+        assert!(!preview.destructive);
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Rows are not copied"))
+        );
+    }
+
+    #[test]
+    fn mysql_only_table_options_are_rejected_before_ddl() {
+        let action = validate(StructureActionRequest::CreateTable {
+            database: Some("app".to_string()),
+            schema: Some("public".to_string()),
+            name: "Users".to_string(),
+            columns: vec![column("id", "bigint")],
+            primary_key: Vec::new(),
+            unique_keys: Vec::new(),
+            options: Some(TableOptionsRequest {
+                engine: Some("InnoDB".to_string()),
+                ..TableOptionsRequest::default()
+            }),
+        });
+        let error = preview(&action).expect_err("PostgreSQL has no MySQL engine option");
+        assert_eq!(error.kind, DatabaseErrorKind::Capability);
     }
 }

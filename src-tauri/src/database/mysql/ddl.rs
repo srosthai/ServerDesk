@@ -32,16 +32,25 @@ pub fn preview(action: &ValidatedStructureAction) -> Result<StructureDdlPreview,
                     quote_column_list(&options.primary_key)
                 ));
             }
+            for key in &options.unique_keys {
+                definitions.push(format!(
+                    "UNIQUE KEY {} ({})",
+                    MYSQL_DIALECT.quote_identifier(&key.name),
+                    quote_column_list(&key.columns)
+                ));
+            }
+            let options_sql = render_table_options(&options.options)?;
             action.preview(
                 MYSQL_DIALECT.engine(),
                 vec![format!(
-                    "CREATE TABLE {} (\n  {}\n)",
+                    "CREATE TABLE {} (\n  {}\n){}",
                     MYSQL_DIALECT.quote_qualified_name(&table),
-                    definitions.join(",\n  ")
+                    definitions.join(",\n  "),
+                    options_sql
                 )],
                 vec![
                     "MySQL creates the table with the database default character set and \
-                     collation."
+                     collation unless the preview sets them explicitly."
                         .to_string(),
                 ],
             )
@@ -59,6 +68,26 @@ pub fn preview(action: &ValidatedStructureAction) -> Result<StructureDdlPreview,
                 vec![
                     "Saved queries, grants, and application code that use the old table name must \
                      be updated."
+                        .to_string(),
+                ],
+            )
+        }
+        ValidatedStructureAction::DuplicateTable { table, new_name } => {
+            let old_name = table_name(table)?;
+            let new_table = table_name_with(table, new_name)?;
+            action.preview(
+                MYSQL_DIALECT.engine(),
+                vec![format!(
+                    "CREATE TABLE {} LIKE {}",
+                    MYSQL_DIALECT.quote_qualified_name(&new_table),
+                    MYSQL_DIALECT.quote_qualified_name(&old_name)
+                )],
+                vec![
+                    "The duplicate copies columns, indexes, and the table options. Rows are not \
+                     copied."
+                        .to_string(),
+                    "Foreign keys are not copied by CREATE TABLE ... LIKE; add them explicitly if \
+                     the duplicate needs the same relationships."
                         .to_string(),
                 ],
             )
@@ -429,6 +458,41 @@ fn render_position(position: &ColumnPosition) -> String {
     }
 }
 
+fn render_table_options(
+    options: &crate::database::structure::ValidatedTableOptions,
+) -> Result<String, DatabaseError> {
+    if options.tablespace.is_some() {
+        return Err(DatabaseError::capability(
+            "MySQL does not support a PostgreSQL-style table tablespace option. Use CREATE TABLE \
+             ... TABLESPACE with an InnoDB general tablespace separately.",
+        ));
+    }
+    if options.unlogged {
+        return Err(DatabaseError::capability(
+            "MySQL does not support PostgreSQL UNLOGGED tables.",
+        ));
+    }
+
+    let mut suffix = String::new();
+    if let Some(engine) = options.engine.as_deref() {
+        suffix.push_str(" ENGINE=");
+        suffix.push_str(engine);
+    }
+    if let Some(charset) = options.charset.as_deref() {
+        suffix.push_str(" DEFAULT CHARACTER SET ");
+        suffix.push_str(charset);
+    }
+    if let Some(collation) = options.collation.as_deref() {
+        suffix.push_str(" COLLATE ");
+        suffix.push_str(collation);
+    }
+    if let Some(comment) = options.comment.as_deref() {
+        suffix.push_str(" COMMENT=");
+        suffix.push_str(&string_literal(comment));
+    }
+    Ok(suffix)
+}
+
 fn render_column(column: &ValidatedColumnDefinition) -> Result<String, DatabaseError> {
     if column.generated.is_some() && column.identity != ColumnIdentity::None {
         return Err(DatabaseError::validation(
@@ -593,7 +657,10 @@ mod tests {
     use crate::database::{
         DatabaseErrorKind, TableRef,
         capabilities::DatabaseCapabilities,
-        structure::{ColumnDefinitionRequest, ConstraintRequest, StructureActionRequest},
+        structure::{
+            ColumnDefinitionRequest, ConstraintRequest, StructureActionRequest,
+            TableOptionsRequest, UniqueKeyRequest,
+        },
     };
     use crate::storage::DatabaseEngine;
 
@@ -641,6 +708,8 @@ mod tests {
             name: "Users".to_string(),
             columns: vec![id, slug, email],
             primary_key: vec!["ID".to_string()],
+            unique_keys: Vec::new(),
+            options: None,
         });
         action.ensure_supported(&capabilities()).expect("supported");
         let preview = preview(&action).expect("preview");
@@ -878,5 +947,82 @@ mod tests {
         );
         let mismatched = TableRef::new(Some("app"), Some("other"), "users").expect("table");
         assert!(table_name(&mismatched).is_err());
+    }
+
+    #[test]
+    fn create_table_applies_unique_keys_and_mysql_table_options() {
+        let action = validate(StructureActionRequest::CreateTable {
+            database: Some("app".to_string()),
+            schema: None,
+            name: "Users".to_string(),
+            columns: vec![
+                column("ID", "bigint unsigned"),
+                column("Email", "varchar(320)"),
+            ],
+            primary_key: vec!["ID".to_string()],
+            unique_keys: vec![UniqueKeyRequest {
+                name: "Users Email Key".to_string(),
+                columns: vec!["Email".to_string()],
+            }],
+            options: Some(TableOptionsRequest {
+                engine: Some("InnoDB".to_string()),
+                charset: Some("utf8mb4".to_string()),
+                collation: Some("utf8mb4_unicode_ci".to_string()),
+                tablespace: None,
+                unlogged: false,
+                comment: Some("Users table".to_string()),
+            }),
+        });
+        action.ensure_supported(&capabilities()).expect("supported");
+        let preview = preview(&action).expect("preview");
+
+        assert!(preview.statements[0].contains("UNIQUE KEY `Users Email Key` (`Email`)"));
+        assert!(preview.statements[0].contains("ENGINE=InnoDB"));
+        assert!(
+            preview.statements[0]
+                .contains("DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+        );
+        assert!(preview.statements[0].contains("COMMENT='Users table'"));
+    }
+
+    #[test]
+    fn duplicate_table_uses_create_table_like() {
+        let action = validate(StructureActionRequest::DuplicateTable {
+            database: Some("app".to_string()),
+            schema: None,
+            name: "Users".to_string(),
+            new_name: "Accounts".to_string(),
+        });
+        let preview = preview(&action).expect("duplicate preview");
+        assert_eq!(
+            preview.statements,
+            ["CREATE TABLE `app`.`Accounts` LIKE `app`.`Users`"]
+        );
+        assert!(!preview.destructive);
+        assert!(!preview.requires_confirmation);
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Rows are not copied"))
+        );
+    }
+
+    #[test]
+    fn postgres_only_table_options_are_rejected_before_ddl() {
+        let action = validate(StructureActionRequest::CreateTable {
+            database: Some("app".to_string()),
+            schema: None,
+            name: "Users".to_string(),
+            columns: vec![column("id", "bigint")],
+            primary_key: Vec::new(),
+            unique_keys: Vec::new(),
+            options: Some(TableOptionsRequest {
+                tablespace: Some("fast".to_string()),
+                ..TableOptionsRequest::default()
+            }),
+        });
+        let error = preview(&action).expect_err("MySQL has no PostgreSQL tablespace option");
+        assert_eq!(error.kind, DatabaseErrorKind::Capability);
     }
 }
