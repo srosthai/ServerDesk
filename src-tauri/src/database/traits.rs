@@ -16,6 +16,7 @@ use super::{
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
     pagination::{Bounded, Page, PageRequest},
+    row_writes::{RowDeleteRequest, RowInsertRequest, RowUpdateRequest, RowWriteResult},
     rows::{RowQueryControl, RowReadRequest, RowReadResult},
     structure::{StructureDdlPreview, ValidatedStructureAction},
 };
@@ -525,6 +526,32 @@ pub trait DatabaseAdapter: Send + Sync {
         request: &RowReadRequest,
         control: &RowQueryControl,
     ) -> Result<RowReadResult, DatabaseError>;
+
+    /// Inserts one row in a transaction, verifies the affected row, re-reads it
+    /// where the identity is known, and commits only after verification. A
+    /// failure rolls back and reports that no rows were changed.
+    async fn insert_row(
+        &mut self,
+        request: &RowInsertRequest,
+        control: &RowQueryControl,
+    ) -> Result<RowWriteResult, DatabaseError>;
+
+    /// Updates one row addressed by a stable identity. `expected` values guard
+    /// every changed column; a concurrent change affects zero rows and rolls the
+    /// transaction back instead of overwriting newer data.
+    async fn update_row(
+        &mut self,
+        request: &RowUpdateRequest,
+        control: &RowQueryControl,
+    ) -> Result<RowWriteResult, DatabaseError>;
+
+    /// Deletes one or more explicit row identities in one transaction. The
+    /// affected count must match the target count or the transaction rolls back.
+    async fn delete_rows(
+        &mut self,
+        request: &RowDeleteRequest,
+        control: &RowQueryControl,
+    ) -> Result<RowWriteResult, DatabaseError>;
 
     /// Returns a bounded dependency inventory for one table. Callers use it
     /// before destructive structure changes so the UI can name the foreign
