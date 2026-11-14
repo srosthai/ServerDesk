@@ -33,6 +33,7 @@ use crate::database::{
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
     pagination::{Bounded, Page, PageRequest},
+    row_writes::{RowDeleteRequest, RowInsertRequest, RowUpdateRequest, RowWriteResult},
     rows::{RowQueryControl, RowReadRequest, RowReadResult},
     structure::{StructureDdlPreview, ValidatedStructureAction},
     traits::{
@@ -922,6 +923,93 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
             drop(guard.take());
         }
 
+        result
+    }
+
+    async fn insert_row(
+        &mut self,
+        request: &RowInsertRequest,
+        control: &RowQueryControl,
+    ) -> Result<RowWriteResult, DatabaseError> {
+        self.require_capability(DatabaseAction::InsertRow)?;
+        if self.read_only {
+            return Err(DatabaseError::permission(
+                "The database session is read-only; row inserts are disabled.",
+            ));
+        }
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let result = engine_rows::insert_row(connection, request, control, self.read_only)
+            .await
+            .map_err(|error| error.scoped_permission("table", request.table.name.as_str()));
+
+        if matches!(&result, Err(error) if matches!(
+            error.kind,
+            crate::database::DatabaseErrorKind::Cancelled
+                | crate::database::DatabaseErrorKind::Timeout
+                | crate::database::DatabaseErrorKind::Connection
+        )) {
+            self.connected.store(false, Ordering::SeqCst);
+            drop(guard.take());
+        }
+        result
+    }
+
+    async fn update_row(
+        &mut self,
+        request: &RowUpdateRequest,
+        control: &RowQueryControl,
+    ) -> Result<RowWriteResult, DatabaseError> {
+        self.require_capability(DatabaseAction::EditRow)?;
+        if self.read_only {
+            return Err(DatabaseError::permission(
+                "The database session is read-only; row updates are disabled.",
+            ));
+        }
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let result = engine_rows::update_row(connection, request, control, self.read_only)
+            .await
+            .map_err(|error| error.scoped_permission("table", request.table.name.as_str()));
+
+        if matches!(&result, Err(error) if matches!(
+            error.kind,
+            crate::database::DatabaseErrorKind::Cancelled
+                | crate::database::DatabaseErrorKind::Timeout
+                | crate::database::DatabaseErrorKind::Connection
+        )) {
+            self.connected.store(false, Ordering::SeqCst);
+            drop(guard.take());
+        }
+        result
+    }
+
+    async fn delete_rows(
+        &mut self,
+        request: &RowDeleteRequest,
+        control: &RowQueryControl,
+    ) -> Result<RowWriteResult, DatabaseError> {
+        self.require_capability(DatabaseAction::DeleteRow)?;
+        if self.read_only {
+            return Err(DatabaseError::permission(
+                "The database session is read-only; row deletes are disabled.",
+            ));
+        }
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let result = engine_rows::delete_rows(connection, request, control, self.read_only)
+            .await
+            .map_err(|error| error.scoped_permission("table", request.table.name.as_str()));
+
+        if matches!(&result, Err(error) if matches!(
+            error.kind,
+            crate::database::DatabaseErrorKind::Cancelled
+                | crate::database::DatabaseErrorKind::Timeout
+                | crate::database::DatabaseErrorKind::Connection
+        )) {
+            self.connected.store(false, Ordering::SeqCst);
+            drop(guard.take());
+        }
         result
     }
 

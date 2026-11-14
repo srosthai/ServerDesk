@@ -71,6 +71,7 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useDatabaseExplorerStore } from "@/stores/databaseExplorerStore";
 import { useDatabaseProfileStore } from "@/stores/databaseProfileStore";
 import { useDatabaseRowStore } from "@/stores/databaseRowStore";
+import { useDatabaseRowWriteStore } from "@/stores/databaseRowWriteStore";
 import {
   useDatabaseWorkspaceStore,
   type DatabaseWorkspaceTab,
@@ -1549,6 +1550,7 @@ function DatabaseManagerPage() {
     closeWorkspaceTab(profileId);
     useDatabaseExplorerStore.getState().resetProfile(profileId);
     useDatabaseRowStore.getState().resetProfile(profileId);
+    useDatabaseRowWriteStore.getState().resetProfile(profileId);
     setStructureIntent(null);
     setTableSummaryOverrides((current) => {
       const next = { ...current };
@@ -1593,6 +1595,7 @@ function DatabaseManagerPage() {
       closeWorkspaceTab(deleteTarget.id);
       useDatabaseExplorerStore.getState().resetProfile(deleteTarget.id);
       useDatabaseRowStore.getState().resetProfile(deleteTarget.id);
+      useDatabaseRowWriteStore.getState().resetProfile(deleteTarget.id);
       setNotice(`Deleted ${deleteTarget.name}. The remote database was not changed.`);
       setDeleteTarget(null);
     }

@@ -700,6 +700,51 @@ export type DatabaseRowCancellationResult = {
   cancelled: boolean;
 };
 
+export type DatabaseRowValueMode = "value" | "null" | "default";
+
+export type DatabaseRowWriteValue = {
+  column: string;
+  mode: DatabaseRowValueMode;
+  value?: string | null;
+};
+
+export type DatabaseRowWriteTable = {
+  database?: string | null;
+  schema?: string | null;
+  name: string;
+};
+
+export type DatabaseRowInsertRequest = {
+  table: DatabaseRowWriteTable;
+  values: DatabaseRowWriteValue[];
+};
+
+export type DatabaseRowUpdateRequest = {
+  table: DatabaseRowWriteTable;
+  identity: DatabaseRowIdentityValue[];
+  values: DatabaseRowWriteValue[];
+  expected: DatabaseRowIdentityValue[];
+};
+
+export type DatabaseRowDeleteRequest = {
+  table: DatabaseRowWriteTable;
+  targets: DatabaseRowIdentityValue[][];
+};
+
+export type DatabaseRowWriteOperation = "insert" | "update" | "delete";
+
+export type DatabaseRowTransactionState = "committed" | "rolled_back";
+
+export type DatabaseRowWriteResult = {
+  operation: DatabaseRowWriteOperation;
+  table: DatabaseRowWriteTable;
+  affectedRows: number;
+  verified: boolean;
+  verification: string;
+  transaction: DatabaseRowTransactionState;
+  row?: DatabaseRowRecord;
+};
+
 export type DatabaseExplorerNode =
   | { kind: "databases" }
   | { kind: "schemas" }

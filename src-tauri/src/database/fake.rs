@@ -22,6 +22,11 @@ use super::{
     mysql,
     pagination::{Bounded, Page, PageRequest},
     postgres,
+    row_writes::{
+        ResolvedWriteValue, RowDeleteRequest, RowInsertRequest, RowUpdateRequest,
+        RowWriteOperation, RowWriteResult, resolve_delete, resolve_insert, resolve_update,
+        text_matches_column,
+    },
     rows::{
         MAX_ROW_CELL_CHARACTERS, RowCell, RowColumn, RowColumnKind, RowExactCount,
         RowFilterOperator, RowFilterValue, RowIdentity, RowIdentityValue, RowQueryControl,
@@ -52,6 +57,8 @@ pub struct FakeRowTable {
     pub estimated_rows: MetadataValue<u64>,
     /// Row values in column order. `None` is SQL NULL.
     pub rows: Vec<Vec<Option<String>>>,
+    /// Column defaults in column order. A `None` default is SQL NULL.
+    pub defaults: Vec<Option<String>>,
 }
 
 impl FakeRowTable {
@@ -68,7 +75,14 @@ impl FakeRowTable {
             identity,
             estimated_rows,
             rows,
+            defaults: Vec::new(),
         }
+    }
+
+    /// Sets one default value per column for default-mode write tests.
+    pub fn with_defaults(mut self, defaults: Vec<Option<String>>) -> Self {
+        self.defaults = defaults;
+        self
     }
 
     fn matches(&self, reference: &TableRef) -> bool {
@@ -113,6 +127,9 @@ pub struct FakeDatabaseAdapter {
     detail_table: String,
     row_tables: Vec<FakeRowTable>,
     row_read_error: Option<DatabaseError>,
+    row_write_error: Option<DatabaseError>,
+    row_write_count: usize,
+    row_rollback_count: usize,
 }
 
 impl FakeDatabaseAdapter {
@@ -169,6 +186,9 @@ impl FakeDatabaseAdapter {
             detail_table,
             row_tables: Vec::new(),
             row_read_error: None,
+            row_write_error: None,
+            row_write_count: 0,
+            row_rollback_count: 0,
         }
     }
 
@@ -182,6 +202,21 @@ impl FakeDatabaseAdapter {
     pub fn with_row_read_error(mut self, error: DatabaseError) -> Self {
         self.row_read_error = Some(error);
         self
+    }
+
+    /// Makes the next row write fail before any memory mutation, simulating a
+    /// database rejection followed by a rollback.
+    pub fn with_row_write_error(mut self, error: DatabaseError) -> Self {
+        self.row_write_error = Some(error);
+        self
+    }
+
+    pub fn row_write_count(&self) -> usize {
+        self.row_write_count
+    }
+
+    pub fn row_rollback_count(&self) -> usize {
+        self.row_rollback_count
     }
 
     /// Makes the next structure execution fail with a typed database error.
@@ -440,6 +475,51 @@ impl FakeDatabaseAdapter {
 
         true
     }
+
+    fn row_metadata(&self, fixture: &FakeRowTable) -> RowTableMetadata {
+        RowTableMetadata {
+            engine: self.engine,
+            database: fixture
+                .table
+                .database
+                .as_ref()
+                .map(|value| value.as_str().to_string()),
+            schema: fixture
+                .table
+                .schema
+                .as_ref()
+                .map(|value| value.as_str().to_string()),
+            table: fixture.table.name.clone(),
+            columns: fixture.columns.clone(),
+            identity: fixture.identity.clone(),
+            estimated_rows: fixture.estimated_rows.clone(),
+        }
+    }
+
+    fn row_record(metadata: &RowTableMetadata, values: &[Option<String>]) -> RowRecord {
+        let plan = crate::database::rows::RowReadPlan {
+            visible: (0..metadata.columns.len()).collect(),
+            sort: Vec::new(),
+            filters: Vec::new(),
+            search: None,
+        };
+        Self::record_from_values(metadata, &plan, values).expect("fake row record")
+    }
+}
+
+fn row_cell_matches(column: &RowColumn, actual: Option<&Option<String>>, expected: &str) -> bool {
+    let Some(actual) = actual.and_then(Option::as_deref) else {
+        return false;
+    };
+    text_matches_column(column, expected, actual).unwrap_or_else(|| match column.kind {
+        RowColumnKind::Text | RowColumnKind::Uuid | RowColumnKind::Temporal => expected == actual,
+        RowColumnKind::Integer => expected.parse::<i64>().ok() == actual.parse::<i64>().ok(),
+        RowColumnKind::Float | RowColumnKind::Decimal => {
+            expected.parse::<f64>().ok() == actual.parse::<f64>().ok()
+        }
+        RowColumnKind::Boolean => parse_fake_bool(expected) == parse_fake_bool(actual),
+        _ => expected == actual,
+    })
 }
 
 fn truncate_fake_cell(value: Option<String>) -> (Option<String>, bool) {
@@ -1744,6 +1824,290 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
             has_more,
             exact_rows,
             self.read_only,
+        ))
+    }
+
+    async fn insert_row(
+        &mut self,
+        request: &RowInsertRequest,
+        control: &RowQueryControl,
+    ) -> Result<RowWriteResult, DatabaseError> {
+        self.require_capability(DatabaseAction::InsertRow)?;
+        self.require_connection()?;
+        if self.read_only {
+            return Err(DatabaseError::permission(
+                "The database session is read-only; row inserts are disabled.",
+            ));
+        }
+        if control.is_cancelled() {
+            return Err(DatabaseError::cancelled("The row write was cancelled."));
+        }
+        self.row_write_count += 1;
+        if let Some(error) = self.row_write_error.take() {
+            self.row_rollback_count += 1;
+            return Err(crate::database::row_writes::rolled_back(error));
+        }
+
+        let metadata = {
+            let fixture = self
+                .row_tables
+                .iter()
+                .find(|table| table.matches(&request.table))
+                .ok_or_else(|| DatabaseError::query("The selected table was not found."))?;
+            self.row_metadata(fixture)
+        };
+        let plan = resolve_insert(request, &metadata)?;
+        let defaults = self
+            .row_tables
+            .iter()
+            .find(|table| table.matches(&request.table))
+            .map(|table| table.defaults.clone())
+            .unwrap_or_default();
+        let default_for =
+            |index: usize| -> Option<String> { defaults.get(index).cloned().flatten() };
+        let mut values = (0..metadata.columns.len())
+            .map(default_for)
+            .collect::<Vec<_>>();
+
+        for value in &plan.values {
+            let column = metadata.column(value.column)?;
+            values[value.column] = match &value.value {
+                ResolvedWriteValue::Null => None,
+                ResolvedWriteValue::Default => default_for(value.column),
+                ResolvedWriteValue::Value(_) => value.text.clone(),
+            };
+            if values[value.column].is_none()
+                && !column.nullable
+                && column.identity != crate::database::ColumnIdentity::AutoIncrement
+            {
+                return Err(DatabaseError::validation(format!(
+                    "Column {} is not nullable and has no default.",
+                    column.name
+                )));
+            }
+        }
+
+        let identity_indices = metadata.identity_indices();
+        if identity_indices.len() == 1 {
+            let index = identity_indices[0];
+            if metadata.columns[index].identity == crate::database::ColumnIdentity::AutoIncrement
+                && values[index].is_none()
+            {
+                let next = self
+                    .row_tables
+                    .iter()
+                    .find(|table| table.matches(&request.table))
+                    .map(|table| {
+                        table
+                            .rows
+                            .iter()
+                            .filter_map(|row| row.get(index).and_then(|value| value.as_deref()))
+                            .filter_map(|value| value.parse::<i64>().ok())
+                            .max()
+                            .unwrap_or(0)
+                            + 1
+                    })
+                    .unwrap_or(1);
+                values[index] = Some(next.to_string());
+            }
+        }
+
+        for (index, column) in metadata.columns.iter().enumerate() {
+            if values[index].is_none() && !column.nullable {
+                return Err(DatabaseError::validation(format!(
+                    "Column {} is not nullable and has no default.",
+                    column.name
+                )));
+            }
+        }
+
+        let fixture = self
+            .row_tables
+            .iter_mut()
+            .find(|table| table.matches(&request.table))
+            .ok_or_else(|| DatabaseError::query("The selected table was not found."))?;
+        let duplicate = fixture.rows.iter().any(|row| {
+            identity_indices
+                .iter()
+                .all(|index| row.get(*index) == values.get(*index))
+        });
+        if duplicate {
+            self.row_rollback_count += 1;
+            return Err(DatabaseError::dependency(
+                "A row with the same stable identity already exists. No row was inserted.",
+            ));
+        }
+
+        fixture.rows.push(values.clone());
+        let row = Self::row_record(&metadata, &values);
+        Ok(RowWriteResult::committed(
+            RowWriteOperation::Insert,
+            request.table.clone(),
+            1,
+            "Inserted 1 row into the fake fixture and re-read it by its stable identity."
+                .to_string(),
+            Some(row),
+        ))
+    }
+
+    async fn update_row(
+        &mut self,
+        request: &RowUpdateRequest,
+        control: &RowQueryControl,
+    ) -> Result<RowWriteResult, DatabaseError> {
+        self.require_capability(DatabaseAction::EditRow)?;
+        self.require_connection()?;
+        if self.read_only {
+            return Err(DatabaseError::permission(
+                "The database session is read-only; row updates are disabled.",
+            ));
+        }
+        if control.is_cancelled() {
+            return Err(DatabaseError::cancelled("The row write was cancelled."));
+        }
+        self.row_write_count += 1;
+        if let Some(error) = self.row_write_error.take() {
+            self.row_rollback_count += 1;
+            return Err(crate::database::row_writes::rolled_back(error));
+        }
+
+        let metadata = {
+            let fixture = self
+                .row_tables
+                .iter()
+                .find(|table| table.matches(&request.table))
+                .ok_or_else(|| DatabaseError::query("The selected table was not found."))?;
+            self.row_metadata(fixture)
+        };
+        let plan = resolve_update(request, &metadata)?;
+        let fixture = self
+            .row_tables
+            .iter_mut()
+            .find(|table| table.matches(&request.table))
+            .ok_or_else(|| DatabaseError::query("The selected table was not found."))?;
+
+        let Some(row_index) = fixture.rows.iter().position(|row| {
+            plan.identity.iter().all(|(index, _, text)| {
+                row_cell_matches(&metadata.columns[*index], row.get(*index), text)
+            })
+        }) else {
+            self.row_rollback_count += 1;
+            return Err(DatabaseError::dependency(
+                "The row no longer exists. It may have been deleted by another session.",
+            ));
+        };
+
+        for expected in &plan.expected {
+            let column = metadata.column(expected.column)?;
+            let actual = fixture.rows[row_index]
+                .get(expected.column)
+                .and_then(Option::as_deref);
+            let matches = match (&expected.value, actual) {
+                (None, None) => true,
+                (Some(expected), Some(actual)) => {
+                    text_matches_column(column, expected, actual) != Some(false)
+                }
+                _ => false,
+            };
+            if !matches {
+                self.row_rollback_count += 1;
+                return Err(DatabaseError::dependency(
+                    "The row changed in another session before this update could be applied.",
+                ));
+            }
+        }
+
+        for value in &plan.values {
+            let column = metadata.column(value.column)?;
+            fixture.rows[row_index][value.column] = match &value.value {
+                ResolvedWriteValue::Null => None,
+                ResolvedWriteValue::Default => None,
+                ResolvedWriteValue::Value(_) => value.text.clone(),
+            };
+            if fixture.rows[row_index][value.column].is_none() && !column.nullable {
+                self.row_rollback_count += 1;
+                return Err(DatabaseError::validation(format!(
+                    "Column {} is not nullable.",
+                    column.name
+                )));
+            }
+        }
+
+        let row = Self::row_record(&metadata, &fixture.rows[row_index]);
+        Ok(RowWriteResult::committed(
+            RowWriteOperation::Update,
+            request.table.clone(),
+            1,
+            "Updated 1 row in the fake fixture and re-read the changed values.".to_string(),
+            Some(row),
+        ))
+    }
+
+    async fn delete_rows(
+        &mut self,
+        request: &RowDeleteRequest,
+        control: &RowQueryControl,
+    ) -> Result<RowWriteResult, DatabaseError> {
+        self.require_capability(DatabaseAction::DeleteRow)?;
+        self.require_connection()?;
+        if self.read_only {
+            return Err(DatabaseError::permission(
+                "The database session is read-only; row deletes are disabled.",
+            ));
+        }
+        if control.is_cancelled() {
+            return Err(DatabaseError::cancelled("The row write was cancelled."));
+        }
+        self.row_write_count += 1;
+        if let Some(error) = self.row_write_error.take() {
+            self.row_rollback_count += 1;
+            return Err(crate::database::row_writes::rolled_back(error));
+        }
+
+        let metadata = {
+            let fixture = self
+                .row_tables
+                .iter()
+                .find(|table| table.matches(&request.table))
+                .ok_or_else(|| DatabaseError::query("The selected table was not found."))?;
+            self.row_metadata(fixture)
+        };
+        let plan = resolve_delete(request, &metadata)?;
+        let fixture = self
+            .row_tables
+            .iter_mut()
+            .find(|table| table.matches(&request.table))
+            .ok_or_else(|| DatabaseError::query("The selected table was not found."))?;
+
+        let mut indices = Vec::with_capacity(plan.targets.len());
+        for target in &plan.targets {
+            let Some(index) = fixture.rows.iter().position(|row| {
+                target.iter().all(|(index, _, text)| {
+                    row_cell_matches(&metadata.columns[*index], row.get(*index), text)
+                })
+            }) else {
+                self.row_rollback_count += 1;
+                return Err(DatabaseError::dependency(
+                    "One or more selected rows no longer exist or were changed in another session. No rows were deleted.",
+                ));
+            };
+            indices.push(index);
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        for index in indices.into_iter().rev() {
+            fixture.rows.remove(index);
+        }
+        let affected = u64::try_from(plan.targets.len()).unwrap_or(u64::MAX);
+        Ok(RowWriteResult::committed(
+            RowWriteOperation::Delete,
+            request.table.clone(),
+            affected,
+            format!(
+                "Deleted {affected} row{} from the fake fixture and verified the targets are absent.",
+                if affected == 1 { "" } else { "s" }
+            ),
+            None,
         ))
     }
 

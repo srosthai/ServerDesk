@@ -17,13 +17,16 @@ import {
   MagnifyingGlassIcon,
   PencilSimpleIcon,
   PlugsIcon,
+  PlusIcon,
   ProhibitIcon,
   RowsIcon,
+  TrashIcon,
   XIcon,
 } from "@phosphor-icons/react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { CopyButton } from "@/components/ui/copy-button";
 import {
   Dialog,
@@ -70,16 +73,29 @@ import {
   visibleColumnNames,
   type CellPresentation,
 } from "@/features/databases/databaseDataGridModel";
+import {
+  EditRowDialog,
+  InsertRowDialog,
+  RowWriteInfo,
+  RowWriteResultBanner,
+} from "@/features/databases/DatabaseRowWriteDialogs";
+import {
+  identityKey,
+  rowEditingBlocked as rowEditingBlockedReason,
+} from "@/features/databases/databaseRowWriteModel";
 import { databaseRowKey, useDatabaseRowStore } from "@/stores/databaseRowStore";
+import { useDatabaseRowWriteStore } from "@/stores/databaseRowWriteStore";
 import { useDatabaseWorkspaceStore } from "@/stores/databaseWorkspaceStore";
 import type {
   DatabaseRowCell,
   DatabaseRowColumn,
   DatabaseRowFilter,
   DatabaseRowFilterOperator,
+  DatabaseRowIdentityValue,
   DatabaseRowReadResult,
   DatabaseRowRecord,
   DatabaseRowTable,
+  DatabaseRowWriteValue,
 } from "@/types/contracts";
 import { cn } from "@/lib/utils";
 
@@ -532,6 +548,11 @@ export function DatabaseDataGrid({
   const entry = useDatabaseRowStore((state) => state.entries[rowKey]);
   const loadRows = useDatabaseRowStore((state) => state.loadRows);
   const cancelRows = useDatabaseRowStore((state) => state.cancelRows);
+  const writeEntry = useDatabaseRowWriteStore((state) => state.entries[rowKey]);
+  const insertRow = useDatabaseRowWriteStore((state) => state.insertRow);
+  const updateRow = useDatabaseRowWriteStore((state) => state.updateRow);
+  const deleteRows = useDatabaseRowWriteStore((state) => state.deleteRows);
+  const clearWriteEntry = useDatabaseRowWriteStore((state) => state.clearEntry);
 
   const [refreshToken, setRefreshToken] = useState(0);
   const [filtersOpen, setFiltersOpen] = useState(false);
@@ -540,6 +561,11 @@ export function DatabaseDataGrid({
   const [searchDraft, setSearchDraft] = useState(grid.search);
   const [columnsOpen, setColumnsOpen] = useState(false);
   const [viewer, setViewer] = useState<ViewerTarget | null>(null);
+  const [insertOpen, setInsertOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
+  const [deleteTargets, setDeleteTargets] = useState<DatabaseRowIdentityValue[][] | null>(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [selectedRows, setSelectedRows] = useState<Set<string>>(() => new Set());
   const [activeCell, setActiveCell] = useState({ row: 0, column: 0 });
   const [resizePreview, setResizePreview] = useState<{ column: string; width: number } | null>(
     null,
@@ -644,6 +670,7 @@ export function DatabaseDataGrid({
   };
 
   function updateGrid(patch: Parameters<typeof setDataGridState>[2]) {
+    setSelectedRows(new Set());
     setDataGridState(profileId, tableKey, patch);
   }
 
@@ -742,6 +769,7 @@ export function DatabaseDataGrid({
   }
 
   function handleRefresh() {
+    setSelectedRows(new Set());
     setRefreshToken((token) => token + 1);
   }
 
@@ -838,6 +866,91 @@ export function DatabaseDataGrid({
     return `${gridId}-r${row}-c${column}`;
   }
 
+  function toggleRowSelection(record: DatabaseRowRecord, selected: boolean) {
+    const key = identityKey(record);
+    setSelectedRows((current) => {
+      const next = new Set(current);
+      if (selected) {
+        next.add(key);
+      } else {
+        next.delete(key);
+      }
+      return next;
+    });
+  }
+
+  function togglePageSelection(selected: boolean) {
+    if (!selected) {
+      setSelectedRows(new Set());
+      return;
+    }
+    setSelectedRows(new Set(rows.map(identityKey)));
+  }
+
+  async function handleInsert(values: Parameters<typeof insertRow>[2]) {
+    if (!result) {
+      return;
+    }
+    const written = await insertRow(profileId, tableRef, values);
+    if (written) {
+      setInsertOpen(false);
+      handleRefresh();
+    }
+  }
+
+  async function handleUpdate(
+    identity: DatabaseRowIdentityValue[],
+    payload: { values: DatabaseRowWriteValue[]; expected: DatabaseRowIdentityValue[] },
+  ) {
+    if (!result) {
+      return;
+    }
+    const written = await updateRow(
+      profileId,
+      tableRef,
+      identity,
+      payload.values,
+      payload.expected,
+    );
+    if (written) {
+      setEditOpen(false);
+      handleRefresh();
+    }
+  }
+
+  async function handleDelete() {
+    const targets = deleteTargets;
+    if (!targets || targets.length === 0) {
+      return;
+    }
+    const written = await deleteRows(profileId, tableRef, targets, true);
+    if (written) {
+      setDeleteOpen(false);
+      setSelectedRows(new Set());
+      handleRefresh();
+    } else {
+      setDeleteOpen(false);
+    }
+  }
+
+  function beginDeleteActive() {
+    if (!activeRecord) {
+      return;
+    }
+    setDeleteTargets([activeRecord.identity]);
+    setDeleteOpen(true);
+  }
+
+  function beginDeleteSelected() {
+    const targets = rows
+      .filter((record) => selectedRows.has(identityKey(record)))
+      .map((record) => record.identity);
+    if (targets.length > 0) {
+      setDeleteTargets(targets);
+      setDeleteOpen(true);
+    }
+  }
+
   const canPrevious = grid.offset > 0;
   const canNext = result?.page.hasMore ?? false;
   const currentPage = Math.floor(grid.offset / grid.limit) + 1;
@@ -845,14 +958,20 @@ export function DatabaseDataGrid({
   const sampleTime = formatSampleTime(entry?.updatedAt);
   const filtersActive = grid.filters.length > 0 || grid.search.length > 0;
   const searchable = result?.columns.some((column) => column.searchable) ?? false;
-  const rowEditingBlocked = result !== undefined && (!result.editable || readOnly);
-  const editReason = !result
-    ? "Load table rows before editing."
-    : readOnly || result.readOnlyReasons.includes("session_read_only")
-      ? "This connection is read-only."
-      : !result.identity.stable
-        ? "Row editing is disabled because this table has no stable primary key or complete unique index."
-        : "Row editing is added in #177.";
+  const rowEditingReason = rowEditingBlockedReason(result, readOnly);
+  const rowEditingBlocked = rowEditingReason !== null;
+  const writePending = writeEntry?.status === "running";
+  const writeResult = writeEntry?.status === "succeeded" ? (writeEntry.result ?? null) : null;
+  const writeError =
+    writeEntry?.status === "failed"
+      ? (writeEntry.errorMessage ?? writeEntry.error?.message ?? "The row write failed.")
+      : null;
+  const writeErrorDetails =
+    writeEntry?.status === "failed" ? (writeEntry.error?.details ?? null) : null;
+  const activeRecord = rows[active.row];
+  const selectedCount = selectedRows.size;
+  const allPageSelected =
+    rows.length > 0 && rows.every((record) => selectedRows.has(identityKey(record)));
 
   if (!connected) {
     return (
@@ -979,9 +1098,54 @@ export function DatabaseDataGrid({
             <ColumnsIcon className="size-3.5" aria-hidden="true" />
             Columns
           </Button>
-          <Button variant="secondary" size="sm" disabled title={editReason} aria-label="Edit row">
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => setInsertOpen(true)}
+            disabled={rowEditingBlocked || writePending}
+            title={
+              rowEditingReason ?? "Insert a row with typed values and explicit NULL/default modes"
+            }
+            aria-label="Insert row"
+          >
+            <PlusIcon className="size-3.5" aria-hidden="true" />
+            Insert row
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => setEditOpen(true)}
+            disabled={rowEditingBlocked || writePending || !activeRecord}
+            title={rowEditingReason ?? "Edit the active row"}
+            aria-label="Edit row"
+          >
             <PencilSimpleIcon className="size-3.5" aria-hidden="true" />
             Edit row
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={beginDeleteActive}
+            disabled={rowEditingBlocked || writePending || !activeRecord}
+            title={rowEditingReason ?? "Delete the active row"}
+            aria-label="Delete row"
+          >
+            <TrashIcon className="size-3.5" aria-hidden="true" />
+            Delete row
+          </Button>
+          <Button
+            variant={selectedCount > 0 ? "destructive" : "secondary"}
+            size="sm"
+            onClick={beginDeleteSelected}
+            disabled={rowEditingBlocked || writePending || selectedCount === 0}
+            title={
+              rowEditingReason ??
+              `Delete ${selectedCount} selected row${selectedCount === 1 ? "" : "s"} after confirmation`
+            }
+            aria-label="Delete selected rows"
+          >
+            <TrashIcon className="size-3.5" aria-hidden="true" />
+            Delete selected ({selectedCount})
           </Button>
         </div>
       </div>
@@ -1306,12 +1470,20 @@ export function DatabaseDataGrid({
           <ProhibitIcon className="mt-0.5 size-3.5 shrink-0 text-warning" aria-hidden="true" />
           <p className="text-[10px] leading-4 text-muted-foreground">
             <span className="font-medium text-warning">Row editing is disabled.</span>{" "}
-            {readOnly || result.readOnlyReasons.includes("session_read_only")
-              ? "This connection is read-only."
-              : "This table has no primary key or complete unique index, so a row cannot be addressed safely."}
+            {rowEditingReason}
           </p>
         </div>
       ) : null}
+
+      {result && !rowEditingBlocked ? <RowWriteInfo /> : null}
+
+      <RowWriteResultBanner
+        result={writeResult}
+        errorMessage={writeError}
+        errorDetails={writeErrorDetails}
+        onDismiss={() => clearWriteEntry(profileId, tableRef)}
+        onRetry={handleRefresh}
+      />
 
       {status === "error" && result ? (
         <Alert variant="destructive" className="py-2.5">
@@ -1413,12 +1585,12 @@ export function DatabaseDataGrid({
                     (resizePreview?.column === column.name
                       ? resizePreview.width
                       : columnWidth(column, grid.columnWidths)),
-                  52,
+                  76,
                 )}px`,
               }}
             >
               <colgroup>
-                <col style={{ width: 52 }} />
+                <col style={{ width: 76 }} />
                 {visibleColumns.map((column) => (
                   <col
                     key={column.name}
@@ -1438,7 +1610,17 @@ export function DatabaseDataGrid({
                     aria-label="Row number"
                     className="border-r border-border/70 px-2 py-1.5 text-right text-[9px] font-medium tracking-wide text-muted-foreground"
                   >
-                    #
+                    <label className="flex items-center justify-end gap-1">
+                      <input
+                        type="checkbox"
+                        className="size-3 accent-[var(--primary)]"
+                        checked={allPageSelected}
+                        disabled={rows.length === 0}
+                        aria-label="Select all rows on this page"
+                        onChange={(event) => togglePageSelection(event.target.checked)}
+                      />
+                      #
+                    </label>
                   </th>
                   {visibleColumns.map((column, columnIndex) => {
                     const direction = sortDirectionFor(grid.sort, column.name);
@@ -1558,7 +1740,16 @@ export function DatabaseDataGrid({
                         aria-colindex={1}
                         className="border-r border-border/70 px-2 py-1.5 text-right font-mono text-[9px] font-normal text-muted-foreground/70"
                       >
-                        {(grid.offset + rowIndex + 1).toLocaleString("en-US")}
+                        <label className="flex items-center justify-end gap-1">
+                          <input
+                            type="checkbox"
+                            className="size-3 accent-[var(--primary)]"
+                            checked={selectedRows.has(key)}
+                            aria-label={`Select row ${grid.offset + rowIndex + 1}`}
+                            onChange={(event) => toggleRowSelection(record, event.target.checked)}
+                          />
+                          {(grid.offset + rowIndex + 1).toLocaleString("en-US")}
+                        </label>
                       </th>
                       {visibleColumns.map((column, columnIndex) => {
                         const cell = record.cells[columnIndex];
@@ -1670,6 +1861,82 @@ export function DatabaseDataGrid({
           </div>
         </div>
       </div>
+
+      {insertOpen ? (
+        <InsertRowDialog
+          open
+          onOpenChange={(open) => {
+            setInsertOpen(open);
+            if (!open) {
+              clearWriteEntry(profileId, tableRef);
+            }
+          }}
+          tableName={table}
+          columns={allColumns}
+          pending={writePending}
+          error={writeError}
+          onInsert={(values) => void handleInsert(values)}
+        />
+      ) : null}
+
+      {editOpen && result ? (
+        <EditRowDialog
+          key={activeRecord ? identityKey(activeRecord) : "empty"}
+          open
+          onOpenChange={(open) => {
+            setEditOpen(open);
+            if (!open) {
+              clearWriteEntry(profileId, tableRef);
+            }
+          }}
+          tableName={table}
+          result={result}
+          record={activeRecord ?? null}
+          pending={writePending}
+          error={writeError}
+          onUpdate={(identity, payload) => {
+            if (typeof payload !== "string") {
+              void handleUpdate(identity, payload);
+            }
+          }}
+        />
+      ) : null}
+
+      <ConfirmDialog
+        open={deleteOpen}
+        onOpenChange={(open) => {
+          if (!open && !writePending) {
+            setDeleteOpen(false);
+            clearWriteEntry(profileId, tableRef);
+          }
+        }}
+        title={
+          deleteTargets?.length === 1
+            ? `Delete 1 row from ${table}?`
+            : `Delete ${deleteTargets?.length ?? 0} rows from ${table}?`
+        }
+        description="Only the selected row identities are deleted. The delete runs in one transaction and reports the affected rows after verification."
+        confirmLabel={deleteTargets?.length === 1 ? "Delete row" : "Delete rows"}
+        details={[
+          { label: "Connection", value: profileName },
+          {
+            label: "Table",
+            value: `${database ?? "active database"}${schema ? ` / ${schema}` : ""} / ${table}`,
+          },
+          { label: "Rows", value: String(deleteTargets?.length ?? 0) },
+          {
+            label: "Scope",
+            value:
+              deleteTargets?.length === 1
+                ? "Single row by stable identity"
+                : "Bulk delete scoped to the selected stable identities",
+          },
+        ]}
+        warningTitle="This permanently deletes the selected rows."
+        warningDescription="No table-wide or predicate-based delete is accepted. The transaction rolls back if any selected row is missing or changed."
+        onConfirm={() => void handleDelete()}
+        pending={writePending}
+      />
 
       <ColumnSettingsDialog
         open={columnsOpen}
