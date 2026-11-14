@@ -711,8 +711,8 @@ Tauri boundary.
 ## Row browsing commands
 
 `src-tauri/src/commands/database/rows.rs` owns the data-browser backend
-contract. The data grid itself is #176; this slice provides bounded reads and
-the typed state the grid consumes.
+contract. The React data grid consumes it from the Data tab; this slice provides
+bounded reads and the typed state the grid consumes.
 
 | Command                    | Purpose                                                      |
 | -------------------------- | ------------------------------------------------------------ |
@@ -855,7 +855,13 @@ unknown state.
 `src/services/databaseRows.ts` is the only React module that invokes the
 commands. `src/stores/databaseRowStore.ts` owns one current page per
 connection/table, query state, in-flight request ids, stale-response rejection,
-cancelled state, and profile resets. The data grid UI is #176.
+cancelled state, and profile resets. `src/features/databases/DatabaseDataGrid.tsx`
+is the Data tab grid: it owns server-side pagination, sort, filters, search,
+column visibility and widths, typed value rendering, the JSON/long-text/binary
+viewer, loading/empty/error/disconnected states, and keyboard navigation.
+Per-table grid state lives in the owning connection tab
+(`src/stores/databaseWorkspaceStore.ts`), so switching connections cannot share
+page, sort, filter, or column settings.
 
 ### Tests
 
