@@ -15,6 +15,7 @@ pub mod mysql;
 pub mod pagination;
 pub mod postgres;
 pub mod row_service;
+pub mod row_writes;
 pub mod rows;
 pub mod service;
 pub mod structure;
@@ -45,6 +46,11 @@ pub use pagination::{
 };
 pub use postgres::PostgresDatabaseAdapter;
 pub use row_service::DatabaseRowService;
+pub use row_writes::{
+    MAX_ROW_WRITE_TARGETS, MAX_ROW_WRITE_TEXT_CHARACTERS, MAX_ROW_WRITE_VALUES, RowDeleteRequest,
+    RowInsertRequest, RowTransactionState, RowUpdateRequest, RowValueMode, RowWriteOperation,
+    RowWriteResult, RowWriteValue,
+};
 pub use rows::{
     DEFAULT_ROW_PAGE_LIMIT, DEFAULT_ROW_QUERY_TIMEOUT, MAX_ROW_CELL_CHARACTERS, MAX_ROW_COLUMNS,
     MAX_ROW_FILTER_VALUE_CHARACTERS, MAX_ROW_FILTER_VALUES, MAX_ROW_FILTERS, MAX_ROW_OFFSET,

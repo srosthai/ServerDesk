@@ -8,7 +8,7 @@
 use std::{collections::HashSet, future::Future};
 
 use sqlx::{
-    MySql, Row,
+    Connection as _, MySql, Row,
     mysql::{MySqlArguments, MySqlConnection, MySqlRow},
     query::Query,
 };
@@ -24,14 +24,20 @@ use super::{
 use crate::database::{
     dialect::{Identifier, IdentifierQuoter, ParameterizedQuery, QualifiedName, SqlValue},
     errors::DatabaseError,
-    rows::{
-        MAX_ROW_CELL_CHARACTERS, MAX_ROW_COLUMNS, RowColumn, RowExactCount, RowFilterOperator,
-        RowFilterValue, RowQueryControl, RowReadPlan, RowReadRequest, RowReadResult,
-        RowSortDirection, RowTableMetadata, UniqueIndexCandidate, contains_pattern,
-        ends_with_pattern, infer_row_identity, is_bit_type, is_spatial_type, projected_outputs,
-        resolve_read_plan, row_from_values, sql_value_for_column, starts_with_pattern,
+    row_writes::{
+        ResolvedInsert, ResolvedUpdate, ResolvedWriteValue, RowDeleteRequest, RowInsertRequest,
+        RowUpdateRequest, RowWriteOperation, RowWriteResult, resolve_delete, resolve_insert,
+        resolve_update, rolled_back, text_matches_column,
     },
-    traits::ColumnIdentity,
+    rows::{
+        MAX_ROW_CELL_CHARACTERS, MAX_ROW_COLUMNS, RowColumn, RowColumnKind, RowExactCount,
+        RowFilterOperator, RowFilterValue, RowIdentityValue, RowQueryControl, RowReadPlan,
+        RowReadRequest, RowReadResult, RowRecord, RowSortDirection, RowTableMetadata,
+        UniqueIndexCandidate, contains_pattern, ends_with_pattern, infer_row_identity, is_bit_type,
+        is_spatial_type, projected_outputs, resolve_read_plan, row_from_values,
+        sql_value_for_column, starts_with_pattern,
+    },
+    traits::{ColumnIdentity, TableRef},
 };
 
 const DEFAULT_ESTIMATE_INDEX_LIMIT: i64 = 1_024;
@@ -352,17 +358,17 @@ pub fn build_count_query(
     build_count_query_for_plan(metadata, &plan)
 }
 
-/// Runs one bounded row read on a live MySQL connection.
-pub async fn read_rows(
+/// Loads live column and identity metadata for one table. Both row reads and
+/// writes use this path so an edit can never address a column the grid did not
+/// see.
+pub(crate) async fn load_table_metadata(
     connection: &mut MySqlConnection,
-    request: &RowReadRequest,
+    table: &TableRef,
     control: &RowQueryControl,
-    session_read_only: bool,
-) -> Result<RowReadResult, DatabaseError> {
-    request.validate()?;
-    let deadline = Instant::now() + control.timeout.max(std::time::Duration::from_millis(1));
-    let database = requested_database(&request.table)?;
-    let table_name = request.table.name.as_str();
+    deadline: Instant,
+) -> Result<RowTableMetadata, DatabaseError> {
+    let database = requested_database(table)?;
+    let table_name = table.name.as_str();
 
     let estimate_rows = bounded_query(
         control,
@@ -408,9 +414,9 @@ pub async fn read_rows(
     )
     .await?;
 
-    let metadata = metadata_from_records(
+    metadata_from_records(
         resolved_database,
-        request.table.name.clone(),
+        table.name.clone(),
         estimated_rows,
         column_rows
             .iter()
@@ -420,7 +426,19 @@ pub async fn read_rows(
             .iter()
             .map(MysqlRowIndexRecord::from_row)
             .collect::<Result<Vec<_>, _>>()?,
-    )?;
+    )
+}
+
+/// Runs one bounded row read on a live MySQL connection.
+pub async fn read_rows(
+    connection: &mut MySqlConnection,
+    request: &RowReadRequest,
+    control: &RowQueryControl,
+    session_read_only: bool,
+) -> Result<RowReadResult, DatabaseError> {
+    request.validate()?;
+    let deadline = Instant::now() + control.timeout.max(std::time::Duration::from_millis(1));
+    let metadata = load_table_metadata(connection, &request.table, control, deadline).await?;
 
     let plan = resolve_read_plan(request, &metadata)?;
     let identity_columns = metadata.identity_indices();
@@ -467,6 +485,713 @@ pub async fn read_rows(
         exact_rows,
         session_read_only,
     ))
+}
+
+/// Runs one verified insert in a MySQL transaction.
+pub async fn insert_row(
+    connection: &mut MySqlConnection,
+    request: &RowInsertRequest,
+    control: &RowQueryControl,
+    session_read_only: bool,
+) -> Result<RowWriteResult, DatabaseError> {
+    request.validate()?;
+    if session_read_only {
+        return Err(DatabaseError::permission(
+            "The database session is read-only; row inserts are disabled.",
+        ));
+    }
+    let deadline = Instant::now() + control.timeout.max(std::time::Duration::from_millis(1));
+    let metadata = load_table_metadata(connection, &request.table, control, deadline).await?;
+    let plan = resolve_insert(request, &metadata)?;
+    let insert = build_insert_query(&metadata, &plan)?;
+
+    let mut tx = begin_transaction(connection, deadline).await?;
+    let outcome = run_insert(&mut tx, &metadata, &plan, &insert, control, deadline).await;
+    match outcome {
+        Ok(row) => {
+            commit_transaction(tx, deadline).await?;
+            let verification = if row.is_some() {
+                format!(
+                    "Inserted 1 row into {} and re-read it by its stable identity.",
+                    table_label(&metadata)
+                )
+            } else {
+                format!(
+                    "Inserted 1 row into {} and verified the affected row count. The generated \
+                     identity was not available for a re-read.",
+                    table_label(&metadata)
+                )
+            };
+            Ok(RowWriteResult::committed(
+                RowWriteOperation::Insert,
+                table_ref(&metadata),
+                1,
+                verification,
+                row,
+            ))
+        }
+        Err(error) => Err(fail_and_rollback(tx, error, deadline).await),
+    }
+}
+
+/// Runs one guarded update in a MySQL transaction.
+pub async fn update_row(
+    connection: &mut MySqlConnection,
+    request: &RowUpdateRequest,
+    control: &RowQueryControl,
+    session_read_only: bool,
+) -> Result<RowWriteResult, DatabaseError> {
+    request.validate()?;
+    if session_read_only {
+        return Err(DatabaseError::permission(
+            "The database session is read-only; row updates are disabled.",
+        ));
+    }
+    let deadline = Instant::now() + control.timeout.max(std::time::Duration::from_millis(1));
+    let metadata = load_table_metadata(connection, &request.table, control, deadline).await?;
+    let plan = resolve_update(request, &metadata)?;
+    let update = build_update_query(&metadata, &plan)?;
+
+    let mut tx = begin_transaction(connection, deadline).await?;
+    let outcome = run_update(&mut tx, &metadata, &plan, &update, control, deadline).await;
+    match outcome {
+        Ok(row) => {
+            commit_transaction(tx, deadline).await?;
+            Ok(RowWriteResult::committed(
+                RowWriteOperation::Update,
+                table_ref(&metadata),
+                1,
+                format!(
+                    "Updated 1 row in {} and re-read the changed values.",
+                    table_label(&metadata)
+                ),
+                row,
+            ))
+        }
+        Err(error) => Err(fail_and_rollback(tx, error, deadline).await),
+    }
+}
+
+/// Runs one explicit, scoped delete in a MySQL transaction.
+pub async fn delete_rows(
+    connection: &mut MySqlConnection,
+    request: &RowDeleteRequest,
+    control: &RowQueryControl,
+    session_read_only: bool,
+) -> Result<RowWriteResult, DatabaseError> {
+    request.validate()?;
+    if session_read_only {
+        return Err(DatabaseError::permission(
+            "The database session is read-only; row deletes are disabled.",
+        ));
+    }
+    let deadline = Instant::now() + control.timeout.max(std::time::Duration::from_millis(1));
+    let metadata = load_table_metadata(connection, &request.table, control, deadline).await?;
+    let plan = resolve_delete(request, &metadata)?;
+    let query = build_delete_query(&metadata, &plan)?;
+    let target_count = u64::try_from(plan.targets.len()).unwrap_or(u64::MAX);
+
+    let mut tx = begin_transaction(connection, deadline).await?;
+    let outcome = run_delete(
+        &mut tx,
+        &metadata,
+        &plan,
+        &query,
+        target_count,
+        control,
+        deadline,
+    )
+    .await;
+    match outcome {
+        Ok(affected) => {
+            commit_transaction(tx, deadline).await?;
+            Ok(RowWriteResult::committed(
+                RowWriteOperation::Delete,
+                table_ref(&metadata),
+                affected,
+                format!(
+                    "Deleted {affected} row{} from {} and verified the targets are absent.",
+                    if affected == 1 { "" } else { "s" },
+                    table_label(&metadata)
+                ),
+                None,
+            ))
+        }
+        Err(error) => Err(fail_and_rollback(tx, error, deadline).await),
+    }
+}
+
+pub struct RowInsertQuery {
+    pub query: ParameterizedQuery,
+    pub identity_columns: Vec<usize>,
+    pub auto_increment: Option<usize>,
+}
+
+fn push_bound_write_value(
+    query: &mut ParameterizedQuery,
+    column: &RowColumn,
+    value: SqlValue,
+) -> Result<(), DatabaseError> {
+    if column.kind == RowColumnKind::Json {
+        query.push_sql("CAST(");
+        query.push_value(&MYSQL_DIALECT, value)?;
+        query.push_sql(" AS JSON)");
+    } else {
+        query.push_value(&MYSQL_DIALECT, value)?;
+    }
+    Ok(())
+}
+
+/// Builds one parameterized `INSERT`. MySQL has no `RETURNING`, so a supplied
+/// identity is reused and a single `AUTO_INCREMENT` column uses
+/// `last_insert_id()` after execution.
+pub fn build_insert_query(
+    metadata: &RowTableMetadata,
+    plan: &ResolvedInsert,
+) -> Result<RowInsertQuery, DatabaseError> {
+    let mut query = ParameterizedQuery::new();
+    query
+        .push_sql("INSERT INTO ")
+        .push_qualified_name(&MYSQL_DIALECT, &qualified_table(metadata)?);
+    if plan.values.is_empty() {
+        query.push_sql(" () VALUES ()");
+    } else {
+        query.push_sql(" (");
+        for (position, value) in plan.values.iter().enumerate() {
+            if position > 0 {
+                query.push_sql(", ");
+            }
+            let column = metadata.column(value.column)?;
+            query.push_identifier(&MYSQL_DIALECT, &column.name);
+        }
+        query.push_sql(") VALUES (");
+        for (position, value) in plan.values.iter().enumerate() {
+            if position > 0 {
+                query.push_sql(", ");
+            }
+            let column = metadata.column(value.column)?;
+            match &value.value {
+                ResolvedWriteValue::Null => {
+                    query.push_sql("NULL");
+                }
+                ResolvedWriteValue::Default => {
+                    query.push_sql("DEFAULT");
+                }
+                ResolvedWriteValue::Value(bound) => {
+                    push_bound_write_value(&mut query, column, bound.clone())?;
+                }
+            }
+        }
+        query.push_sql(")");
+    }
+
+    let identity_columns = metadata.identity_indices();
+    let auto_increment = (identity_columns.len() == 1
+        && metadata.columns[identity_columns[0]].identity == ColumnIdentity::AutoIncrement)
+        .then_some(identity_columns[0]);
+
+    Ok(RowInsertQuery {
+        query,
+        identity_columns,
+        auto_increment,
+    })
+}
+
+fn push_identity_predicate(
+    query: &mut ParameterizedQuery,
+    metadata: &RowTableMetadata,
+    identity: &[(usize, SqlValue, String)],
+) -> Result<(), DatabaseError> {
+    for (position, (index, value, _)) in identity.iter().enumerate() {
+        if position > 0 {
+            query.push_sql(" AND ");
+        }
+        let column = metadata.column(*index)?;
+        query
+            .push_identifier(&MYSQL_DIALECT, &column.name)
+            .push_sql(" = ")
+            .push_value(&MYSQL_DIALECT, value.clone())?;
+    }
+    Ok(())
+}
+
+/// Builds one guarded `UPDATE` using MySQL's null-safe `<=>` comparison for
+/// every original value.
+pub fn build_update_query(
+    metadata: &RowTableMetadata,
+    plan: &ResolvedUpdate,
+) -> Result<ParameterizedQuery, DatabaseError> {
+    let mut query = ParameterizedQuery::new();
+    query
+        .push_sql("UPDATE ")
+        .push_qualified_name(&MYSQL_DIALECT, &qualified_table(metadata)?)
+        .push_sql(" SET ");
+    for (position, value) in plan.values.iter().enumerate() {
+        if position > 0 {
+            query.push_sql(", ");
+        }
+        let column = metadata.column(value.column)?;
+        query
+            .push_identifier(&MYSQL_DIALECT, &column.name)
+            .push_sql(" = ");
+        match &value.value {
+            ResolvedWriteValue::Null => {
+                query.push_sql("NULL");
+            }
+            ResolvedWriteValue::Default => {
+                return Err(DatabaseError::validation(
+                    "Update fields cannot use the default mode.",
+                ));
+            }
+            ResolvedWriteValue::Value(bound) => {
+                push_bound_write_value(&mut query, column, bound.clone())?;
+            }
+        }
+    }
+    query.push_sql(" WHERE ");
+    push_identity_predicate(&mut query, metadata, &plan.identity)?;
+    for expected in &plan.expected {
+        let column = metadata.column(expected.column)?;
+        query.push_sql(" AND ");
+        query.push_identifier(&MYSQL_DIALECT, &column.name);
+        query.push_sql(" <=> ");
+        match &expected.value {
+            None => {
+                query.push_sql("NULL");
+            }
+            Some(value) => {
+                let (bound, _) = crate::database::row_writes::resolve_text_value(column, value)?;
+                push_bound_write_value(&mut query, column, bound)?;
+            }
+        }
+    }
+    Ok(query)
+}
+
+/// Builds one explicit target-scoped `DELETE`.
+pub fn build_delete_query(
+    metadata: &RowTableMetadata,
+    plan: &crate::database::row_writes::ResolvedDelete,
+) -> Result<ParameterizedQuery, DatabaseError> {
+    let mut query = ParameterizedQuery::new();
+    query
+        .push_sql("DELETE FROM ")
+        .push_qualified_name(&MYSQL_DIALECT, &qualified_table(metadata)?)
+        .push_sql(" WHERE ");
+    for (position, target) in plan.targets.iter().enumerate() {
+        if position > 0 {
+            query.push_sql(" OR ");
+        }
+        query.push_sql("(");
+        push_identity_predicate(&mut query, metadata, target)?;
+        query.push_sql(")");
+    }
+    Ok(query)
+}
+
+fn build_count_matching_query(
+    metadata: &RowTableMetadata,
+    targets: &[Vec<(usize, SqlValue, String)>],
+) -> Result<ParameterizedQuery, DatabaseError> {
+    let mut query = ParameterizedQuery::new();
+    query
+        .push_sql("SELECT COUNT(*) AS total FROM ")
+        .push_qualified_name(&MYSQL_DIALECT, &qualified_table(metadata)?)
+        .push_sql(" WHERE ");
+    for (position, target) in targets.iter().enumerate() {
+        if position > 0 {
+            query.push_sql(" OR ");
+        }
+        query.push_sql("(");
+        push_identity_predicate(&mut query, metadata, target)?;
+        query.push_sql(")");
+    }
+    Ok(query)
+}
+
+fn build_row_query(
+    metadata: &RowTableMetadata,
+    identity: &[(usize, SqlValue, String)],
+    selected: &[usize],
+    truncate_display: bool,
+) -> Result<crate::database::rows::RowSelectQuery, DatabaseError> {
+    let identity_columns = metadata.identity_indices();
+    let outputs = selected
+        .iter()
+        .map(|index| crate::database::rows::RowOutputColumn {
+            column: *index,
+            visible: true,
+            truncate: truncate_display && !identity_columns.contains(index),
+        })
+        .collect::<Vec<_>>();
+    let mut query = ParameterizedQuery::new();
+    query.push_sql("SELECT ");
+    for (position, output) in outputs.iter().enumerate() {
+        if position > 0 {
+            query.push_sql(", ");
+        }
+        let column = metadata.column(output.column)?;
+        query
+            .push_sql(&cell_expression(column, output.truncate))
+            .push_sql(" AS ")
+            .push_identifier(&MYSQL_DIALECT, &alias(position));
+    }
+    query
+        .push_sql(" FROM ")
+        .push_qualified_name(&MYSQL_DIALECT, &qualified_table(metadata)?)
+        .push_sql(" WHERE ");
+    push_identity_predicate(&mut query, metadata, identity)?;
+    query.push_sql(" LIMIT 2");
+
+    Ok(crate::database::rows::RowSelectQuery {
+        query,
+        outputs,
+        visible_columns: selected.to_vec(),
+        identity_columns,
+    })
+}
+
+async fn fetch_row(
+    tx: &mut sqlx::MySqlConnection,
+    metadata: &RowTableMetadata,
+    identity: &[(usize, SqlValue, String)],
+    selected: &[usize],
+    truncate_display: bool,
+    control: &RowQueryControl,
+    deadline: Instant,
+) -> Result<Option<RowRecord>, DatabaseError> {
+    let select = build_row_query(metadata, identity, selected, truncate_display)?;
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(select.query.sql().to_string()));
+    query = bind_values(query, select.query.values());
+    let rows = bounded_query(control, deadline, query.fetch_all(&mut *tx)).await?;
+    if rows.len() > 1 {
+        return Err(DatabaseError::query(
+            "The stable row identity matched more than one row.",
+        ));
+    }
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let mut values = Vec::with_capacity(select.outputs.len());
+    for index in 0..select.outputs.len() {
+        values.push(row.try_get::<Option<String>, _>(index).map_err(|error| {
+            map_sqlx_error(error).with_details("A written row could not be decoded as text.")
+        })?);
+    }
+    row_from_values(metadata, &select.outputs, values).map(Some)
+}
+
+fn supplied_identity(
+    metadata: &RowTableMetadata,
+    plan: &ResolvedInsert,
+) -> Result<Option<Vec<RowIdentityValue>>, DatabaseError> {
+    let mut identity = Vec::with_capacity(metadata.identity.columns.len());
+    for index in metadata.identity_indices() {
+        let Some(value) = plan.values.iter().find(|value| value.column == index) else {
+            return Ok(None);
+        };
+        let column = metadata.column(index)?;
+        match &value.value {
+            ResolvedWriteValue::Value(_) => identity.push(RowIdentityValue {
+                column: column.name.clone(),
+                value: value.text.clone(),
+            }),
+            ResolvedWriteValue::Null | ResolvedWriteValue::Default => return Ok(None),
+        }
+    }
+    if identity.len() != metadata.identity.columns.len() {
+        return Ok(None);
+    }
+    Ok(Some(identity))
+}
+
+async fn run_insert(
+    tx: &mut sqlx::MySqlConnection,
+    metadata: &RowTableMetadata,
+    plan: &ResolvedInsert,
+    insert: &RowInsertQuery,
+    control: &RowQueryControl,
+    deadline: Instant,
+) -> Result<Option<RowRecord>, DatabaseError> {
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(insert.query.sql().to_string()));
+    query = bind_values(query, insert.query.values());
+    let result = bounded_query(control, deadline, query.execute(&mut *tx)).await?;
+    if result.rows_affected() != 1 {
+        return Err(DatabaseError::query(
+            "The insert did not affect exactly one row; the transaction was rolled back.",
+        ));
+    }
+
+    let supplied = supplied_identity(metadata, plan)?;
+    let identity = match supplied {
+        Some(identity) => identity,
+        None => {
+            let Some(index) = insert.auto_increment else {
+                return Ok(None);
+            };
+            let generated = result.last_insert_id();
+            if generated == 0 {
+                return Ok(None);
+            }
+            let column = metadata.column(index)?;
+            vec![RowIdentityValue {
+                column: column.name.clone(),
+                value: Some(generated.to_string()),
+            }]
+        }
+    };
+    let resolved = crate::database::row_writes::resolve_identity_for_lookup(metadata, &identity)?;
+    let all_columns = (0..metadata.columns.len()).collect::<Vec<_>>();
+    let reread = fetch_row(
+        tx,
+        metadata,
+        &resolved,
+        &all_columns,
+        true,
+        control,
+        deadline,
+    )
+    .await?;
+    if reread.is_none() {
+        return Err(DatabaseError::query(
+            "The inserted row could not be re-read by its stable identity; the transaction was \
+             rolled back.",
+        ));
+    }
+    Ok(reread)
+}
+
+async fn run_update(
+    tx: &mut sqlx::MySqlConnection,
+    metadata: &RowTableMetadata,
+    plan: &ResolvedUpdate,
+    query: &ParameterizedQuery,
+    control: &RowQueryControl,
+    deadline: Instant,
+) -> Result<Option<RowRecord>, DatabaseError> {
+    let mut statement = sqlx::query(sqlx::AssertSqlSafe(query.sql().to_string()));
+    statement = bind_values(statement, query.values());
+    let result = bounded_query(control, deadline, statement.execute(&mut *tx)).await?;
+    if result.rows_affected() > 1 {
+        return Err(DatabaseError::query(
+            "The stable row identity matched more than one row; the update was rolled back.",
+        ));
+    }
+
+    let selected = plan
+        .values
+        .iter()
+        .map(|value| value.column)
+        .chain(plan.identity.iter().map(|(index, _, _)| *index))
+        .collect::<Vec<_>>();
+    let changed = fetch_row(
+        tx,
+        metadata,
+        &plan.identity,
+        &selected,
+        false,
+        control,
+        deadline,
+    )
+    .await?;
+    let Some(changed) = changed else {
+        return Err(conflict(
+            "The row no longer exists. It may have been deleted by another session.",
+        ));
+    };
+
+    // MySQL reports changed rows rather than matched rows, so an unchanged
+    // value also yields zero. Compare the guards to distinguish an idempotent
+    // retry from a concurrent change that already wrote the requested value.
+    if result.rows_affected() == 0 {
+        for expected in &plan.expected {
+            let Some(position) = plan
+                .values
+                .iter()
+                .position(|value| value.column == expected.column)
+            else {
+                return Err(conflict(
+                    "The row changed in another session before this update could be applied.",
+                ));
+            };
+            let column = metadata.column(expected.column)?;
+            let actual = changed
+                .cells
+                .get(position)
+                .and_then(|cell| cell.value.as_deref());
+            let matches = match (&expected.value, actual) {
+                (None, None) => true,
+                (Some(expected), Some(actual)) => {
+                    text_matches_column(column, expected, actual) == Some(true)
+                }
+                _ => false,
+            };
+            if !matches {
+                return Err(conflict(
+                    "The row changed in another session before this update could be applied.",
+                ));
+            }
+        }
+    }
+
+    for (position, value) in plan.values.iter().enumerate() {
+        let column = metadata.column(value.column)?;
+        let actual = changed
+            .cells
+            .get(position)
+            .and_then(|cell| cell.value.as_deref());
+        match (&value.value, actual) {
+            (ResolvedWriteValue::Null, None) => {}
+            (ResolvedWriteValue::Null, Some(_)) => {
+                return Err(conflict(
+                    "The row changed in another session before this update could be applied.",
+                ));
+            }
+            (ResolvedWriteValue::Value(_), None) => {
+                return Err(conflict(
+                    "The row changed in another session before this update could be applied.",
+                ));
+            }
+            (ResolvedWriteValue::Value(_), Some(actual)) => {
+                if let Some(text) = &value.text
+                    && text_matches_column(column, text, actual) == Some(false)
+                {
+                    return Err(conflict(
+                        "The row changed in another session before this update could be applied.",
+                    ));
+                }
+            }
+            (ResolvedWriteValue::Default, _) => {}
+        }
+    }
+
+    let all_columns = (0..metadata.columns.len()).collect::<Vec<_>>();
+    fetch_row(
+        tx,
+        metadata,
+        &plan.identity,
+        &all_columns,
+        true,
+        control,
+        deadline,
+    )
+    .await
+}
+
+async fn run_delete(
+    tx: &mut sqlx::MySqlConnection,
+    metadata: &RowTableMetadata,
+    plan: &crate::database::row_writes::ResolvedDelete,
+    query: &ParameterizedQuery,
+    target_count: u64,
+    control: &RowQueryControl,
+    deadline: Instant,
+) -> Result<u64, DatabaseError> {
+    let mut statement = sqlx::query(sqlx::AssertSqlSafe(query.sql().to_string()));
+    statement = bind_values(statement, query.values());
+    let result = bounded_query(control, deadline, statement.execute(&mut *tx)).await?;
+    let affected = result.rows_affected();
+    if affected != target_count {
+        return Err(conflict(
+            "One or more selected rows no longer exist or were changed in another session. No rows were deleted.",
+        ));
+    }
+
+    let count_query = build_count_matching_query(metadata, &plan.targets)?;
+    let mut count_statement = sqlx::query(sqlx::AssertSqlSafe(count_query.sql().to_string()));
+    count_statement = bind_values(count_statement, count_query.values());
+    let count_row = bounded_query(control, deadline, count_statement.fetch_one(&mut *tx)).await?;
+    let remaining: i64 = decode(&count_row, "total")?;
+    if remaining != 0 {
+        return Err(conflict(
+            "The deleted rows are still present after the delete. The transaction was rolled back.",
+        ));
+    }
+    Ok(affected)
+}
+
+fn conflict(message: &str) -> DatabaseError {
+    DatabaseError::dependency(message)
+}
+
+fn table_ref(metadata: &RowTableMetadata) -> TableRef {
+    TableRef {
+        database: metadata
+            .database
+            .as_deref()
+            .and_then(|value| Identifier::new(value).ok()),
+        schema: metadata
+            .schema
+            .as_deref()
+            .and_then(|value| Identifier::new(value).ok()),
+        name: metadata.table.clone(),
+    }
+}
+
+fn table_label(metadata: &RowTableMetadata) -> String {
+    let mut label = String::new();
+    if let Some(database) = metadata.database.as_deref() {
+        label.push_str(database);
+        label.push('.');
+    }
+    if let Some(schema) = metadata.schema.as_deref()
+        && Some(schema) != metadata.database.as_deref()
+    {
+        label.push_str(schema);
+        label.push('.');
+    }
+    label.push_str(metadata.table.as_str());
+    label
+}
+
+async fn begin_transaction(
+    connection: &mut MySqlConnection,
+    deadline: Instant,
+) -> Result<sqlx::Transaction<'_, MySql>, DatabaseError> {
+    tokio::time::timeout_at(deadline, connection.begin())
+        .await
+        .map_err(|_| {
+            DatabaseError::timeout("The database did not start a transaction within the timeout.")
+        })?
+        .map_err(map_sqlx_error)
+}
+
+async fn commit_transaction(
+    tx: sqlx::Transaction<'_, MySql>,
+    deadline: Instant,
+) -> Result<(), DatabaseError> {
+    let outcome = tokio::time::timeout_at(deadline, tx.commit()).await;
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(map_sqlx_error(error).with_details(
+            "The transaction commit could not be confirmed. Re-read the row before retrying.",
+        )),
+        Err(_) => Err(DatabaseError::timeout(
+            "The database did not confirm the transaction commit within the timeout.",
+        )
+        .with_details(
+            "The transaction commit could not be confirmed. Re-read the row before retrying.",
+        )),
+    }
+}
+
+async fn fail_and_rollback(
+    tx: sqlx::Transaction<'_, MySql>,
+    error: DatabaseError,
+    deadline: Instant,
+) -> DatabaseError {
+    let confirmed = tokio::time::timeout_at(deadline, tx.rollback())
+        .await
+        .map(|result| result.is_ok())
+        .unwrap_or(false);
+    if confirmed {
+        rolled_back(error)
+    } else {
+        error.with_details(
+            "The transaction rollback could not be confirmed. No row was reported as changed; \
+             re-read the row before retrying.",
+        )
+    }
 }
 
 pub(crate) fn count_is_filtered(request: &RowReadRequest) -> bool {

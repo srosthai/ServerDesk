@@ -1003,12 +1003,24 @@ against a PostgreSQL 18 container.
   but not rows or foreign keys. Copying data is deferred to the import/export
   slice so a duplicate cannot unexpectedly copy a large table.
 - MySQL table row counts are engine estimates (`TABLE_ROWS`); they are not exact.
-- The row browser reads base tables, not views. Row-level insert, edit, and
-  delete are deferred to the editing slice; this slice only exposes stable
-  identity and read-only markers.
+- The row browser and row editor read base tables, not views. A table without a
+  stable primary key or complete non-null unique index stays read-only for
+  insert, update, and delete.
 - Row-browser cells are text representations. Non-identity cells longer than
   4,096 characters are returned as an explicit truncated value; identity values
   are read in full. Binary values are base64 and spatial values are WKT.
+- Row writes validate typed values against live column metadata, bind every
+  value as a parameter, and distinguish an empty string, SQL NULL, and DEFAULT.
+  Update conflict guards compare the original value of each changed column; a
+  concurrent change rolls the transaction back instead of overwriting newer
+  data. Delete accepts only explicit stable identities and requires a
+  confirmation that names the exact target count.
+- Generated columns and `GENERATED ALWAYS` identity columns cannot receive
+  explicit insert values. Columns with an unsupported or ambiguous type are
+  rejected for editing rather than coerced.
+- A committed write is reported as committed only after the affected-row count
+  and row re-read verification pass. A write whose commit cannot be confirmed
+  reports an unknown outcome and asks the user to re-read the row.
 - Exact row counts run a separate `COUNT(*)` and can be expensive on large
   tables; they are opt-in and share the request timeout.
 - MySQL prefix unique indexes and PostgreSQL partial/expression unique indexes
@@ -1028,8 +1040,8 @@ against a PostgreSQL 18 container.
 - Index column expressions are reported in the same ordered `columns` list as
   plain columns; the first version does not separately type expression versus
   column entries.
-- Real query execution, transactions, cancellation, streaming, and row editing
-  are follow-up work. The SQL tab owns a per-connection draft and result panel,
+- Real SQL query execution, streaming result sets, and cancellation are
+  follow-up work. The SQL tab owns a per-connection draft and result panel,
   but its Run action stays disabled until the query commands land.
 - Workspace tabs live in frontend memory for the current application run. The
   selected database, SQL draft, and result document are restored across

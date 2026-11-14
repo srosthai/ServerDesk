@@ -17,12 +17,13 @@ use serverdesk_lib::{
         ColumnDefaultRequest, ColumnDefinitionRequest, ColumnIdentity, ConstraintKind,
         ConstraintRequest, DatabaseAction, DatabaseActionRequest, DatabaseAdapter,
         DatabaseConnectRequest, DatabaseErrorKind, DatabasePassword, Identifier, MetadataScope,
-        MetadataValue, PageRequest, PostgresDatabaseAdapter, ReferentialAction, RowFilter,
-        RowFilterOperator, RowFilterValue, RowIdentityKind, RowPageRequest, RowQueryControl,
-        RowQueryRegistry, RowReadOnlyReason, RowReadRequest, RowSearch, RowSort, RowSortDirection,
-        StructureActionRequest, TableOptionsRequest, TableRef, UniqueKeyRequest,
-        execute_structure_with_adapter, execute_with_adapter, preview_structure_with_adapter,
-        preview_with_adapter,
+        MetadataValue, PageRequest, PostgresDatabaseAdapter, ReferentialAction, RowDeleteRequest,
+        RowFilter, RowFilterOperator, RowFilterValue, RowIdentityKind, RowInsertRequest,
+        RowPageRequest, RowQueryControl, RowQueryRegistry, RowReadOnlyReason, RowReadRequest,
+        RowSearch, RowSort, RowSortDirection, RowTransactionState, RowUpdateRequest, RowValueMode,
+        RowWriteOperation, RowWriteValue, StructureActionRequest, TableOptionsRequest, TableRef,
+        UniqueKeyRequest, execute_structure_with_adapter, execute_with_adapter,
+        preview_structure_with_adapter, preview_with_adapter,
     },
     storage::DatabaseEngine,
 };
@@ -1346,5 +1347,246 @@ async fn live_postgres_row_browser_filters_sorts_counts_casts_cancels_and_flags_
         .await;
     }
 
+    adapter.close().await.expect("close fixture");
+}
+
+#[tokio::test]
+async fn live_postgres_row_writes_insert_update_conflict_delete_and_rollback() {
+    let Some(fixture) = LivePostgres::from_env() else {
+        eprintln!("skipping live PostgreSQL row write test: fixture environment is not set");
+        return;
+    };
+
+    let mut adapter = PostgresDatabaseAdapter::new();
+    adapter
+        .connect(fixture.request(false))
+        .await
+        .expect("connect to fixture");
+
+    let table = "serverdesk_row_write_ops";
+    let table_ref = TableRef::new(Some(&fixture.database), Some("public"), table).expect("table");
+    let _ = execute_structure_with_adapter(
+        &mut adapter,
+        StructureActionRequest::DropTable {
+            database: Some(fixture.database.clone()),
+            schema: Some("public".to_string()),
+            name: table.to_string(),
+        },
+        true,
+    )
+    .await;
+
+    execute_structure_with_adapter(
+        &mut adapter,
+        StructureActionRequest::CreateTable {
+            database: Some(fixture.database.clone()),
+            schema: Some("public".to_string()),
+            name: table.to_string(),
+            columns: vec![
+                ColumnDefinitionRequest {
+                    name: "id".to_string(),
+                    data_type: "bigint".to_string(),
+                    nullable: false,
+                    default: None,
+                    comment: None,
+                    generated: None,
+                    identity: Some(ColumnIdentity::Always),
+                },
+                ColumnDefinitionRequest {
+                    name: "name".to_string(),
+                    data_type: "text".to_string(),
+                    nullable: false,
+                    default: None,
+                    comment: None,
+                    generated: None,
+                    identity: None,
+                },
+                ColumnDefinitionRequest {
+                    name: "note".to_string(),
+                    data_type: "text".to_string(),
+                    nullable: true,
+                    default: None,
+                    comment: None,
+                    generated: None,
+                    identity: None,
+                },
+                ColumnDefinitionRequest {
+                    name: "score".to_string(),
+                    data_type: "integer".to_string(),
+                    nullable: false,
+                    default: Some(ColumnDefaultRequest::Number {
+                        value: "0".to_string(),
+                    }),
+                    comment: None,
+                    generated: None,
+                    identity: None,
+                },
+                ColumnDefinitionRequest {
+                    name: "created_at".to_string(),
+                    data_type: "timestamp with time zone".to_string(),
+                    nullable: false,
+                    default: Some(ColumnDefaultRequest::CurrentTimestamp),
+                    comment: None,
+                    generated: None,
+                    identity: None,
+                },
+            ],
+            primary_key: vec!["id".to_string()],
+            unique_keys: Vec::new(),
+            options: None,
+        },
+        false,
+    )
+    .await
+    .expect("create row-write table");
+
+    let inserted = adapter
+        .insert_row(
+            &RowInsertRequest {
+                table: table_ref.clone(),
+                values: vec![
+                    RowWriteValue {
+                        column: Identifier::new("name").expect("name"),
+                        mode: RowValueMode::Value,
+                        value: Some("ann".to_string()),
+                    },
+                    RowWriteValue {
+                        column: Identifier::new("note").expect("note"),
+                        mode: RowValueMode::Null,
+                        value: None,
+                    },
+                    RowWriteValue {
+                        column: Identifier::new("score").expect("score"),
+                        mode: RowValueMode::Default,
+                        value: None,
+                    },
+                    RowWriteValue {
+                        column: Identifier::new("created_at").expect("created_at"),
+                        mode: RowValueMode::Default,
+                        value: None,
+                    },
+                ],
+            },
+            &RowQueryControl::default(),
+        )
+        .await
+        .expect("insert row");
+    assert_eq!(inserted.operation, RowWriteOperation::Insert);
+    assert_eq!(inserted.transaction, RowTransactionState::Committed);
+    assert_eq!(inserted.affected_rows, 1);
+    let inserted_row = inserted.row.expect("inserted row re-read");
+    let id = inserted_row
+        .identity
+        .iter()
+        .find(|entry| entry.column == Identifier::new("id").expect("id"))
+        .and_then(|entry| entry.value.clone())
+        .expect("generated identity");
+    assert!(id.parse::<i64>().is_ok());
+    assert_eq!(inserted_row.cells[1].value.as_deref(), Some("ann"));
+    assert!(inserted_row.cells[2].value.is_none());
+    assert_eq!(inserted_row.cells[3].value.as_deref(), Some("0"));
+    assert!(inserted_row.cells[4].value.is_some());
+
+    let empty = adapter
+        .insert_row(
+            &RowInsertRequest {
+                table: table_ref.clone(),
+                values: vec![RowWriteValue {
+                    column: Identifier::new("name").expect("name"),
+                    mode: RowValueMode::Value,
+                    value: Some(String::new()),
+                }],
+            },
+            &RowQueryControl::default(),
+        )
+        .await
+        .expect("insert empty name");
+    assert_eq!(
+        empty.row.expect("empty row").cells[1].value.as_deref(),
+        Some("")
+    );
+
+    let update = RowUpdateRequest {
+        table: table_ref.clone(),
+        identity: vec![serverdesk_lib::database::RowIdentityValue {
+            column: Identifier::new("id").expect("id"),
+            value: Some(id.clone()),
+        }],
+        values: vec![RowWriteValue {
+            column: Identifier::new("name").expect("name"),
+            mode: RowValueMode::Value,
+            value: Some("ann updated".to_string()),
+        }],
+        expected: vec![serverdesk_lib::database::RowIdentityValue {
+            column: Identifier::new("name").expect("name"),
+            value: Some("ann".to_string()),
+        }],
+    };
+    let updated = adapter
+        .update_row(&update, &RowQueryControl::default())
+        .await
+        .expect("update row");
+    assert_eq!(updated.transaction, RowTransactionState::Committed);
+    assert_eq!(
+        updated.row.expect("updated row").cells[1].value.as_deref(),
+        Some("ann updated")
+    );
+
+    let conflict = adapter
+        .update_row(&update, &RowQueryControl::default())
+        .await
+        .expect_err("stale update must conflict");
+    assert_eq!(conflict.kind, DatabaseErrorKind::Dependency);
+    assert!(
+        conflict
+            .details
+            .as_deref()
+            .is_some_and(|details| details.contains("rolled back"))
+    );
+
+    let deleted = adapter
+        .delete_rows(
+            &RowDeleteRequest {
+                table: table_ref.clone(),
+                targets: vec![vec![serverdesk_lib::database::RowIdentityValue {
+                    column: Identifier::new("id").expect("id"),
+                    value: Some(id),
+                }]],
+            },
+            &RowQueryControl::default(),
+        )
+        .await
+        .expect("delete row");
+    assert_eq!(deleted.operation, RowWriteOperation::Delete);
+    assert_eq!(deleted.affected_rows, 1);
+
+    let read = adapter
+        .read_rows(
+            &RowReadRequest {
+                table: table_ref,
+                page: RowPageRequest::try_new(10, 0).expect("page"),
+                visible_columns: Vec::new(),
+                sort: Vec::new(),
+                filters: Vec::new(),
+                search: None,
+                include_exact_count: true,
+            },
+            &RowQueryControl::default(),
+        )
+        .await
+        .expect("read after delete");
+    assert_eq!(read.rows.len(), 1);
+    assert_eq!(read.rows[0].cells[1].value.as_deref(), Some(""));
+
+    let _ = execute_structure_with_adapter(
+        &mut adapter,
+        StructureActionRequest::DropTable {
+            database: Some(fixture.database.clone()),
+            schema: Some("public".to_string()),
+            name: table.to_string(),
+        },
+        true,
+    )
+    .await;
     adapter.close().await.expect("close fixture");
 }
