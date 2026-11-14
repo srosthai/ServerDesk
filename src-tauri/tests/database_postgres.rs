@@ -17,12 +17,13 @@ use serverdesk_lib::{
         ColumnDefaultRequest, ColumnDefinitionRequest, ColumnIdentity, ConstraintKind,
         ConstraintRequest, DatabaseAction, DatabaseActionRequest, DatabaseAdapter,
         DatabaseConnectRequest, DatabaseErrorKind, DatabasePassword, Identifier, MetadataScope,
-        MetadataValue, PageRequest, PostgresDatabaseAdapter, ReferentialAction, RowDeleteRequest,
-        RowFilter, RowFilterOperator, RowFilterValue, RowIdentityKind, RowInsertRequest,
-        RowPageRequest, RowQueryControl, RowQueryRegistry, RowReadOnlyReason, RowReadRequest,
-        RowSearch, RowSort, RowSortDirection, RowTransactionState, RowUpdateRequest, RowValueMode,
-        RowWriteOperation, RowWriteValue, StructureActionRequest, TableOptionsRequest, TableRef,
-        UniqueKeyRequest, execute_structure_with_adapter, execute_with_adapter,
+        MetadataValue, PageRequest, PostgresDatabaseAdapter, QueryControl, QueryRegistry,
+        QueryRequest, ReferentialAction, RowDeleteRequest, RowFilter, RowFilterOperator,
+        RowFilterValue, RowIdentityKind, RowInsertRequest, RowPageRequest, RowQueryControl,
+        RowQueryRegistry, RowReadOnlyReason, RowReadRequest, RowSearch, RowSort, RowSortDirection,
+        RowTransactionState, RowUpdateRequest, RowValueMode, RowWriteOperation, RowWriteValue,
+        StructureActionRequest, TableOptionsRequest, TableRef, UniqueKeyRequest,
+        execute_query_with_adapter, execute_structure_with_adapter, execute_with_adapter,
         preview_structure_with_adapter, preview_with_adapter,
     },
     storage::DatabaseEngine,
@@ -1589,4 +1590,112 @@ async fn live_postgres_row_writes_insert_update_conflict_delete_and_rollback() {
     )
     .await;
     adapter.close().await.expect("close fixture");
+}
+
+fn live_query_control(request: &QueryRequest) -> QueryControl {
+    QueryControl::new(Duration::from_secs(10), None, request.max_rows)
+}
+
+#[tokio::test]
+async fn live_postgres_sql_execution_selects_writes_limits_cancels_times_out_and_maps_errors() {
+    let Some(fixture) = LivePostgres::from_env() else {
+        eprintln!("skipping live PostgreSQL SQL execution test: fixture environment is not set");
+        return;
+    };
+
+    let mut adapter = PostgresDatabaseAdapter::new();
+    adapter
+        .connect(fixture.request(false))
+        .await
+        .expect("connect writable fixture");
+
+    for sql in [
+        "CREATE TEMP TABLE serverdesk_sql_exec (id integer PRIMARY KEY, name text)",
+        "INSERT INTO serverdesk_sql_exec (id, name) VALUES (1, 'ann') RETURNING id",
+    ] {
+        let request = QueryRequest::try_new(sql, None).expect("request");
+        execute_query_with_adapter(&adapter, &request, false, &live_query_control(&request))
+            .await
+            .expect("write SQL");
+    }
+
+    let request = QueryRequest::try_new(
+        "SELECT id, name FROM serverdesk_sql_exec ORDER BY id; SELECT 2 AS second",
+        None,
+    )
+    .expect("select request");
+    let result =
+        execute_query_with_adapter(&adapter, &request, false, &live_query_control(&request))
+            .await
+            .expect("multi result select");
+    assert_eq!(result.engine, DatabaseEngine::Postgresql);
+    assert_eq!(result.results.len(), 2);
+    assert_eq!(result.results[0].columns[0].name, "id");
+    assert_eq!(result.results[0].rows[0][1].value.as_deref(), Some("ann"));
+    assert_eq!(result.results[1].rows[0][0].value.as_deref(), Some("2"));
+
+    let request = QueryRequest::try_new(
+        "SELECT 1 AS value UNION ALL SELECT 2 UNION ALL SELECT 3",
+        Some(2),
+    )
+    .expect("limit request");
+    let result =
+        execute_query_with_adapter(&adapter, &request, false, &live_query_control(&request))
+            .await
+            .expect("limited select");
+    assert_eq!(result.results[0].returned_rows, 2);
+    assert!(result.results[0].truncated);
+    assert!(result.truncated);
+
+    let registry = QueryRegistry::default();
+    let guard = registry.begin("live-postgres-sql-cancel").expect("begin");
+    guard.cancellation().cancel();
+    let request = QueryRequest::try_new("SELECT pg_sleep(1)", None).expect("cancel request");
+    let control = QueryControl::new(
+        Duration::from_secs(10),
+        Some(guard.cancellation()),
+        request.max_rows,
+    );
+    let error = execute_query_with_adapter(&adapter, &request, false, &control)
+        .await
+        .expect_err("cancelled SQL");
+    assert_eq!(error.kind, DatabaseErrorKind::Cancelled);
+
+    let request = QueryRequest::try_new("SELEC 1", None).expect("bad SQL");
+    let error =
+        execute_query_with_adapter(&adapter, &request, false, &live_query_control(&request))
+            .await
+            .expect_err("rejected SQL");
+    assert_eq!(error.kind, DatabaseErrorKind::Query);
+    assert_eq!(error.database_code(), Some("42601"));
+    assert!(error.position().is_some());
+    assert!(error.duration_ms().is_some());
+
+    let drop_request =
+        QueryRequest::try_new("DROP TABLE serverdesk_sql_exec", None).expect("drop request");
+    let error = execute_query_with_adapter(
+        &adapter,
+        &drop_request,
+        false,
+        &live_query_control(&drop_request),
+    )
+    .await
+    .expect_err("unconfirmed drop");
+    assert_eq!(error.kind, DatabaseErrorKind::Cancelled);
+    execute_query_with_adapter(
+        &adapter,
+        &drop_request,
+        true,
+        &live_query_control(&drop_request),
+    )
+    .await
+    .expect("confirmed drop");
+
+    let timeout_request = QueryRequest::try_new("SELECT pg_sleep(5)", None).expect("timeout SQL");
+    let timeout_control = QueryControl::new(Duration::from_millis(200), None, 10);
+    let error = execute_query_with_adapter(&adapter, &timeout_request, false, &timeout_control)
+        .await
+        .expect_err("timed out SQL");
+    assert_eq!(error.kind, DatabaseErrorKind::Timeout);
+    assert!(!adapter.is_connected());
 }

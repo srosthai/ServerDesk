@@ -26,7 +26,8 @@ use tokio::{
 use crate::storage::DatabaseEngine;
 
 use super::{
-    MYSQL_DIALECT, actions as engine_actions, ddl as engine_ddl, rows as engine_rows, sql,
+    MYSQL_DIALECT, actions as engine_actions, ddl as engine_ddl, queries as engine_queries,
+    rows as engine_rows, sql,
 };
 use crate::database::{
     actions::{DatabaseDdlPreview, ValidatedDatabaseAction},
@@ -34,6 +35,7 @@ use crate::database::{
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
     pagination::{Bounded, Page, PageRequest},
+    queries::{QueryControl, QueryExecutionResult, QueryRequest},
     row_writes::{RowDeleteRequest, RowInsertRequest, RowUpdateRequest, RowWriteResult},
     rows::{RowQueryControl, RowReadRequest, RowReadResult},
     structure::{StructureDdlPreview, ValidatedStructureAction},
@@ -892,6 +894,33 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
         ))
     }
 
+    async fn execute_query(
+        &self,
+        request: &QueryRequest,
+        control: &QueryControl,
+    ) -> Result<QueryExecutionResult, DatabaseError> {
+        self.require_capability(DatabaseAction::RunQuery)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let result =
+            engine_queries::execute_query(connection, request, control, self.read_only).await;
+
+        if matches!(&result, Err(error) if matches!(
+            error.kind,
+            crate::database::DatabaseErrorKind::Cancelled
+                | crate::database::DatabaseErrorKind::Timeout
+                | crate::database::DatabaseErrorKind::Connection
+        )) {
+            // Dropping a streaming query future can leave the protocol stream
+            // in an unknown state. Close the session instead of risking a later
+            // statement reading leftover packets.
+            self.connected.store(false, Ordering::SeqCst);
+            drop(guard.take());
+        }
+
+        result
+    }
+
     async fn read_rows(
         &self,
         request: &RowReadRequest,
@@ -1595,6 +1624,13 @@ fn map_mysql_error(number: Option<u16>, sql_state: Option<&str>) -> DatabaseErro
     // Diagnostics contain only the engine error number and SQLSTATE. Server
     // messages are deliberately omitted because they can echo account names,
     // connection details, or values from the statement.
+    let code = number
+        .map(|number| number.to_string())
+        .or_else(|| sql_state.map(str::to_string));
+    let error = match code {
+        Some(code) => error.with_database_code(code),
+        None => error,
+    };
     error.with_details(driver_identifier(number, sql_state))
 }
 
@@ -1720,9 +1756,10 @@ mod tests {
     #[test]
     fn query_diagnostics_are_redacted_and_bounded() {
         let error = map_mysql_error(Some(1064), Some("42000"));
-        let details = error.details.expect("details");
+        let details = error.details.as_ref().expect("details");
 
         assert_eq!(error.kind, DatabaseErrorKind::Query);
+        assert_eq!(error.database_code(), Some("1064"));
         assert!(!details.contains("super-secret-token"));
         assert!(details.contains("1064"));
     }
