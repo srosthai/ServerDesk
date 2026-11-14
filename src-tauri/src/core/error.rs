@@ -53,7 +53,25 @@ impl ErrorScope {
     }
 }
 
+/// Optional structured diagnostics carried by app errors. The boxed container
+/// keeps the common `Result` error size small while serializing these fields at
+/// the error's top level when present.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorDiagnostics {
+    /// Engine-native error code when the failure came from a database.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_code: Option<String>,
+    /// One-based statement position when the engine reports one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<u32>,
+    /// Time spent before the failure, when a caller measured it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppError {
     pub code: ErrorCode,
     pub message: String,
@@ -61,6 +79,8 @@ pub struct AppError {
     pub details: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<ErrorScope>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Box<ErrorDiagnostics>>,
 }
 
 impl AppError {
@@ -70,6 +90,7 @@ impl AppError {
             message: sanitize_diagnostic(message.into()),
             details: None,
             scope: None,
+            diagnostics: None,
         }
     }
 
@@ -81,6 +102,47 @@ impl AppError {
     pub fn with_scope(mut self, object: impl Into<String>, name: impl Into<String>) -> Self {
         self.scope = Some(ErrorScope::new(object, name));
         self
+    }
+
+    fn diagnostics_mut(&mut self) -> &mut ErrorDiagnostics {
+        self.diagnostics
+            .get_or_insert_with(|| Box::new(ErrorDiagnostics::default()))
+    }
+
+    pub fn with_database_code(mut self, code: impl Into<String>) -> Self {
+        let code = code.into();
+        if !code.trim().is_empty() {
+            self.diagnostics_mut().database_code = Some(sanitize_diagnostic(code));
+        }
+        self
+    }
+
+    pub fn with_position(mut self, position: u32) -> Self {
+        self.diagnostics_mut().position = Some(position);
+        self
+    }
+
+    pub fn with_duration_ms(mut self, duration_ms: u64) -> Self {
+        self.diagnostics_mut().duration_ms = Some(duration_ms);
+        self
+    }
+
+    pub fn database_code(&self) -> Option<&str> {
+        self.diagnostics
+            .as_deref()
+            .and_then(|diagnostics| diagnostics.database_code.as_deref())
+    }
+
+    pub fn position(&self) -> Option<u32> {
+        self.diagnostics
+            .as_deref()
+            .and_then(|diagnostics| diagnostics.position)
+    }
+
+    pub fn duration_ms(&self) -> Option<u64> {
+        self.diagnostics
+            .as_deref()
+            .and_then(|diagnostics| diagnostics.duration_ms)
     }
 
     pub fn validation(message: impl Into<String>) -> Self {
@@ -204,6 +266,19 @@ mod tests {
         assert_eq!(value["code"], "timeout");
         assert_eq!(value["message"], "Connection timed out");
         assert_eq!(value["details"], "Timed out after 10s");
+    }
+
+    #[test]
+    fn serializes_query_diagnostics_at_the_top_level() {
+        let error = AppError::query("The SQL statement was rejected.")
+            .with_database_code("42601")
+            .with_position(8)
+            .with_duration_ms(12);
+        let value = serde_json::to_value(error).expect("serialized error");
+
+        assert_eq!(value["databaseCode"], "42601");
+        assert_eq!(value["position"], 8);
+        assert_eq!(value["durationMs"], 12);
     }
 
     #[test]

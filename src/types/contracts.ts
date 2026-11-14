@@ -33,6 +33,12 @@ export type CommandError = {
   message: string;
   details?: string;
   scope?: ErrorScope;
+  /** Engine-native code (MySQL error number or PostgreSQL SQLSTATE). */
+  databaseCode?: string;
+  /** One-based statement position when the engine reports one. */
+  position?: number;
+  /** Time spent before the failure, when the backend measured it. */
+  durationMs?: number;
 };
 
 export type AppInfo = {
@@ -743,6 +749,74 @@ export type DatabaseRowWriteResult = {
   verification: string;
   transaction: DatabaseRowTransactionState;
   row?: DatabaseRowRecord;
+};
+
+export type DatabaseQueryWarningCode =
+  | "drop"
+  | "truncate"
+  | "delete_without_where"
+  | "update_without_where"
+  | "delete_broad_predicate"
+  | "update_broad_predicate";
+
+export type DatabaseQueryWarning = {
+  code: DatabaseQueryWarningCode;
+  /** One-based statement position inside the submitted SQL. */
+  statementIndex: number;
+  message: string;
+};
+
+export type DatabaseSqlAnalysis = {
+  engine: DatabaseEngine;
+  statementCount: number;
+  hasWrites: boolean;
+  destructive: boolean;
+  requiresConfirmation: boolean;
+  warnings: DatabaseQueryWarning[];
+};
+
+export type DatabaseQueryColumn = {
+  name: string;
+  dataType: string;
+};
+
+export type DatabaseQueryCell = {
+  value: string | null;
+  truncated: boolean;
+};
+
+export type DatabaseQueryResultSet = {
+  index: number;
+  columns: DatabaseQueryColumn[];
+  rows: DatabaseQueryCell[][];
+  returnedRows: number;
+  affectedRows: number | null;
+  lastInsertId: number | null;
+  truncated: boolean;
+  columnsTruncated: boolean;
+};
+
+export type DatabaseQueryExecutionResult = {
+  engine: DatabaseEngine;
+  readOnly: boolean;
+  results: DatabaseQueryResultSet[];
+  warnings: DatabaseQueryWarning[];
+  destructive: boolean;
+  requiresConfirmation: boolean;
+  truncated: boolean;
+  maxRows: number;
+  durationMs: number;
+};
+
+export type DatabaseQueryCancellationResult = {
+  requestId: string;
+  cancelled: boolean;
+};
+
+export type DatabaseQueryOptions = {
+  maxRows?: number;
+  timeoutMs?: number;
+  confirmed?: boolean;
 };
 
 export type DatabaseExplorerNode =

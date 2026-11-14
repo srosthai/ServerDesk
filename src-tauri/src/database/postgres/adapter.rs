@@ -25,7 +25,8 @@ use tokio::{
 use crate::storage::DatabaseEngine;
 
 use super::{
-    POSTGRES_DIALECT, actions as engine_actions, ddl as engine_ddl, rows as engine_rows, sql,
+    POSTGRES_DIALECT, actions as engine_actions, ddl as engine_ddl, queries as engine_queries,
+    rows as engine_rows, sql,
 };
 use crate::database::{
     actions::{DatabaseDdlPreview, ValidatedDatabaseAction},
@@ -33,6 +34,7 @@ use crate::database::{
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
     pagination::{Bounded, Page, PageRequest},
+    queries::{QueryControl, QueryExecutionResult, QueryRequest},
     row_writes::{RowDeleteRequest, RowInsertRequest, RowUpdateRequest, RowWriteResult},
     rows::{RowQueryControl, RowReadRequest, RowReadResult},
     structure::{StructureDdlPreview, ValidatedStructureAction},
@@ -896,6 +898,32 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
         Ok(Page::from_items(constraints, page, None))
     }
 
+    async fn execute_query(
+        &self,
+        request: &QueryRequest,
+        control: &QueryControl,
+    ) -> Result<QueryExecutionResult, DatabaseError> {
+        self.require_capability(DatabaseAction::RunQuery)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let result =
+            engine_queries::execute_query(connection, request, control, self.read_only).await;
+
+        if matches!(&result, Err(error) if matches!(
+            error.kind,
+            crate::database::DatabaseErrorKind::Cancelled
+                | crate::database::DatabaseErrorKind::Timeout
+                | crate::database::DatabaseErrorKind::Connection
+        )) {
+            // A dropped streaming query future can leave the protocol stream
+            // in an unknown state. Close the session instead of reusing it.
+            self.connected.store(false, Ordering::SeqCst);
+            drop(guard.take());
+        }
+
+        result
+    }
+
     async fn read_rows(
         &self,
         request: &RowReadRequest,
@@ -1475,7 +1503,15 @@ pub(crate) fn map_sqlx_error(error: sqlx::Error) -> DatabaseError {
             if let Some(postgres_error) =
                 database_error.try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
             {
-                return map_postgres_error(postgres_error.code());
+                let position = match postgres_error.position() {
+                    Some(sqlx::postgres::PgErrorPosition::Original(position)) => {
+                        u32::try_from(position).ok()
+                    }
+                    // An internal position points into a generated statement
+                    // (for example a PL/pgSQL body), not the user's SQL.
+                    Some(sqlx::postgres::PgErrorPosition::Internal { .. }) | None => None,
+                };
+                return map_postgres_error(postgres_error.code(), position);
             }
             DatabaseError::query(DRIVER_FAILURE_MESSAGE)
                 .with_details("The database driver reported an unmapped database error.")
@@ -1512,7 +1548,7 @@ pub(crate) fn map_sqlx_error(error: sqlx::Error) -> DatabaseError {
     }
 }
 
-fn map_postgres_error(sql_state: &str) -> DatabaseError {
+fn map_postgres_error(sql_state: &str, position: Option<u32>) -> DatabaseError {
     let error = match sql_state {
         // 28P01 invalid password, 28000 invalid authorization specification.
         "28P01" | "28000" => DatabaseError::database_auth(
@@ -1555,7 +1591,12 @@ fn map_postgres_error(sql_state: &str) -> DatabaseError {
     // Diagnostics contain only the engine SQLSTATE. Server messages are
     // deliberately omitted because they can echo account names, SQL text,
     // connection details, or values from the statement.
-    error.with_details(format!("PostgreSQL SQLSTATE {sql_state}."))
+    let error = error.with_database_code(sql_state);
+    match position {
+        Some(position) => error.with_position(position),
+        None => error,
+    }
+    .with_details(format!("PostgreSQL SQLSTATE {sql_state}."))
 }
 
 #[cfg(test)]
@@ -1645,7 +1686,7 @@ mod tests {
             ("42601", DatabaseErrorKind::Query),
             ("23505", DatabaseErrorKind::Query),
         ] {
-            let error = map_postgres_error(sql_state);
+            let error = map_postgres_error(sql_state, None);
             assert_eq!(error.kind, expected, "PostgreSQL SQLSTATE {sql_state}");
         }
 
@@ -1667,7 +1708,7 @@ mod tests {
 
     #[test]
     fn authentication_errors_do_not_echo_driver_text_or_credentials() {
-        let error = map_postgres_error("28P01");
+        let error = map_postgres_error("28P01", None);
         let debug = format!("{error:?}");
         let serialized = serde_json::to_string(&error).expect("serialized error");
 
@@ -1681,17 +1722,19 @@ mod tests {
 
     #[test]
     fn query_diagnostics_are_redacted_and_bounded() {
-        let error = map_postgres_error("42601");
-        let details = error.details.expect("details");
+        let error = map_postgres_error("42601", Some(8));
+        let details = error.details.as_ref().expect("details");
 
         assert_eq!(error.kind, DatabaseErrorKind::Query);
+        assert_eq!(error.database_code(), Some("42601"));
+        assert_eq!(error.position(), Some(8));
         assert!(!details.contains("super-secret-token"));
         assert!(details.contains("42601"));
     }
 
     #[test]
     fn permission_failures_are_scoped_without_driver_text_or_sql() {
-        let error = map_postgres_error("42501").scoped_permission("table", "users");
+        let error = map_postgres_error("42501", None).scoped_permission("table", "users");
         assert_eq!(error.kind, DatabaseErrorKind::Permission);
         assert_eq!(
             error.scope.as_ref().map(|scope| scope.name.as_str()),

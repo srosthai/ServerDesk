@@ -16,6 +16,7 @@ use super::{
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
     pagination::{Bounded, Page, PageRequest},
+    queries::{QueryControl, QueryExecutionResult, QueryRequest},
     row_writes::{RowDeleteRequest, RowInsertRequest, RowUpdateRequest, RowWriteResult},
     rows::{RowQueryControl, RowReadRequest, RowReadResult},
     structure::{StructureDdlPreview, ValidatedStructureAction},
@@ -515,6 +516,16 @@ pub trait DatabaseAdapter: Send + Sync {
         table: &TableRef,
         page: PageRequest,
     ) -> Result<Page<ConstraintSummary>, DatabaseError>;
+
+    /// Executes one SQL string, which may contain several statements, and
+    /// returns every result set with bounded rows and cells. The control bounds
+    /// the whole request with a timeout, a cancellation handle, and hard result
+    /// limits. A read-only adapter rejects writing statements before they run.
+    async fn execute_query(
+        &self,
+        request: &QueryRequest,
+        control: &QueryControl,
+    ) -> Result<QueryExecutionResult, DatabaseError>;
 
     /// Reads one hard-bounded page of table rows. Filters and search values are
     /// parameterized, sort columns are resolved against live metadata, and the

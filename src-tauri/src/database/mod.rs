@@ -14,6 +14,7 @@ pub mod fake;
 pub mod mysql;
 pub mod pagination;
 pub mod postgres;
+pub mod queries;
 pub mod row_service;
 pub mod row_writes;
 pub mod rows;
@@ -45,6 +46,15 @@ pub use pagination::{
     Bounded, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, MAX_PAGE_OFFSET, Page, PageRequest,
 };
 pub use postgres::PostgresDatabaseAdapter;
+pub use queries::{
+    DEFAULT_QUERY_RESULT_LIMIT, DEFAULT_QUERY_TIMEOUT, DatabaseQueryService,
+    MAX_QUERY_CELL_CHARACTERS, MAX_QUERY_COLUMNS, MAX_QUERY_REQUEST_ID_LENGTH,
+    MAX_QUERY_RESULT_CHARACTERS, MAX_QUERY_RESULT_LIMIT, MAX_QUERY_RESULT_SETS,
+    MAX_QUERY_SQL_CHARACTERS, MAX_QUERY_TIMEOUT, QueryCancellation, QueryCell, QueryColumn,
+    QueryControl, QueryExecutionResult, QueryGuard, QueryRegistry, QueryRequest, QueryResultSet,
+    SqlAnalysis, SqlWarning, SqlWarningCode, analyze_sql, execute_query_with_adapter,
+    query_timeout, validate_query_request_id,
+};
 pub use row_service::DatabaseRowService;
 pub use row_writes::{
     MAX_ROW_WRITE_TARGETS, MAX_ROW_WRITE_TEXT_CHARACTERS, MAX_ROW_WRITE_VALUES, RowDeleteRequest,
