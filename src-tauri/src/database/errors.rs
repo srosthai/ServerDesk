@@ -79,8 +79,28 @@ impl fmt::Display for DatabaseErrorKind {
     }
 }
 
+/// Engine diagnostics that are only present for some failures. Keeping them
+/// behind one boxed value avoids enlarging every `Result` in the database
+/// layer while still serializing the fields at the error's top level.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseDiagnostics {
+    /// Engine-native error code (MySQL error number or PostgreSQL SQLSTATE).
+    /// Server messages are deliberately not forwarded because they can echo
+    /// SQL text, account names, or connection details.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_code: Option<String>,
+    /// One-based character position reported by the engine when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<u32>,
+    /// Time spent before the failure, when the caller measured it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
 /// Structured database failure with bounded, redacted diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DatabaseError {
     pub kind: DatabaseErrorKind,
     pub message: String,
@@ -90,6 +110,8 @@ pub struct DatabaseError {
     /// so a permission error can stay attached to one table or schema.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<ErrorScope>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Box<DatabaseDiagnostics>>,
 }
 
 impl DatabaseError {
@@ -99,12 +121,58 @@ impl DatabaseError {
             message: sanitize_text_bounded(&message.into(), MAX_MESSAGE_LENGTH),
             details: None,
             scope: None,
+            diagnostics: None,
         }
     }
 
     pub fn with_details(mut self, details: impl Into<String>) -> Self {
         self.details = Some(sanitize_text_bounded(&details.into(), MAX_DETAILS_LENGTH));
         self
+    }
+
+    fn diagnostics_mut(&mut self) -> &mut DatabaseDiagnostics {
+        self.diagnostics
+            .get_or_insert_with(|| Box::new(DatabaseDiagnostics::default()))
+    }
+
+    /// Attaches the engine-native error code without changing the kind.
+    pub fn with_database_code(mut self, code: impl Into<String>) -> Self {
+        let code = code.into();
+        if !code.trim().is_empty() {
+            self.diagnostics_mut().database_code =
+                Some(sanitize_text_bounded(&code, MAX_MESSAGE_LENGTH));
+        }
+        self
+    }
+
+    /// Attaches a one-based statement position when the engine reports one.
+    pub fn with_position(mut self, position: u32) -> Self {
+        self.diagnostics_mut().position = Some(position);
+        self
+    }
+
+    /// Attaches the duration measured before the failure.
+    pub fn with_duration_ms(mut self, duration_ms: u64) -> Self {
+        self.diagnostics_mut().duration_ms = Some(duration_ms);
+        self
+    }
+
+    pub fn database_code(&self) -> Option<&str> {
+        self.diagnostics
+            .as_deref()
+            .and_then(|diagnostics| diagnostics.database_code.as_deref())
+    }
+
+    pub fn position(&self) -> Option<u32> {
+        self.diagnostics
+            .as_deref()
+            .and_then(|diagnostics| diagnostics.position)
+    }
+
+    pub fn duration_ms(&self) -> Option<u64> {
+        self.diagnostics
+            .as_deref()
+            .and_then(|diagnostics| diagnostics.duration_ms)
     }
 
     pub fn with_scope(mut self, object: impl Into<String>, name: impl Into<String>) -> Self {
@@ -202,13 +270,28 @@ impl From<DatabaseError> for AppError {
             DatabaseErrorKind::Internal => ErrorCode::Internal,
         };
 
+        let database_code = error.database_code().map(str::to_string);
+        let position = error.position();
+        let duration_ms = error.duration_ms();
         let app_error = AppError::new(code, error.message);
         let app_error = match error.details {
             Some(details) => app_error.with_details(details),
             None => app_error,
         };
-        match error.scope {
+        let app_error = match error.scope {
             Some(scope) => app_error.with_scope(scope.object, scope.name),
+            None => app_error,
+        };
+        let app_error = match database_code {
+            Some(database_code) => app_error.with_database_code(database_code),
+            None => app_error,
+        };
+        let app_error = match position {
+            Some(position) => app_error.with_position(position),
+            None => app_error,
+        };
+        match duration_ms {
+            Some(duration_ms) => app_error.with_duration_ms(duration_ms),
             None => app_error,
         }
     }
@@ -271,6 +354,20 @@ mod tests {
                 app_code
             );
         }
+    }
+
+    #[test]
+    fn structured_query_diagnostics_carry_code_position_and_duration() {
+        let error = DatabaseError::query("The SQL statement was rejected.")
+            .with_database_code("42601")
+            .with_position(8)
+            .with_duration_ms(12);
+        let value = serde_json::to_value(&error).expect("serialized error");
+
+        assert_eq!(value["databaseCode"], "42601");
+        assert_eq!(value["position"], 8);
+        assert_eq!(value["durationMs"], 12);
+        assert_eq!(AppError::from(error.clone()).database_code(), Some("42601"));
     }
 
     #[test]

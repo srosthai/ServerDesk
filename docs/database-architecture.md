@@ -35,6 +35,7 @@ src-tauri/src/commands/database/
   capabilities.rs   engine/version capability document
   discovery.rs      lazy explorer-node metadata commands
   profiles.rs       saved profile CRUD, test, connect, reconnect, disconnect
+  queries.rs        SQL analysis, bounded execution, and cancellation commands
   rows.rs           bounded row reads and cancellation commands
   structure.rs      structure preview and table lifecycle execution + audit
   tunnels.rs        loopback SSH tunnel inspection commands
@@ -45,6 +46,7 @@ src-tauri/src/database/
   actions.rs        lifecycle requests, DDL preview, verified result service
   structure.rs      table/column/index/constraint validation, DDL previews, and table execution
   discovery.rs      explorer-node request/response and metadata service
+  queries.rs        SQL request model, destructive analysis, limits, and cancellation
   row_service.rs    row-read service over the connection registry
   rows.rs           row request model, safe planning, cancellation, and page/result types
   capabilities.rs   action model, flags, version parsing
@@ -59,6 +61,7 @@ src-tauri/src/database/
     ddl.rs          MySQL table/column/index/constraint DDL planning
     adapter.rs      live SQLx MySQL adapter and error mapping
     capabilities.rs MySQL version gates
+    queries.rs      MySQL streaming SQL execution and result decoding
     rows.rs         MySQL row metadata, query builders, and bounded reads
     sql.rs          MySQL-only metadata and row-browser SQL
   postgres/
@@ -67,6 +70,7 @@ src-tauri/src/database/
     ddl.rs          PostgreSQL table/column/index/constraint DDL planning
     adapter.rs      live SQLx PostgreSQL adapter and error mapping
     capabilities.rs PostgreSQL version gates
+    queries.rs      PostgreSQL streaming SQL execution and result decoding
     rows.rs         PostgreSQL row metadata, query builders, and bounded reads
     sql.rs          PostgreSQL-only metadata and row-browser SQL
 ```
@@ -95,6 +99,8 @@ same adapter contract.
 - bounded object counts for one explorer node;
 - hard-bounded, parameterized row reads with stable-identity detection,
   exact/estimated counts, cancellation, and query timeouts;
+- streaming execution of editor-supplied SQL with multiple result sets,
+  affected-row counts, destructive analysis, cancellation, and result limits;
 - capability checks through `require_capability`;
 - connection checks through `require_connection`.
 
@@ -707,6 +713,125 @@ Commands convert `DatabaseError` to `AppError`. `tunnel`, `database_auth`,
 `permission`, and `cancelled` reuse the existing codes. Error messages and
 details are bounded and pass through the central redactor before crossing the
 Tauri boundary.
+
+## SQL execution commands
+
+`src-tauri/src/commands/database/queries.rs` owns the SQL execution backend
+contract used by the SQL workspace. The editor chooses whether to submit the
+current statement or a selection; the backend executes the supplied SQL string
+as-is and never rewrites it.
+
+| Command                | Purpose                                                       |
+| ---------------------- | ------------------------------------------------------------- |
+| `analyze_database_sql` | Detect writes and destructive statements without connecting   |
+| `execute_database_sql` | Execute one SQL string and return bounded result sets         |
+| `cancel_database_sql`  | Cancel one in-flight execution by caller-generated request id |
+
+`execute_database_sql` accepts `profileId`, `requestId`, `sql`, optional
+`maxRows`, optional `timeoutMs`, and `confirmed`. The response carries the
+engine, read-only state, every result set, affected-row and last-insert counts,
+warnings, destructive/confirmation markers, truncation disclosure, the applied
+row limit, and the measured duration:
+
+```json
+{
+  "engine": "postgresql",
+  "readOnly": false,
+  "results": [
+    {
+      "index": 0,
+      "columns": [{ "name": "id", "dataType": "int4" }],
+      "rows": [[{ "value": "1", "truncated": false }]],
+      "returnedRows": 1,
+      "affectedRows": 1,
+      "lastInsertId": null,
+      "truncated": false,
+      "columnsTruncated": false
+    }
+  ],
+  "warnings": [],
+  "destructive": false,
+  "requiresConfirmation": false,
+  "truncated": false,
+  "maxRows": 500,
+  "durationMs": 4
+}
+```
+
+MySQL uses the text protocol with the connection's negotiated multi-statement
+capability; PostgreSQL uses the simple-query protocol. `raw_sql` execution with
+several statements is handled by the server the same way as a script: SQLx's
+documented implicit transaction behavior applies, and MySQL DDL still implicitly
+commits. Each driver event is folded into a result collector, so every statement
+can produce its own row and/or affected-count result.
+
+### Safety and bounds
+
+| Bound                               | Value          |
+| ----------------------------------- | -------------- |
+| Default result rows per statement   | 500            |
+| Maximum result rows per statement   | 5,000 (reject) |
+| Maximum result sets per execution   | 32             |
+| Maximum columns per result set      | 512            |
+| Maximum cell characters             | 16,384         |
+| Maximum characters across all cells | 4,000,000      |
+| Maximum SQL characters              | 1,000,000      |
+| Default / maximum query timeout     | 10 / 30 sec    |
+
+The engine streams rows from the driver. Rows beyond a limit are drained but not
+stored, so memory stays bounded and the protocol stream ends cleanly. A
+truncated cell or result set is always marked `truncated`; the response never
+silently claims a partial result is complete. If more than 32 result sets are
+returned, the extra sets are counted as truncated and discarded.
+
+SQL analysis is conservative and engine-aware. `hasWrites` is true for DML,
+DDL, session-changing statements, data-modifying CTEs, `SELECT ... INTO`, and
+locking reads such as `FOR UPDATE`. A read-only profile rejects these before the
+adapter executes anything. Destructive analysis flags `DROP` and `TRUNCATE`, and
+flags `DELETE`/`UPDATE` that have no top-level `WHERE` or an always-true
+predicate. Destructive SQL returns a typed `cancelled` error unless the caller
+passes `confirmed: true`, so bypassing the UI cannot run it. Warnings name the
+one-based statement index and never echo the SQL text.
+
+Comments, quoted strings, quoted identifiers, MySQL `#` comments, and
+PostgreSQL dollar-quoted strings are excluded from keyword detection. An
+unterminated quote or comment fails validation before execution. Detection is a
+safety aid, not a SQL parser and not a replacement for database privileges.
+
+### Timeouts, cancellation, and errors
+
+The command registers `requestId` before execution and removes it when the call
+finishes. `cancel_database_sql` cancels exactly that request; cancelling a
+finished id is idempotent. A pre-flight cancellation never touches the
+connection. An in-flight cancellation drops the streaming driver future and the
+adapter closes the session, because the protocol stream can no longer be trusted
+for reuse. A timeout follows the same path and returns a distinct `timeout`
+error, so cancellation and expiry are never conflated. Cancellation is bounded
+by the same overall deadline as the query.
+
+Database errors keep the shared typed kinds and add optional structured fields:
+`databaseCode` is the MySQL error number or PostgreSQL SQLSTATE, `position` is
+the one-based error cursor when PostgreSQL reports one for the original query,
+and `durationMs` is measured by the command. Server error messages, SQL text,
+credentials, and connection strings are deliberately not forwarded; they can
+echo sensitive values. Authentication errors remain `database_auth`, read-only
+writes remain `permission`, and stalled statements remain `timeout`.
+
+`src/services/databaseQueries.ts` is the only React module that invokes these
+commands. `src/stores/databaseQueryStore.ts` keeps one analysis/result document
+per connection profile, tracks running and cancelled state, rejects stale
+responses, and preserves structured error metadata. The SQL editor UI is #179.
+
+### Tests
+
+`src-tauri/tests/database_queries.rs` uses the fake adapter for both engines and
+covers SELECT and write execution, multiple result sets, affected counts, row
+and cell limits, read-only rejection before execution, destructive confirmation,
+warnings, timeout versus cancellation, and structured redacted errors. The
+opt-in live MySQL and PostgreSQL suites add real SELECT/write execution,
+multi-statement results, limits, syntax-error code/position mapping,
+cancellation, and timeout on `SLEEP`/`pg_sleep`, including session closure after
+a timeout.
 
 ## Row browsing commands
 
