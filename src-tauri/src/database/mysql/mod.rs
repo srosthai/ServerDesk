@@ -17,6 +17,7 @@ pub mod actions;
 pub mod adapter;
 pub mod capabilities;
 pub mod ddl;
+pub mod queries;
 pub mod rows;
 pub mod sql;
 

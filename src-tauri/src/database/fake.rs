@@ -22,6 +22,10 @@ use super::{
     mysql,
     pagination::{Bounded, Page, PageRequest},
     postgres,
+    queries::{
+        QueryColumn, QueryControl, QueryExecutionResult, QueryRequest, QueryResultCollector,
+        SqlToken, split_sql_statements,
+    },
     row_writes::{
         ResolvedWriteValue, RowDeleteRequest, RowInsertRequest, RowUpdateRequest,
         RowWriteOperation, RowWriteResult, resolve_delete, resolve_insert, resolve_update,
@@ -130,6 +134,8 @@ pub struct FakeDatabaseAdapter {
     row_write_error: Option<DatabaseError>,
     row_write_count: usize,
     row_rollback_count: usize,
+    query_error: Option<DatabaseError>,
+    query_execution_count: AtomicUsize,
 }
 
 impl FakeDatabaseAdapter {
@@ -189,6 +195,8 @@ impl FakeDatabaseAdapter {
             row_write_error: None,
             row_write_count: 0,
             row_rollback_count: 0,
+            query_error: None,
+            query_execution_count: AtomicUsize::new(0),
         }
     }
 
@@ -196,6 +204,16 @@ impl FakeDatabaseAdapter {
     pub fn with_row_table(mut self, table: FakeRowTable) -> Self {
         self.row_tables.push(table);
         self
+    }
+
+    /// Makes every SQL execution fail with a typed database error.
+    pub fn with_query_error(mut self, error: DatabaseError) -> Self {
+        self.query_error = Some(error);
+        self
+    }
+
+    pub fn query_execution_count(&self) -> usize {
+        self.query_execution_count.load(Ordering::SeqCst)
     }
 
     /// Makes every row read fail with a typed database error.
@@ -1706,6 +1724,87 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
                 .unwrap_or_default(),
             page,
         ))
+    }
+
+    async fn execute_query(
+        &self,
+        request: &QueryRequest,
+        control: &QueryControl,
+    ) -> Result<QueryExecutionResult, DatabaseError> {
+        self.require_capability(DatabaseAction::RunQuery)?;
+        self.require_connection()?;
+        self.query_execution_count.fetch_add(1, Ordering::SeqCst);
+
+        if control.is_cancelled() {
+            return Err(DatabaseError::cancelled("The SQL execution was cancelled."));
+        }
+        if let Some(error) = &self.query_error {
+            return Err(error.clone());
+        }
+
+        let analysis = request.analyze(self.engine)?;
+        if self.read_only && analysis.has_writes {
+            return Err(DatabaseError::permission(
+                "The database session is read-only; the SQL attempted a write.",
+            ));
+        }
+
+        let started = std::time::Instant::now();
+        let statements = split_sql_statements(self.engine, &request.sql)?;
+        let mut collector = QueryResultCollector::new(control);
+
+        for statement in statements {
+            let first = statement.tokens.iter().find_map(|token| match token {
+                SqlToken::Word(word) => Some(word.as_str()),
+                SqlToken::Symbol(_) => None,
+            });
+            match first {
+                Some("select" | "show" | "describe" | "desc" | "values" | "table") => {
+                    let many = statement.tokens.iter().any(|token| {
+                        matches!(token, SqlToken::Word(word) if word == "many" || word == "series")
+                    });
+                    let values = if many {
+                        (1..=6).map(|value| value.to_string()).collect::<Vec<_>>()
+                    } else {
+                        vec![
+                            statement
+                                .tokens
+                                .get(1)
+                                .and_then(|token| match token {
+                                    SqlToken::Word(word) => Some(word.clone()),
+                                    SqlToken::Symbol(_) => None,
+                                })
+                                .unwrap_or_else(|| "1".to_string()),
+                        ]
+                    };
+                    let affected = values.len() as u64;
+                    let columns = vec![QueryColumn {
+                        name: "value".to_string(),
+                        data_type: "text".to_string(),
+                    }];
+                    for value in values {
+                        collector.push_row(columns.clone(), vec![Some(value)])?;
+                    }
+                    collector.push_command(affected, None);
+                }
+                Some("insert") => collector.push_command(1, Some(7)),
+                Some("update" | "delete") => collector.push_command(1, None),
+                _ => collector.push_command(0, None),
+            }
+        }
+
+        let (results, truncated) = collector.finish();
+        Ok(QueryExecutionResult {
+            engine: self.engine,
+            read_only: self.read_only,
+            results,
+            warnings: analysis.warnings,
+            destructive: analysis.destructive,
+            requires_confirmation: analysis.requires_confirmation,
+            truncated,
+            max_rows: control.max_rows,
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        })
     }
 
     async fn read_rows(
