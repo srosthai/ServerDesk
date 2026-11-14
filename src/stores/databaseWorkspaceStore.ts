@@ -1,5 +1,9 @@
 import { create } from "zustand";
 import type { DatabaseExplorerSelection } from "@/features/databases/databaseExplorerTreeModel";
+import {
+  DEFAULT_DATA_GRID_STATE,
+  type DatabaseDataGridState,
+} from "@/features/databases/databaseDataGridModel";
 import type { DatabaseEngine, DatabaseProfile } from "@/types/contracts";
 
 export const DATABASE_WORKSPACE_VIEWS = [
@@ -51,6 +55,8 @@ export type DatabaseWorkspaceTab = {
   selection: DatabaseExplorerSelection | null;
   sqlDraft: string;
   sqlResult: DatabaseWorkspaceQueryResult | null;
+  /** Data-grid state is keyed by table and owned by this connection tab. */
+  dataGrid: Record<string, DatabaseDataGridState>;
   tasks: DatabaseWorkspaceTask[];
   openedAt: number;
 };
@@ -66,6 +72,12 @@ type DatabaseWorkspaceStore = {
   setSelection: (profileId: string, selection: DatabaseExplorerSelection | null) => void;
   setSqlDraft: (profileId: string, draft: string) => void;
   setSqlResult: (profileId: string, result: DatabaseWorkspaceQueryResult | null) => void;
+  setDataGridState: (
+    profileId: string,
+    tableKey: string,
+    patch: Partial<DatabaseDataGridState>,
+  ) => void;
+  resetDataGridState: (profileId: string, tableKey: string) => void;
   addTask: (profileId: string, task: DatabaseWorkspaceTask) => void;
   updateTask: (
     profileId: string,
@@ -91,6 +103,7 @@ function tabFromProfile(profile: DatabaseProfile): DatabaseWorkspaceTab {
     selection: null,
     sqlDraft: "",
     sqlResult: null,
+    dataGrid: {},
     tasks: [],
     openedAt: Date.now(),
   };
@@ -212,6 +225,31 @@ export const useDatabaseWorkspaceStore = create<DatabaseWorkspaceStore>((set) =>
 
   setSqlResult: (profileId, result) => {
     set((state) => updateTab(state, profileId, (tab) => ({ ...tab, sqlResult: result })));
+  },
+
+  setDataGridState: (profileId, tableKey, patch) => {
+    set((state) =>
+      updateTab(state, profileId, (tab) => {
+        const current = tab.dataGrid[tableKey] ?? DEFAULT_DATA_GRID_STATE;
+        return {
+          ...tab,
+          dataGrid: {
+            ...tab.dataGrid,
+            [tableKey]: { ...current, ...patch },
+          },
+        };
+      }),
+    );
+  },
+
+  resetDataGridState: (profileId, tableKey) => {
+    set((state) =>
+      updateTab(state, profileId, (tab) => {
+        const dataGrid = { ...tab.dataGrid };
+        delete dataGrid[tableKey];
+        return { ...tab, dataGrid };
+      }),
+    );
   },
 
   addTask: (profileId, task) => {

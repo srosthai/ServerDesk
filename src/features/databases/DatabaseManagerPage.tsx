@@ -33,6 +33,7 @@ import { StatusBadge } from "@/components/ui/status-badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { DatabaseConnectionList, EngineBadge } from "@/features/databases/DatabaseConnectionList";
 import { DatabaseActionDialog } from "@/features/databases/DatabaseActionDialog";
+import { DatabaseDataGrid } from "@/features/databases/DatabaseDataGrid";
 import { DatabaseExplorerTree } from "@/features/databases/DatabaseExplorerTree";
 import {
   DatabaseTableIndexesPanel,
@@ -69,6 +70,7 @@ import { dropDatabase, previewDatabaseAction, setActiveDatabase } from "@/servic
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useDatabaseExplorerStore } from "@/stores/databaseExplorerStore";
 import { useDatabaseProfileStore } from "@/stores/databaseProfileStore";
+import { useDatabaseRowStore } from "@/stores/databaseRowStore";
 import {
   useDatabaseWorkspaceStore,
   type DatabaseWorkspaceTab,
@@ -1546,6 +1548,7 @@ function DatabaseManagerPage() {
     // by profile id, so resetting one cannot touch another connection's tree.
     closeWorkspaceTab(profileId);
     useDatabaseExplorerStore.getState().resetProfile(profileId);
+    useDatabaseRowStore.getState().resetProfile(profileId);
     setStructureIntent(null);
     setTableSummaryOverrides((current) => {
       const next = { ...current };
@@ -1589,6 +1592,7 @@ function DatabaseManagerPage() {
     if (deleted) {
       closeWorkspaceTab(deleteTarget.id);
       useDatabaseExplorerStore.getState().resetProfile(deleteTarget.id);
+      useDatabaseRowStore.getState().resetProfile(deleteTarget.id);
       setNotice(`Deleted ${deleteTarget.name}. The remote database was not changed.`);
       setDeleteTarget(null);
     }
@@ -1899,6 +1903,28 @@ function DatabaseManagerPage() {
                                 }
                               }}
                               onCreateTable={() => setStructureIntent({ type: "create_table" })}
+                            />
+                          )
+                        ) : tab.value === "data" ? (
+                          selectedTableScope && structureProfile ? (
+                            <DatabaseDataGrid
+                              key={`${structureProfile.id}:${selectedTableScope.database ?? ""}:${
+                                selectedTableScope.schema ?? ""
+                              }:${selectedTableScope.table}`}
+                              profileId={structureProfile.id}
+                              profileName={structureProfile.name}
+                              database={selectedTableScope.database ?? null}
+                              schema={selectedTableScope.schema ?? null}
+                              table={selectedTableScope.table}
+                              connected={structureConnected}
+                              readOnly={selectedSnapshot?.readOnly ?? structureProfile.readOnly}
+                              onConnect={() => void handleConnect(structureProfile)}
+                            />
+                          ) : (
+                            <EmptyState
+                              icon={<RowsIcon className="size-4" aria-hidden="true" />}
+                              title="No table selected"
+                              description="Select a table in the explorer to browse its records. Data is read one bounded page at a time and query state stays with this connection tab."
                             />
                           )
                         ) : tab.value === "sql" ? (

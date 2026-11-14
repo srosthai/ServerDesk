@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { dataGridTableKey } from "@/features/databases/databaseDataGridModel";
 import {
   nextActiveTabId,
   useDatabaseWorkspaceStore,
@@ -131,6 +132,59 @@ describe("database workspace store", () => {
       sqlResult: null,
       tasks: [],
     });
+  });
+
+  it("keeps data-grid query and column state scoped to each connection tab", () => {
+    const workspace = useDatabaseWorkspaceStore.getState();
+    workspace.openTab(primary);
+    workspace.openTab(analytics);
+    const usersKey = dataGridTableKey({ database: "app", schema: "public", table: "users" });
+    const ordersKey = dataGridTableKey({ database: "app", schema: "public", table: "orders" });
+
+    useDatabaseWorkspaceStore.getState().setDataGridState(primary.id, usersKey, {
+      offset: 100,
+      limit: 25,
+      sort: [{ column: "created_at", direction: "desc" }],
+      filters: [
+        {
+          column: "email",
+          operator: "contains",
+          value: { kind: "text", value: "example.com" },
+        },
+      ],
+      hiddenColumns: ["notes"],
+      columnWidths: { email: 240 },
+      includeExactCount: true,
+    });
+    useDatabaseWorkspaceStore.getState().setDataGridState(primary.id, ordersKey, {
+      offset: 50,
+    });
+    useDatabaseWorkspaceStore.getState().setDataGridState(analytics.id, usersKey, {
+      offset: 25,
+    });
+
+    expect(useDatabaseWorkspaceStore.getState().tabs[primary.id].dataGrid[usersKey]).toMatchObject({
+      offset: 100,
+      limit: 25,
+      sort: [{ column: "created_at", direction: "desc" }],
+      hiddenColumns: ["notes"],
+      columnWidths: { email: 240 },
+      includeExactCount: true,
+    });
+    expect(useDatabaseWorkspaceStore.getState().tabs[primary.id].dataGrid[ordersKey].offset).toBe(
+      50,
+    );
+    expect(useDatabaseWorkspaceStore.getState().tabs[analytics.id].dataGrid[usersKey].offset).toBe(
+      25,
+    );
+
+    useDatabaseWorkspaceStore.getState().resetDataGridState(primary.id, usersKey);
+    expect(
+      useDatabaseWorkspaceStore.getState().tabs[primary.id].dataGrid[usersKey],
+    ).toBeUndefined();
+    expect(useDatabaseWorkspaceStore.getState().tabs[analytics.id].dataGrid[usersKey].offset).toBe(
+      25,
+    );
   });
 
   it("switches the active tab without mutating either connection", () => {

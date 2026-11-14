@@ -17,6 +17,7 @@ import {
   previewDatabaseStructureAction,
   runDatabaseStructureAction,
 } from "@/services/databaseStructure";
+import { createDatabaseRowRequestId, readTableRows } from "@/services/databaseRows";
 import {
   connectDatabaseProfile,
   deleteDatabaseProfile,
@@ -30,6 +31,7 @@ import type { DatabaseWorkspaceView } from "@/stores/databaseWorkspaceStore";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { databaseExplorerNodeKey, useDatabaseExplorerStore } from "@/stores/databaseExplorerStore";
 import { useDatabaseProfileStore } from "@/stores/databaseProfileStore";
+import { useDatabaseRowStore } from "@/stores/databaseRowStore";
 import { useDatabaseWorkspaceStore } from "@/stores/databaseWorkspaceStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useServerStore } from "@/stores/serverStore";
@@ -42,6 +44,8 @@ import type {
   DatabaseExplorerNodePayload,
   DatabaseIndexSummary,
   DatabaseProfile,
+  DatabaseRowColumn,
+  DatabaseRowReadResult,
   DatabaseStructureActionRequest,
   DatabaseStructureActionResult,
   DatabaseSummary,
@@ -102,6 +106,12 @@ vi.mock("@/services/databaseDiscovery", () => ({
 vi.mock("@/services/databaseStructure", () => ({
   previewDatabaseStructureAction: vi.fn(),
   runDatabaseStructureAction: vi.fn(),
+}));
+
+vi.mock("@/services/databaseRows", () => ({
+  readTableRows: vi.fn(),
+  cancelTableRows: vi.fn(),
+  createDatabaseRowRequestId: vi.fn(),
 }));
 
 const server: ServerProfile = {
@@ -374,6 +384,62 @@ const tablesPayload: DatabaseExplorerNodePayload = {
     offset: 0,
     hasMore: false,
     total: 1,
+  },
+};
+
+function rowColumn(
+  name: string,
+  kind: DatabaseRowColumn["kind"],
+  dataType: string,
+  overrides: Partial<DatabaseRowColumn> = {},
+): DatabaseRowColumn {
+  return {
+    name,
+    dataType,
+    kind,
+    nullable: true,
+    ordinalPosition: 1,
+    primaryKey: false,
+    identity: "none",
+    generated: false,
+    sortable: kind !== "json" && kind !== "binary",
+    filterable: kind !== "json" && kind !== "binary",
+    searchable: kind === "text",
+    ...overrides,
+  };
+}
+
+const rowGridResult: DatabaseRowReadResult = {
+  engine: "postgresql",
+  table: { database: "app", schema: "public", name: "users" },
+  columns: [
+    rowColumn("id", "integer", "bigint", {
+      nullable: false,
+      ordinalPosition: 1,
+      primaryKey: true,
+      identity: "by_default",
+    }),
+    rowColumn("email", "text", "text", { ordinalPosition: 2 }),
+    rowColumn("metadata", "json", "jsonb", { ordinalPosition: 3 }),
+  ],
+  visibleColumns: ["id", "email", "metadata"],
+  identity: { kind: "primary_key", columns: ["id"], stable: true },
+  editable: true,
+  readOnlyReasons: [],
+  rows: [
+    {
+      cells: [
+        { value: "1", truncated: false },
+        { value: "ann@example.com", truncated: false },
+        { value: '{"role":"admin"}', truncated: false },
+      ],
+      identity: [{ column: "id", value: "1" }],
+    },
+  ],
+  page: { limit: 100, offset: 0, returned: 1, hasMore: false },
+  counts: {
+    estimatedTableRows: { status: "available", value: 42 },
+    exactRows: { value: 1, filtered: false },
   },
 };
 
@@ -745,6 +811,9 @@ describe("DatabaseManagerPage", () => {
     });
     useDatabaseExplorerStore.setState({ nodes: {}, error: null, commandError: null });
     useDatabaseWorkspaceStore.setState({ tabs: {}, order: [], activeTabId: null });
+    useDatabaseRowStore.setState({ entries: {} });
+    vi.mocked(createDatabaseRowRequestId).mockReturnValue("row-request-page");
+    vi.mocked(readTableRows).mockResolvedValue(rowGridResult);
     usePreferencesStore.setState({
       preferences: { ...DEFAULT_PREFERENCES },
       status: "unavailable",
@@ -1472,6 +1541,29 @@ describe("DatabaseManagerPage", () => {
     await user.click(screen.getByRole("button", { name: "Try again" }));
 
     expect(fetchServers).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders the bounded data browser for the selected table in the Data tab", async () => {
+    useSelectedTable("data");
+    renderPage();
+
+    expect(screen.getByRole("tab", { name: "Data" })).toHaveAttribute("aria-selected", "true");
+    const grid = await screen.findByRole("grid", { name: "Table data for users" });
+    expect(within(grid).getByText("ann@example.com")).toBeInTheDocument();
+    expect(screen.getByText("~42 est. rows")).toBeInTheDocument();
+    expect(screen.getByText("1 exact")).toBeInTheDocument();
+    expect(readTableRows).toHaveBeenCalledWith(
+      profile.id,
+      { database: "app", schema: "public", table: "users" },
+      expect.objectContaining({
+        limit: 100,
+        offset: 0,
+        sort: [],
+        filters: [],
+        includeExactCount: false,
+      }),
+      "row-request-page",
+    );
   });
 
   it("shows table overview, structure, and indexes for the selected table", async () => {
