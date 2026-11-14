@@ -9,7 +9,9 @@ import {
   createDatabaseRowRequestId,
   readTableRows,
 } from "@/services/databaseRows";
+import { deleteTableRows, insertTableRow, updateTableRow } from "@/services/databaseRowWrites";
 import { useDatabaseRowStore } from "@/stores/databaseRowStore";
+import { useDatabaseRowWriteStore } from "@/stores/databaseRowWriteStore";
 import { useDatabaseWorkspaceStore } from "@/stores/databaseWorkspaceStore";
 import type {
   DatabaseProfile,
@@ -19,12 +21,19 @@ import type {
   DatabaseRowOptions,
   DatabaseRowReadResult,
   DatabaseRowRecord,
+  DatabaseRowWriteResult,
 } from "@/types/contracts";
 
 vi.mock("@/services/databaseRows", () => ({
   readTableRows: vi.fn(),
   cancelTableRows: vi.fn(),
   createDatabaseRowRequestId: vi.fn(),
+}));
+
+vi.mock("@/services/databaseRowWrites", () => ({
+  insertTableRow: vi.fn(),
+  updateTableRow: vi.fn(),
+  deleteTableRows: vi.fn(),
 }));
 
 const profile: DatabaseProfile = {
@@ -262,6 +271,20 @@ function lastOptions(): DatabaseRowOptions {
   return calls[calls.length - 1][2] ?? {};
 }
 
+function writeResult(
+  operation: DatabaseRowWriteResult["operation"],
+  affectedRows = 1,
+): DatabaseRowWriteResult {
+  return {
+    operation,
+    table: { database: "app", schema: "public", name: "users" },
+    affectedRows,
+    verified: true,
+    verification: `${operation} committed and verified.`,
+    transaction: "committed",
+  };
+}
+
 function renderGrid(overrides: Partial<ComponentProps<typeof DatabaseDataGrid>> = {}) {
   return render(
     <DatabaseDataGrid
@@ -289,6 +312,7 @@ describe("DatabaseDataGrid", () => {
     useDatabaseWorkspaceStore.setState({ tabs: {}, order: [], activeTabId: null });
     useDatabaseWorkspaceStore.getState().openTab(profile);
     useDatabaseRowStore.setState({ entries: {} });
+    useDatabaseRowWriteStore.setState({ entries: {} });
     let requestId = 0;
     vi.mocked(createDatabaseRowRequestId).mockImplementation(() => {
       requestId += 1;
@@ -301,6 +325,9 @@ describe("DatabaseDataGrid", () => {
       requestId: "row-request-1",
       cancelled: true,
     });
+    vi.mocked(insertTableRow).mockResolvedValue(writeResult("insert"));
+    vi.mocked(updateTableRow).mockResolvedValue(writeResult("update"));
+    vi.mocked(deleteTableRows).mockResolvedValue(writeResult("delete", 2));
   });
 
   it("loads one bounded page and renders typed values, NULL, and empty strings", async () => {
@@ -632,6 +659,151 @@ describe("DatabaseDataGrid", () => {
     );
     expect(screen.getByRole("button", { name: "Edit row" })).toBeDisabled();
     expect(screen.getByText("No stable identity")).toBeInTheDocument();
+  });
+
+  it("inserts a row with explicit value, NULL, and DEFAULT modes", async () => {
+    const user = userEvent.setup();
+    renderGrid();
+
+    await screen.findByRole("grid", { name: "Table data for users" });
+    await user.click(screen.getByRole("button", { name: "Insert row" }));
+    const dialog = await screen.findByRole("dialog", { name: "Insert row into users" });
+
+    await user.click(within(dialog).getByRole("combobox", { name: "name input mode" }));
+    await user.click(await screen.findByRole("option", { name: "Value" }));
+    await user.type(within(dialog).getByLabelText("name value"), "new");
+
+    await user.click(within(dialog).getByRole("combobox", { name: "notes input mode" }));
+    await user.click(await screen.findByRole("option", { name: "NULL" }));
+
+    await user.click(within(dialog).getByRole("combobox", { name: "balance input mode" }));
+    await user.click(await screen.findByRole("option", { name: "Value" }));
+    await user.type(within(dialog).getByLabelText("balance value"), "7");
+
+    await user.click(within(dialog).getByRole("button", { name: "Insert row" }));
+
+    await waitFor(() => {
+      expect(insertTableRow).toHaveBeenCalledWith(
+        "profile-1",
+        { database: "app", schema: "public", table: "users" },
+        [
+          { column: "id", mode: "default" },
+          { column: "name", mode: "value", value: "new" },
+          { column: "active", mode: "default" },
+          { column: "balance", mode: "value", value: "7" },
+          { column: "created_at", mode: "default" },
+          { column: "metadata", mode: "default" },
+          { column: "avatar", mode: "default" },
+          { column: "notes", mode: "null" },
+        ],
+      );
+    });
+    expect(await screen.findByLabelText("Row write succeeded")).toHaveTextContent(
+      "Committed · 1 row affected",
+    );
+  });
+
+  it("updates the active row with its identity and original-value guards", async () => {
+    const user = userEvent.setup();
+    renderGrid();
+
+    await screen.findByRole("grid", { name: "Table data for users" });
+    await user.click(screen.getByRole("button", { name: "Edit row" }));
+    const dialog = await screen.findByRole("dialog", { name: "Edit row in users" });
+    expect(within(dialog).getByText("id=1")).toBeInTheDocument();
+
+    const name = within(dialog).getByLabelText("name value");
+    await user.clear(name);
+    await user.type(name, "ann updated");
+    await user.click(within(dialog).getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => {
+      expect(updateTableRow).toHaveBeenCalledWith(
+        "profile-1",
+        { database: "app", schema: "public", table: "users" },
+        [{ column: "id", value: "1" }],
+        [{ column: "name", mode: "value", value: "ann updated" }],
+        [{ column: "name", value: "ann" }],
+      );
+    });
+    expect(await screen.findByLabelText("Row write succeeded")).toHaveTextContent(
+      "Committed · 1 row affected",
+    );
+  });
+
+  it("confirms a single-row delete before sending its stable identity", async () => {
+    const user = userEvent.setup();
+    renderGrid();
+
+    await screen.findByRole("grid", { name: "Table data for users" });
+    await user.click(screen.getByRole("button", { name: "Delete row" }));
+    const dialog = await screen.findByRole("dialog", { name: "Delete 1 row from users?" });
+    expect(within(dialog).getByText("Single row by stable identity")).toBeInTheDocument();
+
+    await user.click(within(dialog).getByRole("button", { name: "Delete row" }));
+
+    await waitFor(() => {
+      expect(deleteTableRows).toHaveBeenCalledWith(
+        "profile-1",
+        { database: "app", schema: "public", table: "users" },
+        [[{ column: "id", value: "1" }]],
+        true,
+      );
+    });
+  });
+
+  it("requires confirmation for a scoped bulk delete and reports the target count", async () => {
+    const user = userEvent.setup();
+    renderGrid();
+
+    const grid = await screen.findByRole("grid", { name: "Table data for users" });
+    await user.click(within(grid).getByLabelText("Select row 1"));
+    await user.click(within(grid).getByLabelText("Select row 2"));
+    expect(screen.getByRole("button", { name: "Delete selected rows" })).toHaveTextContent(
+      "Delete selected (2)",
+    );
+
+    await user.click(screen.getByRole("button", { name: "Delete selected rows" }));
+    const dialog = await screen.findByRole("dialog", { name: "Delete 2 rows from users?" });
+    expect(
+      within(dialog).getByText("Bulk delete scoped to the selected stable identities"),
+    ).toBeInTheDocument();
+
+    await user.click(within(dialog).getByRole("button", { name: "Delete rows" }));
+
+    await waitFor(() => {
+      expect(deleteTableRows).toHaveBeenCalledWith(
+        "profile-1",
+        { database: "app", schema: "public", table: "users" },
+        [[{ column: "id", value: "1" }], [{ column: "id", value: "2" }]],
+        true,
+      );
+    });
+    expect(await screen.findByLabelText("Row write succeeded")).toHaveTextContent(
+      "Committed · 2 rows affected",
+    );
+  });
+
+  it("shows a rollback banner when a concurrent update conflicts", async () => {
+    const user = userEvent.setup();
+    vi.mocked(updateTableRow).mockRejectedValueOnce({
+      code: "conflict",
+      message: "The row changed in another session before this update could be applied.",
+      details: "The transaction was rolled back; no rows were changed.",
+    });
+    renderGrid();
+
+    await screen.findByRole("grid", { name: "Table data for users" });
+    await user.click(screen.getByRole("button", { name: "Edit row" }));
+    const dialog = await screen.findByRole("dialog", { name: "Edit row in users" });
+    const name = within(dialog).getByLabelText("name value");
+    await user.clear(name);
+    await user.type(name, "stale");
+    await user.click(within(dialog).getByRole("button", { name: "Save changes" }));
+
+    const banner = await screen.findByRole("alert", { name: "Row write failed" });
+    expect(banner).toHaveTextContent("transaction rolled back");
+    expect(banner).toHaveTextContent("The row changed in another session");
   });
 
   it("supports keyboard navigation and column selection", async () => {
