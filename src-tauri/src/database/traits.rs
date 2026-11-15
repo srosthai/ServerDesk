@@ -13,6 +13,10 @@ use crate::storage::DatabaseEngine;
 use super::{
     actions::{DatabaseDdlPreview, ValidatedDatabaseAction},
     capabilities::{CapabilitySnapshot, DatabaseAction, DatabaseCapabilities, DatabaseVersion},
+    csv::{
+        CsvExportSink, CsvExportSource, CsvExportSummary, CsvImportObserver, CsvImportRequest,
+        CsvImportSource, CsvImportSummary,
+    },
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
     pagination::{Bounded, Page, PageRequest},
@@ -537,6 +541,30 @@ pub trait DatabaseAdapter: Send + Sync {
         request: &RowReadRequest,
         control: &RowQueryControl,
     ) -> Result<RowReadResult, DatabaseError>;
+
+    /// Streams a full table or one read-only query into a CSV sink. Values are
+    /// never truncated; the sink receives every value as returned by the
+    /// engine. The caller bounds the transfer with a timeout and cancellation
+    /// handle, and the adapter must check both while rows are streamed.
+    async fn export_csv(
+        &mut self,
+        source: &CsvExportSource,
+        sink: &mut dyn CsvExportSink,
+        control: &RowQueryControl,
+    ) -> Result<CsvExportSummary, DatabaseError>;
+
+    /// Imports parsed CSV rows into one table in a single transaction. Mapping
+    /// and type validation happen before the transaction commits. Rows that
+    /// fail local conversion are reported and skipped; a driver failure rolls
+    /// the transaction back and returns a typed error. Cancellation and timeout
+    /// also roll back and never leave partially committed rows.
+    async fn import_csv(
+        &mut self,
+        request: &CsvImportRequest,
+        source: &mut dyn CsvImportSource,
+        observer: &mut dyn CsvImportObserver,
+        control: &RowQueryControl,
+    ) -> Result<CsvImportSummary, DatabaseError>;
 
     /// Inserts one row in a transaction, verifies the affected row, re-reads it
     /// where the identity is known, and commits only after verification. A
