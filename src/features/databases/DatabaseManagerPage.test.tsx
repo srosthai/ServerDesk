@@ -31,6 +31,7 @@ import type { DatabaseWorkspaceView } from "@/stores/databaseWorkspaceStore";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { databaseExplorerNodeKey, useDatabaseExplorerStore } from "@/stores/databaseExplorerStore";
 import { useDatabaseProfileStore } from "@/stores/databaseProfileStore";
+import { useDatabaseQueryStore } from "@/stores/databaseQueryStore";
 import { useDatabaseRowStore } from "@/stores/databaseRowStore";
 import { useDatabaseWorkspaceStore } from "@/stores/databaseWorkspaceStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
@@ -44,6 +45,7 @@ import type {
   DatabaseExplorerNodePayload,
   DatabaseIndexSummary,
   DatabaseProfile,
+  DatabaseQueryExecutionResult,
   DatabaseRowColumn,
   DatabaseRowReadResult,
   DatabaseStructureActionRequest,
@@ -665,6 +667,35 @@ function renderPage() {
   );
 }
 
+function sqlExecutionResult(
+  columns: Array<{ name: string; dataType: string }>,
+  rows: string[][],
+  durationMs: number,
+): DatabaseQueryExecutionResult {
+  return {
+    engine: "postgresql",
+    readOnly: false,
+    results: [
+      {
+        index: 0,
+        columns,
+        rows: rows.map((row) => row.map((value) => ({ value, truncated: false }))),
+        returnedRows: rows.length,
+        affectedRows: null,
+        lastInsertId: null,
+        truncated: false,
+        columnsTruncated: false,
+      },
+    ],
+    warnings: [],
+    destructive: false,
+    requiresConfirmation: false,
+    truncated: false,
+    maxRows: 500,
+    durationMs,
+  };
+}
+
 function enableTauriRuntime() {
   Object.defineProperty(window, "__TAURI_INTERNALS__", {
     configurable: true,
@@ -811,6 +842,7 @@ describe("DatabaseManagerPage", () => {
     });
     useDatabaseExplorerStore.setState({ nodes: {}, error: null, commandError: null });
     useDatabaseWorkspaceStore.setState({ tabs: {}, order: [], activeTabId: null });
+    useDatabaseQueryStore.setState({ entries: {} });
     useDatabaseRowStore.setState({ entries: {} });
     vi.mocked(createDatabaseRowRequestId).mockReturnValue("row-request-page");
     vi.mocked(readTableRows).mockResolvedValue(rowGridResult);
@@ -1333,23 +1365,22 @@ describe("DatabaseManagerPage", () => {
     await user.click(screen.getByRole("tab", { name: "Analytics (MySQL) workspace tab" }));
     expect(screen.getByLabelText("SQL editor for Analytics")).toHaveValue("select * from metrics");
 
-    useDatabaseWorkspaceStore.getState().setSqlResult(profile.id, {
-      statement: "select * from users",
-      columns: ["id"],
-      rows: [["1"]],
-      affectedRows: null,
-      durationMs: 4,
-      error: null,
-      executedAt: 10,
-    });
-    useDatabaseWorkspaceStore.getState().setSqlResult(analyticsProfile.id, {
-      statement: "select * from metrics",
-      columns: ["visits"],
-      rows: [["42"]],
-      affectedRows: null,
-      durationMs: 6,
-      error: null,
-      executedAt: 11,
+    const primaryQueryId = useDatabaseWorkspaceStore.getState().tabs[profile.id].sqlTabs[0].id;
+    const analyticsQueryId =
+      useDatabaseWorkspaceStore.getState().tabs[analyticsProfile.id].sqlTabs[0].id;
+    useDatabaseQueryStore.setState({
+      entries: {
+        [primaryQueryId]: {
+          status: "succeeded",
+          options: {},
+          result: sqlExecutionResult([{ name: "id", dataType: "int4" }], [["1"]], 4),
+        },
+        [analyticsQueryId]: {
+          status: "succeeded",
+          options: {},
+          result: sqlExecutionResult([{ name: "visits", dataType: "int4" }], [["42"]], 6),
+        },
+      },
     });
 
     expect(
@@ -1364,12 +1395,17 @@ describe("DatabaseManagerPage", () => {
     ).not.toBeInTheDocument();
 
     const state = useDatabaseWorkspaceStore.getState();
-    expect(state.tabs[profile.id].sqlDraft).toBe("select * from users");
+    expect(state.tabs[profile.id].sqlTabs[0].sql).toBe("select * from users");
     expect(state.tabs[profile.id].activeView).toBe("sql");
-    expect(state.tabs[profile.id].sqlResult?.columns).toEqual(["id"]);
-    expect(state.tabs[analyticsProfile.id].sqlDraft).toBe("select * from metrics");
+    expect(
+      useDatabaseQueryStore.getState().entries[primaryQueryId]?.result?.results[0].columns[0].name,
+    ).toBe("id");
+    expect(state.tabs[analyticsProfile.id].sqlTabs[0].sql).toBe("select * from metrics");
     expect(state.tabs[analyticsProfile.id].activeView).toBe("sql");
-    expect(state.tabs[analyticsProfile.id].sqlResult?.columns).toEqual(["visits"]);
+    expect(
+      useDatabaseQueryStore.getState().entries[analyticsQueryId]?.result?.results[0].columns[0]
+        .name,
+    ).toBe("visits");
   });
 
   it("keeps selected database context scoped to each connection", async () => {
@@ -1452,7 +1488,10 @@ describe("DatabaseManagerPage", () => {
 
     await user.click(screen.getByRole("button", { name: "Open Analytics workspace" }));
     useDatabaseWorkspaceStore.getState().setActiveView(profile.id, "sql");
-    useDatabaseWorkspaceStore.getState().setSqlDraft(profile.id, "select * from users");
+    const primaryQueryId = useDatabaseWorkspaceStore.getState().tabs[profile.id].sqlTabs[0].id;
+    useDatabaseWorkspaceStore
+      .getState()
+      .setSqlQueryText(profile.id, primaryQueryId, "select * from users");
 
     await user.click(screen.getByRole("button", { name: "Disconnect Primary" }));
 
@@ -1464,8 +1503,10 @@ describe("DatabaseManagerPage", () => {
     expect(profileState.snapshots[analyticsProfile.id].state).toBe("connected");
     expect(useDatabaseWorkspaceStore.getState().tabs[profile.id]).toMatchObject({
       activeView: "sql",
-      sqlDraft: "select * from users",
     });
+    expect(useDatabaseWorkspaceStore.getState().tabs[profile.id].sqlTabs[0].sql).toBe(
+      "select * from users",
+    );
     expect(useDatabaseWorkspaceStore.getState().tabs[analyticsProfile.id]).toMatchObject({
       activeView: "overview",
     });
@@ -1495,7 +1536,10 @@ describe("DatabaseManagerPage", () => {
 
     await user.click(screen.getByRole("button", { name: "Open Analytics workspace" }));
     useDatabaseWorkspaceStore.getState().setActiveView(profile.id, "sql");
-    useDatabaseWorkspaceStore.getState().setSqlDraft(profile.id, "select current_user");
+    const primaryQueryId = useDatabaseWorkspaceStore.getState().tabs[profile.id].sqlTabs[0].id;
+    useDatabaseWorkspaceStore
+      .getState()
+      .setSqlQueryText(profile.id, primaryQueryId, "select current_user");
 
     await user.click(screen.getByRole("button", { name: "Reconnect Primary" }));
 
@@ -1508,8 +1552,10 @@ describe("DatabaseManagerPage", () => {
     expect(useDatabaseWorkspaceStore.getState().activeTabId).toBe(profile.id);
     expect(useDatabaseWorkspaceStore.getState().tabs[profile.id]).toMatchObject({
       activeView: "sql",
-      sqlDraft: "select current_user",
     });
+    expect(useDatabaseWorkspaceStore.getState().tabs[profile.id].sqlTabs[0].sql).toBe(
+      "select current_user",
+    );
     expect(useDatabaseWorkspaceStore.getState().tabs[analyticsProfile.id].activeView).toBe(
       "overview",
     );
