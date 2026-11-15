@@ -3,8 +3,6 @@ import { Link } from "react-router-dom";
 import type { Icon } from "@phosphor-icons/react";
 import {
   ArrowClockwiseIcon,
-  BroomIcon,
-  CheckCircleIcon,
   CircleNotchIcon,
   CodeIcon,
   DatabaseIcon,
@@ -13,7 +11,6 @@ import {
   KeyIcon,
   ListChecksIcon,
   PlugsIcon,
-  PlayIcon,
   PlusIcon,
   RowsIcon,
   TableIcon,
@@ -34,6 +31,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { DatabaseConnectionList, EngineBadge } from "@/features/databases/DatabaseConnectionList";
 import { DatabaseActionDialog } from "@/features/databases/DatabaseActionDialog";
 import { DatabaseDataGrid } from "@/features/databases/DatabaseDataGrid";
+import { DatabaseSqlWorkspace } from "@/features/databases/DatabaseSqlWorkspace";
 import { DatabaseExplorerTree } from "@/features/databases/DatabaseExplorerTree";
 import {
   DatabaseTableIndexesPanel,
@@ -70,6 +68,7 @@ import { dropDatabase, previewDatabaseAction, setActiveDatabase } from "@/servic
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useDatabaseExplorerStore } from "@/stores/databaseExplorerStore";
 import { useDatabaseProfileStore } from "@/stores/databaseProfileStore";
+import { useDatabaseQueryStore } from "@/stores/databaseQueryStore";
 import { useDatabaseRowStore } from "@/stores/databaseRowStore";
 import { useDatabaseRowWriteStore } from "@/stores/databaseRowWriteStore";
 import {
@@ -793,151 +792,6 @@ function DatabaseWorkspaceTabHeader({
   );
 }
 
-function SqlResultPanel({ tab }: { tab: DatabaseWorkspaceTab }) {
-  const result = tab.sqlResult;
-  if (!result) {
-    return (
-      <EmptyState
-        icon={<RowsIcon className="size-4" aria-hidden="true" />}
-        title="No query results yet"
-        description={`Results, errors, and execution time stay with the ${tab.name} tab when you switch connections.`}
-      />
-    );
-  }
-
-  return (
-    <div
-      role="region"
-      aria-label={`SQL results for ${tab.name}`}
-      className="overflow-hidden rounded-md border border-border bg-card"
-    >
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-muted/20 px-3 py-2">
-        <p className="flex items-center gap-1.5 text-[11px] font-medium text-foreground">
-          {result.error ? (
-            <WarningCircleIcon className="size-3.5 text-destructive" aria-hidden="true" />
-          ) : (
-            <CheckCircleIcon className="size-3.5 text-success" aria-hidden="true" />
-          )}
-          {result.error ? "Query failed" : "Query finished"}
-          <span className="font-normal text-muted-foreground">
-            {result.affectedRows !== null
-              ? `${result.affectedRows} row${result.affectedRows === 1 ? "" : "s"} affected`
-              : `${result.rows.length} row${result.rows.length === 1 ? "" : "s"}`}
-          </span>
-        </p>
-        <p className="font-mono text-[10px] text-muted-foreground">
-          {result.durationMs} ms · {new Date(result.executedAt).toLocaleTimeString()}
-        </p>
-      </div>
-      {result.error ? (
-        <p className="px-3 py-2.5 text-[11px] leading-5 text-destructive">{result.error}</p>
-      ) : result.columns.length === 0 ? (
-        <p className="px-3 py-2.5 text-[11px] text-muted-foreground">No result columns.</p>
-      ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full border-collapse text-left text-[11px]">
-            <thead className="bg-muted/20 text-[10px] tracking-wide text-muted-foreground uppercase">
-              <tr>
-                {result.columns.map((column) => (
-                  <th key={column} className="border-b border-border px-2.5 py-1.5 font-medium">
-                    {column}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {result.rows.map((row, index) => (
-                <tr key={index} className="border-b border-border last:border-0">
-                  {row.map((value, columnIndex) => (
-                    <td
-                      key={columnIndex}
-                      className="max-w-64 truncate px-2.5 py-1.5 font-mono text-foreground"
-                      title={value}
-                    >
-                      {value === "" ? <span className="text-muted-foreground">empty</span> : value}
-                    </td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-      <p className="border-t border-border px-3 py-1.5 font-mono text-[10px] text-muted-foreground">
-        {result.statement}
-      </p>
-    </div>
-  );
-}
-
-function DatabaseSqlWorkspace({
-  tab,
-  snapshot,
-}: {
-  tab: DatabaseWorkspaceTab;
-  snapshot: DatabaseConnectionSnapshot | undefined;
-}) {
-  const setSqlDraft = useDatabaseWorkspaceStore((state) => state.setSqlDraft);
-  const setSqlResult = useDatabaseWorkspaceStore((state) => state.setSqlResult);
-  const connected = snapshot?.state === "connected";
-
-  return (
-    <div className="space-y-3">
-      <div className="overflow-hidden rounded-md border border-border bg-card">
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2">
-          <div className="flex items-center gap-2">
-            <CodeIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
-            <h3 className="text-[12px] font-semibold text-foreground">SQL editor</h3>
-            <EngineBadge engine={tab.engine} />
-            <Badge variant={connected ? "success" : "outline"}>
-              {connected ? "Connected" : "Disconnected"}
-            </Badge>
-            {tab.readOnly ? <Badge variant="warning">Read-only</Badge> : null}
-          </div>
-          <span className="font-mono text-[10px] text-muted-foreground">{tab.name}</span>
-        </div>
-        <textarea
-          id={`database-sql-editor-${tab.profileId}`}
-          aria-label={`SQL editor for ${tab.name}`}
-          value={tab.sqlDraft}
-          onChange={(event) => setSqlDraft(tab.profileId, event.target.value)}
-          spellCheck={false}
-          placeholder="SELECT current_database(), current_user;"
-          className="min-h-40 w-full resize-y bg-transparent p-3 font-mono text-[12px] leading-5 text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:ring-2 focus-visible:ring-ring/30"
-        />
-        <div className="flex flex-wrap items-center gap-2 border-t border-border bg-muted/15 px-3 py-2">
-          <Button
-            size="sm"
-            disabled
-            title="SQL execution is added with the query milestone; this editor owns the draft and result state now."
-          >
-            <PlayIcon className="size-3.5" aria-hidden="true" />
-            Run
-          </Button>
-          <Button
-            size="sm"
-            variant="secondary"
-            onClick={() => {
-              setSqlDraft(tab.profileId, "");
-              setSqlResult(tab.profileId, null);
-            }}
-            disabled={tab.sqlDraft.length === 0 && tab.sqlResult === null}
-          >
-            <BroomIcon className="size-3.5" aria-hidden="true" />
-            Clear
-          </Button>
-          <span className="text-[10px] text-muted-foreground">
-            {connected
-              ? "Draft and results are scoped to this connection tab."
-              : "Connect this profile before running queries."}
-          </span>
-        </div>
-      </div>
-      <SqlResultPanel tab={tab} />
-    </div>
-  );
-}
-
 function DatabaseOperationsWorkspace({ tab }: { tab: DatabaseWorkspaceTab }) {
   const taskTone: Record<DatabaseWorkspaceTaskStatus, string> = {
     running: "text-warning",
@@ -1543,6 +1397,16 @@ function DatabaseManagerPage() {
     }
     const snapshot = useDatabaseProfileStore.getState().snapshots[profileId];
     const live = snapshot !== undefined && snapshot.state !== "disconnected";
+    const runningQueryIds = tab.sqlTabs
+      .filter(
+        (queryTab) => useDatabaseQueryStore.getState().entries[queryTab.id]?.status === "running",
+      )
+      .map((queryTab) => queryTab.id);
+    if (runningQueryIds.length > 0) {
+      await Promise.all(
+        runningQueryIds.map((queryId) => useDatabaseQueryStore.getState().cancel(queryId)),
+      );
+    }
 
     // Removing the tab clears selection, SQL text, results, and background
     // task records for that connection only. Cached explorer nodes are scoped
@@ -1592,10 +1456,16 @@ function DatabaseManagerPage() {
     setDeletePending(false);
 
     if (deleted) {
+      const deletedTab = useDatabaseWorkspaceStore.getState().tabs[deleteTarget.id];
       closeWorkspaceTab(deleteTarget.id);
       useDatabaseExplorerStore.getState().resetProfile(deleteTarget.id);
       useDatabaseRowStore.getState().resetProfile(deleteTarget.id);
       useDatabaseRowWriteStore.getState().resetProfile(deleteTarget.id);
+      if (deletedTab) {
+        useDatabaseQueryStore
+          .getState()
+          .clearMany(deletedTab.sqlTabs.map((queryTab) => queryTab.id));
+      }
       setNotice(`Deleted ${deleteTarget.name}. The remote database was not changed.`);
       setDeleteTarget(null);
     }
@@ -1931,7 +1801,21 @@ function DatabaseManagerPage() {
                             />
                           )
                         ) : tab.value === "sql" ? (
-                          <DatabaseSqlWorkspace tab={activeTab} snapshot={selectedSnapshot} />
+                          <DatabaseSqlWorkspace
+                            tab={activeTab}
+                            snapshot={selectedSnapshot}
+                            onConnect={() => {
+                              const profile = profiles.find(
+                                (entry) => entry.id === activeTab.profileId,
+                              );
+                              if (profile) {
+                                void handleConnect(profile);
+                              }
+                            }}
+                            onConnectionMayHaveClosed={() =>
+                              void refreshConnectionState(activeTab.profileId)
+                            }
+                          />
                         ) : tab.value === "operations" ? (
                           <DatabaseOperationsWorkspace tab={activeTab} />
                         ) : (

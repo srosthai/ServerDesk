@@ -819,8 +819,20 @@ writes remain `permission`, and stalled statements remain `timeout`.
 
 `src/services/databaseQueries.ts` is the only React module that invokes these
 commands. `src/stores/databaseQueryStore.ts` keeps one analysis/result document
-per connection profile, tracks running and cancelled state, rejects stale
-responses, and preserves structured error metadata. The SQL editor UI is #179.
+per SQL query tab, tracks running and cancelled state, rejects stale responses,
+and preserves structured error metadata. `src/stores/databaseWorkspaceStore.ts`
+owns the query-tab strip inside each connection tab, including draft text,
+selection, row limit, timeout, last-run source, and the workspace read-only
+guard. The SQL workspace renders both dialects with a tokenizer that preserves
+comments, quoted strings, MySQL backtick identifiers, and PostgreSQL
+dollar-quoted strings. It submits a selection first, otherwise the statement at
+the cursor, and never rewrites SQL. Result grids stay bounded, distinguish NULL
+from empty strings, and copy/export the active result set as TSV, CSV, or JSON.
+The UI treats a read-only profile as locked and adds an optional client-side
+guard for writable profiles; the backend still rejects writes independently.
+Destructive SQL opens a confirmation before the confirmed execution is sent,
+and failures surface the SQLSTATE or MySQL error code plus position feedback
+when the engine reports one.
 
 ### Tests
 
@@ -832,6 +844,13 @@ opt-in live MySQL and PostgreSQL suites add real SELECT/write execution,
 multi-statement results, limits, syntax-error code/position mapping,
 cancellation, and timeout on `SLEEP`/`pg_sleep`, including session closure after
 a timeout.
+
+The React SQL workspace suite covers adding, switching, and closing query tabs;
+current-statement, selection, Run all, and Ctrl+Enter execution; per-tab draft
+and result isolation; cancellation and reconnect feedback; timeout and
+structured SQL errors with position; read-only guard blocking and the locked
+profile state; destructive confirmation and `confirmed: true`; affected-row and
+duration display; and copy, CSV, and JSON export.
 
 ## Row browsing commands
 
