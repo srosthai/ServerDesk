@@ -17,6 +17,10 @@ use crate::storage::DatabaseEngine;
 use super::{
     actions::{DatabaseDdlPreview, ValidatedDatabaseAction},
     capabilities::{DatabaseAction, DatabaseCapabilities, DatabaseVersion},
+    csv::{
+        CsvExportSink, CsvExportSource, CsvExportSummary, CsvImportObserver, CsvImportRequest,
+        CsvImportSource, CsvImportSummary, CsvWarning, MAX_CSV_REPORTED_ISSUES,
+    },
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
     mysql,
@@ -28,8 +32,8 @@ use super::{
     },
     row_writes::{
         ResolvedWriteValue, RowDeleteRequest, RowInsertRequest, RowUpdateRequest,
-        RowWriteOperation, RowWriteResult, resolve_delete, resolve_insert, resolve_update,
-        text_matches_column,
+        RowWriteOperation, RowWriteResult, resolve_delete, resolve_import_values, resolve_insert,
+        resolve_update, text_matches_column,
     },
     rows::{
         MAX_ROW_CELL_CHARACTERS, RowCell, RowColumn, RowColumnKind, RowExactCount,
@@ -231,6 +235,15 @@ impl FakeDatabaseAdapter {
 
     pub fn row_write_count(&self) -> usize {
         self.row_write_count
+    }
+
+    /// Full fixture rows for one table, including values the display grid would
+    /// truncate. Used by CSV round-trip tests.
+    pub fn row_table_rows(&self, table: &TableRef) -> Option<&[Vec<Option<String>>]> {
+        self.row_tables
+            .iter()
+            .find(|fixture| fixture.matches(table))
+            .map(|fixture| fixture.rows.as_slice())
     }
 
     pub fn row_rollback_count(&self) -> usize {
@@ -1924,6 +1937,279 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
             exact_rows,
             self.read_only,
         ))
+    }
+
+    async fn export_csv(
+        &mut self,
+        source: &CsvExportSource,
+        sink: &mut dyn CsvExportSink,
+        control: &RowQueryControl,
+    ) -> Result<CsvExportSummary, DatabaseError> {
+        match source {
+            CsvExportSource::Table { .. } => {
+                self.require_capability(DatabaseAction::BrowseRows)?;
+            }
+            CsvExportSource::Query { .. } => {
+                self.require_capability(DatabaseAction::RunQuery)?;
+            }
+        }
+        self.require_connection()?;
+        if control.is_cancelled() {
+            return Err(DatabaseError::cancelled("The CSV export was cancelled."));
+        }
+        match source {
+            CsvExportSource::Table { table } => {
+                let fixture = self
+                    .row_tables
+                    .iter()
+                    .find(|fixture| fixture.matches(table))
+                    .ok_or_else(|| DatabaseError::query("The selected table was not found."))?;
+                let columns = fixture
+                    .columns
+                    .iter()
+                    .map(|column| column.name.as_str().to_string())
+                    .collect::<Vec<_>>();
+                sink.write_header(&columns)?;
+                let mut rows = 0u64;
+                for row in &fixture.rows {
+                    if control.is_cancelled() {
+                        return Err(DatabaseError::cancelled("The CSV export was cancelled."));
+                    }
+                    if row.len() != columns.len() {
+                        return Err(DatabaseError::internal(
+                            "A fake row fixture has the wrong number of values.",
+                        ));
+                    }
+                    sink.write_row(row)?;
+                    rows = rows.saturating_add(1);
+                }
+                Ok(CsvExportSummary { columns, rows })
+            }
+            CsvExportSource::Query { sql } => {
+                let request = QueryRequest::try_new(sql.clone(), None)?;
+                let analysis = request.analyze(self.engine)?;
+                if analysis.has_writes {
+                    return Err(DatabaseError::validation(
+                        "CSV export only runs read-only SQL. The statement would write data or schema.",
+                    ));
+                }
+                let query_control = QueryControl::new(
+                    control.timeout,
+                    None,
+                    crate::database::queries::DEFAULT_QUERY_RESULT_LIMIT,
+                );
+                let execution = self.execute_query(&request, &query_control).await?;
+                let Some(result_set) = execution.results.first() else {
+                    return Ok(CsvExportSummary {
+                        columns: Vec::new(),
+                        rows: 0,
+                    });
+                };
+                let columns = result_set
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect::<Vec<_>>();
+                sink.write_header(&columns)?;
+                let mut rows = 0u64;
+                for row in &result_set.rows {
+                    if control.is_cancelled() {
+                        return Err(DatabaseError::cancelled("The CSV export was cancelled."));
+                    }
+                    let values = row
+                        .iter()
+                        .map(|cell| cell.value.clone())
+                        .collect::<Vec<_>>();
+                    sink.write_row(&values)?;
+                    rows = rows.saturating_add(1);
+                }
+                Ok(CsvExportSummary { columns, rows })
+            }
+        }
+    }
+
+    async fn import_csv(
+        &mut self,
+        request: &CsvImportRequest,
+        source: &mut dyn CsvImportSource,
+        observer: &mut dyn CsvImportObserver,
+        control: &RowQueryControl,
+    ) -> Result<CsvImportSummary, DatabaseError> {
+        self.require_capability(DatabaseAction::InsertRow)?;
+        self.require_connection()?;
+        if self.read_only {
+            return Err(DatabaseError::permission(
+                "The database session is read-only; CSV imports are disabled.",
+            ));
+        }
+        if control.is_cancelled() {
+            return Err(DatabaseError::cancelled("The CSV import was cancelled."));
+        }
+
+        let fixture_index = self
+            .row_tables
+            .iter()
+            .position(|fixture| fixture.matches(&request.table))
+            .ok_or_else(|| DatabaseError::query("The selected table was not found."))?;
+        let metadata = {
+            let fixture = &self.row_tables[fixture_index];
+            self.row_metadata(fixture)
+        };
+        let mut mapping = Vec::with_capacity(request.mappings.len());
+        let mut seen_sources = std::collections::HashSet::new();
+        let mut seen_targets = std::collections::HashSet::new();
+        for entry in &request.mappings {
+            let source_index = usize::try_from(entry.source_index).unwrap_or(usize::MAX);
+            if source_index >= source.headers().len() {
+                return Err(DatabaseError::validation(format!(
+                    "Source column {} does not exist in the CSV header.",
+                    entry.source_index
+                )));
+            }
+            if !seen_sources.insert(source_index) {
+                return Err(DatabaseError::validation(format!(
+                    "Source column {} is mapped more than once.",
+                    entry.source_index
+                )));
+            }
+            if !seen_targets.insert(entry.target_column.as_str()) {
+                return Err(DatabaseError::validation(format!(
+                    "Destination column {} is mapped more than once.",
+                    entry.target_column
+                )));
+            }
+            let target = metadata
+                .columns
+                .iter()
+                .position(|column| column.name == entry.target_column)
+                .ok_or_else(|| {
+                    DatabaseError::validation(format!(
+                        "Destination column {} does not exist in table {}.",
+                        entry.target_column, metadata.table
+                    ))
+                })?;
+            let column = metadata.column(target)?;
+            if column.generated || column.identity == crate::database::ColumnIdentity::Always {
+                return Err(DatabaseError::validation(format!(
+                    "Column {} is generated and cannot receive imported values.",
+                    column.name
+                )));
+            }
+            if column.kind == RowColumnKind::Other {
+                return Err(DatabaseError::validation(format!(
+                    "Column {} has a type that cannot be imported safely.",
+                    column.name
+                )));
+            }
+            mapping.push((source_index, target));
+        }
+        if mapping.is_empty() {
+            return Err(DatabaseError::validation(
+                "Map at least one source column to a destination column.",
+            ));
+        }
+
+        let defaults = self.row_tables[fixture_index].defaults.clone();
+        let mut staged = Vec::new();
+        let mut warnings = Vec::new();
+        let mut warnings_truncated = false;
+        let mut conversion_skipped = 0u64;
+        while let Some(row) = source.next_row()? {
+            if control.is_cancelled() {
+                return Err(DatabaseError::cancelled("The CSV import was cancelled."));
+            }
+            let values = mapping
+                .iter()
+                .map(|(source_index, _)| {
+                    let field = &row.fields[*source_index];
+                    if request.options.null_mode.is_null(field) {
+                        None
+                    } else {
+                        Some(field.value.clone())
+                    }
+                })
+                .collect::<Vec<_>>();
+            let targets = mapping
+                .iter()
+                .map(|(_, target)| *target)
+                .collect::<Vec<_>>();
+            let resolved = match resolve_import_values(&metadata, &targets, &values) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    conversion_skipped = conversion_skipped.saturating_add(1);
+                    let warning = CsvWarning {
+                        row_number: row.record_number,
+                        column_number: None,
+                        column_name: None,
+                        message: error.message,
+                    };
+                    if warnings.len() < MAX_CSV_REPORTED_ISSUES {
+                        warnings.push(warning.clone());
+                    } else {
+                        warnings_truncated = true;
+                    }
+                    observer.row_skipped(&warning);
+                    continue;
+                }
+            };
+            let mut full_row = (0..metadata.columns.len())
+                .map(|index| defaults.get(index).cloned().flatten())
+                .collect::<Vec<_>>();
+            let mut row_failed = false;
+            for value in &resolved {
+                let column = metadata.column(value.column)?;
+                full_row[value.column] = match &value.value {
+                    ResolvedWriteValue::Null => None,
+                    ResolvedWriteValue::Default => defaults.get(value.column).cloned().flatten(),
+                    ResolvedWriteValue::Value(_) => value.text.clone(),
+                };
+                if full_row[value.column].is_none() && !column.nullable {
+                    row_failed = true;
+                    break;
+                }
+            }
+            if row_failed {
+                conversion_skipped = conversion_skipped.saturating_add(1);
+                let warning = CsvWarning {
+                    row_number: row.record_number,
+                    column_number: None,
+                    column_name: None,
+                    message: format!(
+                        "Row {} leaves a non-nullable column without a value and was skipped.",
+                        row.record_number
+                    ),
+                };
+                if warnings.len() < MAX_CSV_REPORTED_ISSUES {
+                    warnings.push(warning.clone());
+                } else {
+                    warnings_truncated = true;
+                }
+                observer.row_skipped(&warning);
+                continue;
+            }
+            staged.push(full_row);
+            observer.row_imported(row.record_number);
+        }
+        for issue in source.take_issues() {
+            if warnings.len() < MAX_CSV_REPORTED_ISSUES {
+                warnings.push(issue);
+            } else {
+                warnings_truncated = true;
+            }
+        }
+        warnings_truncated |= source.issues_truncated();
+        let imported = u64::try_from(staged.len()).unwrap_or(u64::MAX);
+        let rows_skipped = source.skipped_rows().saturating_add(conversion_skipped);
+        self.row_tables[fixture_index].rows.extend(staged);
+        Ok(CsvImportSummary {
+            table: request.table.clone(),
+            engine: self.engine,
+            rows_read: source.rows_read(),
+            rows_imported: imported,
+            rows_skipped,
+            warnings,
+            warnings_truncated,
+        })
     }
 
     async fn insert_row(

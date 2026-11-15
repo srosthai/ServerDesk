@@ -53,7 +53,7 @@ fn timeout_error(timeout: std::time::Duration) -> DatabaseError {
     ))
 }
 
-async fn bounded_query<F, T>(
+pub(crate) async fn bounded_query<F, T>(
     control: &RowQueryControl,
     deadline: Instant,
     future: F,
@@ -75,7 +75,7 @@ where
     }
 }
 
-fn bind_values<'q>(
+pub(crate) fn bind_values<'q>(
     mut query: Query<'q, MySql, MySqlArguments>,
     values: &[SqlValue],
 ) -> Query<'q, MySql, MySqlArguments> {
@@ -106,21 +106,21 @@ fn requested_database(table: &crate::database::TableRef) -> Result<Option<String
     }
 }
 
-fn qualified_table(metadata: &RowTableMetadata) -> Result<QualifiedName, DatabaseError> {
+pub(crate) fn qualified_table(metadata: &RowTableMetadata) -> Result<QualifiedName, DatabaseError> {
     let database = metadata.database.as_deref().ok_or_else(|| {
         DatabaseError::validation("Select a MySQL database before browsing table rows.")
     })?;
     QualifiedName::new([Identifier::new(database)?, metadata.table.clone()])
 }
 
-fn alias(index: usize) -> Identifier {
+pub(crate) fn alias(index: usize) -> Identifier {
     Identifier::new(format!("sd_{index}")).expect("generated row alias is a valid identifier")
 }
 
 /// Builds the display expression for one cell. Binary values are base64 text
 /// and spatial values are WKT; everything else is cast to characters so one
 /// uniform decoder can be used regardless of column type.
-fn cell_expression(column: &RowColumn, truncate: bool) -> String {
+pub(crate) fn cell_expression(column: &RowColumn, truncate: bool) -> String {
     let quoted = MYSQL_DIALECT.quote_identifier(&column.name);
     let raw = if is_bit_type(&column.data_type) {
         format!("CAST({quoted} + 0 AS CHAR)")
@@ -1144,7 +1144,7 @@ fn table_label(metadata: &RowTableMetadata) -> String {
     label
 }
 
-async fn begin_transaction(
+pub(crate) async fn begin_transaction(
     connection: &mut MySqlConnection,
     deadline: Instant,
 ) -> Result<sqlx::Transaction<'_, MySql>, DatabaseError> {
@@ -1156,7 +1156,7 @@ async fn begin_transaction(
         .map_err(map_sqlx_error)
 }
 
-async fn commit_transaction(
+pub(crate) async fn commit_transaction(
     tx: sqlx::Transaction<'_, MySql>,
     deadline: Instant,
 ) -> Result<(), DatabaseError> {
@@ -1175,7 +1175,7 @@ async fn commit_transaction(
     }
 }
 
-async fn fail_and_rollback(
+pub(crate) async fn fail_and_rollback(
     tx: sqlx::Transaction<'_, MySql>,
     error: DatabaseError,
     deadline: Instant,

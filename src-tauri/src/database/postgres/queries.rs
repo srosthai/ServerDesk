@@ -112,7 +112,7 @@ pub(crate) async fn execute_query(
     })
 }
 
-async fn describe_columns(
+pub(crate) async fn describe_columns(
     connection: &mut PgConnection,
     sql: &str,
     control: &QueryControl,
@@ -138,7 +138,7 @@ async fn describe_columns(
     }
 }
 
-fn row_columns(row: &PgRow, max_columns: usize) -> Vec<QueryColumn> {
+pub(crate) fn row_columns(row: &PgRow, max_columns: usize) -> Vec<QueryColumn> {
     row.columns()
         .iter()
         .take(max_columns)
@@ -149,7 +149,7 @@ fn row_columns(row: &PgRow, max_columns: usize) -> Vec<QueryColumn> {
         .collect()
 }
 
-fn row_values(row: &PgRow, count: usize) -> Vec<Option<String>> {
+pub(crate) fn row_values(row: &PgRow, count: usize) -> Vec<Option<String>> {
     (0..count)
         .map(
             |index| match row.try_get_unchecked::<Option<String>, _>(index) {

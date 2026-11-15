@@ -25,6 +25,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { CopyButton } from "@/components/ui/copy-button";
 import { EngineBadge } from "@/features/databases/DatabaseConnectionList";
 import { DatabaseSqlEditor } from "@/features/databases/DatabaseSqlEditor";
+import { DatabaseCsvTransferDialog } from "@/features/databases/DatabaseCsvTransferDialog";
 import { DatabaseSqlHistoryPanel } from "@/features/databases/DatabaseSqlHistoryPanel";
 import {
   downloadTextFile,
@@ -336,6 +337,7 @@ function ResultPanel({
     result: typeof result;
     message: string;
   } | null>(null);
+  const [fullCsvOpen, setFullCsvOpen] = useState(false);
   if (!result) {
     return null;
   }
@@ -467,6 +469,18 @@ function ResultPanel({
                   <BracketsCurlyIcon className="size-3.5" aria-hidden="true" />
                   JSON
                 </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 gap-1.5 px-2 text-[11px]"
+                  onClick={() => setFullCsvOpen(true)}
+                  disabled={!queryEntry?.executedSql}
+                  title="Run the executed statement again and stream full values to a CSV file"
+                >
+                  <FileCsvIcon className="size-3.5" aria-hidden="true" />
+                  Full CSV
+                </Button>
               </div>
             ) : null}
           </div>
@@ -499,6 +513,27 @@ function ResultPanel({
         {result.results.length} set{result.results.length === 1 ? "" : "s"} · bounded result
         {result.truncated ? " · at least one bound was applied" : ""}
       </p>
+      {fullCsvOpen && queryEntry?.executedSql ? (
+        <DatabaseCsvTransferDialog
+          key="sql-csv-export"
+          open
+          mode="export"
+          onOpenChange={(open) => {
+            if (!open) {
+              setFullCsvOpen(false);
+            }
+          }}
+          profileId={tab.profileId}
+          table={{
+            database: tab.selection?.database ?? null,
+            schema: tab.selection?.schema ?? null,
+            name: "query",
+          }}
+          columns={[]}
+          readOnly={false}
+          sql={queryEntry.executedSql}
+        />
+      ) : null}
     </section>
   );
 }

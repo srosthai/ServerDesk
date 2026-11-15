@@ -751,6 +751,138 @@ export type DatabaseRowWriteResult = {
   row?: DatabaseRowRecord;
 };
 
+export type DatabaseCsvTable = {
+  database?: string | null;
+  schema?: string | null;
+  name: string;
+};
+
+export type DatabaseCsvDelimiter = "comma" | "semicolon" | "tab" | "pipe";
+
+export type DatabaseCsvEncoding = "utf8" | "utf8_bom" | "utf16_le" | "utf16_be" | "latin1";
+
+export type DatabaseCsvNullMode =
+  { kind: "unquotedEmpty" } | { kind: "literal"; value: string } | { kind: "never" };
+
+export type DatabaseCsvImportOptions = {
+  delimiter: DatabaseCsvDelimiter;
+  encoding: DatabaseCsvEncoding;
+  hasHeader: boolean;
+  nullMode: DatabaseCsvNullMode;
+};
+
+export type DatabaseCsvColumnMapping = {
+  sourceIndex: number;
+  targetColumn: string;
+};
+
+export type DatabaseCsvExportSource =
+  { kind: "table"; table: DatabaseCsvTable } | { kind: "query"; sql: string };
+
+export type DatabaseCsvExportRequest = {
+  source: DatabaseCsvExportSource;
+  destinationPath: string;
+  delimiter: DatabaseCsvDelimiter;
+  encoding: DatabaseCsvEncoding;
+  includeHeader: boolean;
+  overwrite: boolean;
+};
+
+export type DatabaseCsvImportRequest = {
+  table: DatabaseCsvTable;
+  sourcePath: string;
+  options: DatabaseCsvImportOptions;
+  mappings: DatabaseCsvColumnMapping[];
+};
+
+export type DatabaseCsvTransferStatus = "running" | "completed" | "cancelled" | "failed";
+
+export type DatabaseCsvTransferDirection = "export" | "import";
+
+export type DatabaseCsvTransferPhase = "preparing" | "transferring" | "finalizing";
+
+export type DatabaseCsvTransferProgress = {
+  transferId: string;
+  direction: DatabaseCsvTransferDirection;
+  status: DatabaseCsvTransferStatus;
+  phase: DatabaseCsvTransferPhase;
+  rowsProcessed: number;
+  rowsWritten: number;
+  rowsSkipped: number;
+  totalRows: number | null;
+  bytesProcessed: number | null;
+  totalBytes: number | null;
+  warnings: string[];
+  mayBeIncomplete: boolean;
+  emittedAt: number;
+};
+
+export type DatabaseCsvWarning = {
+  rowNumber: number;
+  columnNumber?: number;
+  columnName?: string;
+  message: string;
+};
+
+export type DatabaseCsvExportResult = {
+  status: DatabaseCsvTransferStatus;
+  engine: DatabaseEngine;
+  table?: DatabaseCsvTable;
+  destinationPath: string;
+  rowsExported: number;
+  columns: string[];
+  bytesWritten: number;
+  encoding: DatabaseCsvEncoding;
+  delimiter: DatabaseCsvDelimiter;
+  includeHeader: boolean;
+  warnings: string[];
+  mayBeIncomplete: boolean;
+  valuesTruncated: boolean;
+  durationMs: number;
+};
+
+export type DatabaseCsvImportResult = {
+  status: DatabaseCsvTransferStatus;
+  engine: DatabaseEngine;
+  table: DatabaseCsvTable;
+  rowsRead: number;
+  rowsImported: number;
+  rowsSkipped: number;
+  warnings: DatabaseCsvWarning[];
+  warningsTruncated: boolean;
+  transaction: DatabaseRowTransactionState;
+  mayBeIncomplete: boolean;
+  durationMs: number;
+};
+
+export type DatabaseCsvPreviewField = {
+  value: string;
+  quoted: boolean;
+  isNull: boolean;
+};
+
+export type DatabaseCsvPreviewRow = {
+  rowNumber: number;
+  fields: DatabaseCsvPreviewField[];
+};
+
+export type DatabaseCsvImportPreview = {
+  headers: string[];
+  rows: DatabaseCsvPreviewRow[];
+  warnings: DatabaseCsvWarning[];
+  warningsTruncated: boolean;
+  sampledRows: number;
+  hasMore: boolean;
+  delimiter: DatabaseCsvDelimiter;
+  encoding: DatabaseCsvEncoding;
+  hasHeader: boolean;
+};
+
+export type DatabaseCsvCancellationResult = {
+  requestId: string;
+  cancelled: boolean;
+};
+
 export type DatabaseQueryWarningCode =
   | "drop"
   | "truncate"
