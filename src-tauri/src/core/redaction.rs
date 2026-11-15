@@ -36,6 +36,195 @@ pub fn sanitize_text_bounded(input: &str, max_chars: usize) -> String {
     truncate_chars(redacted.text.trim_end(), max_chars)
 }
 
+/// Redacts text and SQL password literals, then bounds it to `max_chars`.
+///
+/// SQL history and snippets need the generic secret redaction plus literals
+/// that are only secret because of SQL syntax, such as
+/// `CREATE USER ... IDENTIFIED BY 'secret'` and
+/// `ALTER ROLE ... PASSWORD 'secret'`. Those literals are not assignments and
+/// would otherwise survive the generic line-oriented redactor.
+pub fn sanitize_sql_bounded(input: &str, max_chars: usize) -> String {
+    let redacted = redact_text(input);
+    let sql_redacted = redact_sql_secret_literals(&redacted.text);
+    truncate_chars(sql_redacted.trim_end(), max_chars)
+}
+
+fn redact_sql_secret_literals(input: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+
+    while cursor < input.len() {
+        let Some((keyword_start, keyword_len)) = find_next_sql_secret_keyword(&lower, cursor)
+        else {
+            output.push_str(&input[cursor..]);
+            break;
+        };
+
+        let after_keyword = keyword_start + keyword_len;
+        output.push_str(&input[cursor..after_keyword]);
+
+        let keyword = &lower[keyword_start..after_keyword];
+        let Some((literal_start, literal_end, quote)) =
+            sql_secret_literal_after(input, after_keyword, keyword)
+        else {
+            cursor = after_keyword;
+            continue;
+        };
+
+        output.push_str(&input[after_keyword..literal_start]);
+        output.push(quote);
+        output.push_str("<redacted>");
+        output.push(quote);
+        cursor = literal_end + quote.len_utf8();
+    }
+
+    output
+}
+
+fn find_next_sql_secret_keyword(lower: &str, from: usize) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    for keyword in ["password", "identified"] {
+        if let Some(index) = find_ascii_word(lower, keyword, from)
+            && best.is_none_or(|(best_index, _)| index < best_index)
+        {
+            best = Some((index, keyword.len()));
+        }
+    }
+    best
+}
+
+fn find_ascii_word(haystack: &str, needle: &str, from: usize) -> Option<usize> {
+    let mut search_from = from;
+    while search_from < haystack.len() {
+        let relative = haystack[search_from..].find(needle)?;
+        let index = search_from + relative;
+        let before_is_word = haystack[..index]
+            .chars()
+            .next_back()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+        let after_index = index + needle.len();
+        let after_is_word = haystack[after_index..]
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_');
+        if !before_is_word && !after_is_word {
+            return Some(index);
+        }
+        search_from = after_index;
+    }
+    None
+}
+
+/// Returns the opening quote index, closing quote index, and quote character
+/// for a password literal that follows `password` or `identified ... by`.
+fn sql_secret_literal_after(
+    input: &str,
+    start: usize,
+    keyword: &str,
+) -> Option<(usize, usize, char)> {
+    let mut index = skip_ascii_whitespace(input, start);
+
+    if keyword == "password" {
+        if input
+            .as_bytes()
+            .get(index)
+            .is_some_and(|byte| *byte == b'=' || *byte == b':')
+        {
+            index = skip_ascii_whitespace(input, index + 1);
+        }
+    } else {
+        // MySQL: IDENTIFIED [WITH auth_plugin] BY 'password'.
+        if let Some(after_with) = consume_ascii_word(input, index, "with") {
+            index = skip_ascii_whitespace(input, after_with);
+            index = skip_auth_plugin(input, index);
+            index = skip_ascii_whitespace(input, index);
+        }
+        index = consume_ascii_word(input, index, "by")?;
+        index = skip_ascii_whitespace(input, index);
+    }
+
+    let quote = match input[index..].chars().next()? {
+        '\'' => '\'',
+        '"' => '"',
+        _ => return None,
+    };
+    let literal_end = closing_quote_index(input, index, quote)?;
+    Some((index, literal_end, quote))
+}
+
+fn skip_ascii_whitespace(input: &str, start: usize) -> usize {
+    let mut index = start;
+    for character in input[start..].chars() {
+        if !character.is_ascii_whitespace() {
+            break;
+        }
+        index += character.len_utf8();
+    }
+    index
+}
+
+fn consume_ascii_word(input: &str, start: usize, word: &str) -> Option<usize> {
+    let end = start + word.len();
+    if end > input.len() {
+        return None;
+    }
+    let candidate = &input[start..end];
+    if !candidate.eq_ignore_ascii_case(word) {
+        return None;
+    }
+    if input[end..]
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return None;
+    }
+    Some(end)
+}
+
+fn skip_auth_plugin(input: &str, start: usize) -> usize {
+    let Some(first) = input[start..].chars().next() else {
+        return start;
+    };
+    if matches!(first, '\'' | '"') {
+        return closing_quote_index(input, start, first)
+            .map(|index| index + first.len_utf8())
+            .unwrap_or(start);
+    }
+
+    let mut index = start;
+    for character in input[start..].chars() {
+        if !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')) {
+            break;
+        }
+        index += character.len_utf8();
+    }
+    index
+}
+
+fn closing_quote_index(input: &str, start: usize, quote: char) -> Option<usize> {
+    let mut characters = input[start + quote.len_utf8()..].char_indices();
+    while let Some((offset, character)) = characters.next() {
+        if character == '\\' {
+            characters.next();
+            continue;
+        }
+        if character == quote {
+            if characters
+                .clone()
+                .next()
+                .is_some_and(|(_, next)| next == quote)
+            {
+                characters.next();
+                continue;
+            }
+            return Some(start + quote.len_utf8() + offset);
+        }
+    }
+    None
+}
+
 fn redact(input: &str, preserve_private_key_lines: bool) -> RedactedText {
     let stripped = strip_ansi(input);
     let ends_with_newline = stripped.ends_with('\n');
@@ -67,20 +256,34 @@ fn redact(input: &str, preserve_private_key_lines: bool) -> RedactedText {
         if looks_like_dotenv_line(line) {
             redacted = true;
             output.push_str("[redacted environment line]");
-        } else if let Some(value) = redact_bearer_token(line) {
-            redacted = true;
-            output.push_str(&value);
-        } else if let Some(value) = redact_url_password(line) {
-            redacted = true;
-            output.push_str(&value);
-        } else if let Some(value) = redact_secret_assignment(line) {
-            redacted = true;
-            output.push_str(&value);
-        } else if let Some(value) = redact_token_shape(line) {
-            redacted = true;
-            output.push_str(&value);
         } else {
-            output.push_str(&strip_line_controls(line));
+            let mut line = strip_line_controls(line);
+            // A single line can contain several independent secrets, for
+            // example `DB_PASSWORD=... Authorization: Bearer ...`. Apply every
+            // pattern instead of stopping at the first match.
+            for _ in 0..4 {
+                let previous = line.clone();
+                if let Some(value) = redact_bearer_token(&line) {
+                    redacted = true;
+                    line = value;
+                }
+                if let Some(value) = redact_url_password(&line) {
+                    redacted = true;
+                    line = value;
+                }
+                if let Some(value) = redact_secret_assignment(&line) {
+                    redacted = true;
+                    line = value;
+                }
+                if let Some(value) = redact_token_shape(&line) {
+                    redacted = true;
+                    line = value;
+                }
+                if line == previous {
+                    break;
+                }
+            }
+            output.push_str(&line);
         }
         output.push('\n');
     }
@@ -206,7 +409,12 @@ fn redact_secret_assignment(line: &str) -> Option<String> {
             continue;
         }
         let value = &line[index + separator.len_utf8()..];
-        if value.trim().is_empty() || !is_secret_key(key) {
+        let trimmed_value = value.trim();
+        if trimmed_value.is_empty()
+            || trimmed_value == "<redacted>"
+            || trimmed_value.eq_ignore_ascii_case("Bearer <redacted>")
+            || !is_secret_key(key)
+        {
             continue;
         }
 
@@ -419,6 +627,48 @@ mod tests {
                 output.text
             );
         }
+    }
+
+    #[test]
+    fn redacts_multiple_secret_patterns_on_one_line() {
+        let output = redact_text(
+            "authentication failed for DB_PASSWORD=fixture-password with \
+             Authorization: Bearer fixture-token",
+        );
+
+        assert!(output.redacted);
+        assert!(!output.text.contains("fixture-password"));
+        assert!(!output.text.contains("fixture-token"));
+        assert!(output.text.contains("DB_PASSWORD=<redacted>"));
+    }
+
+    #[test]
+    fn redacts_sql_password_literals_without_touching_columns() {
+        let sanitized = sanitize_sql_bounded(
+            "CREATE USER 'app'@'%' IDENTIFIED BY 'fixture-password';\n\
+             ALTER ROLE app WITH PASSWORD 'fixture-role-password';\n\
+             CREATE USER 'plugin'@'%' IDENTIFIED WITH caching_sha2_password BY 'fixture-plugin-password';\n\
+             SET PASSWORD = 'fixture-set-password';\n\
+             SELECT password, token FROM users WHERE active = true;\n",
+            MAX,
+        );
+
+        for secret in [
+            "fixture-password",
+            "fixture-role-password",
+            "fixture-plugin-password",
+            "fixture-set-password",
+        ] {
+            assert!(
+                !sanitized.contains(secret),
+                "sanitized SQL still contains {secret:?}: {sanitized}"
+            );
+        }
+        assert!(sanitized.contains("IDENTIFIED BY '<redacted>'"));
+        assert!(sanitized.contains("PASSWORD '<redacted>'"));
+        assert!(sanitized.contains("SET PASSWORD ="));
+        // A column named `password` is ordinary SQL and stays readable.
+        assert!(sanitized.contains("SELECT password, token FROM users"));
     }
 
     #[test]

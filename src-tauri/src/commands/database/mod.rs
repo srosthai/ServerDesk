@@ -7,6 +7,7 @@
 pub mod actions;
 pub mod capabilities;
 pub mod discovery;
+pub mod history;
 pub mod profiles;
 pub mod queries;
 pub mod row_writes;

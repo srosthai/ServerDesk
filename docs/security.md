@@ -17,7 +17,8 @@ ServerDesk stores its working data locally in SQLite:
 - preferences: theme, monitoring interval, and the last active server;
 - detected Laravel project metadata;
 - trusted SSH host-key fingerprints;
-- bounded, sanitized operation history.
+- bounded, sanitized operation history;
+- bounded, sanitized database query history and local SQL snippets.
 
 The database, WAL, and shared-memory sidecars are restricted to the owning user
 (`0600`) on Unix. SQLite contains credential references, not passwords, private
@@ -193,6 +194,12 @@ confirmation.
   overwritten rather than left recoverable in free pages.
 - Operation history stores bounded, sanitized metadata only. Full command
   output, terminal input, `.env` contents, and secrets are never written.
+- Database query history stores bounded, sanitized SQL and a short sanitized
+  error summary — never result grids, parameters, or raw driver output. Saved
+  snippets are sanitized the same way. History is capped at the newest 1,000
+  rows, one history SQL body at 8,192 characters, and snippets at 65,536
+  characters. Clearing history and deleting a snippet both require explicit
+  confirmation.
 - There is no file logger, crash reporter, or diagnostic-bundle writer in the
   application. Any future one must call the central redaction module before
   writing a byte; the security test suite guards against adding an unreviewed
@@ -211,6 +218,7 @@ It removes or replaces:
   authorization, cookie, and session assignments;
 - bearer tokens and credentials embedded in URLs;
 - common token shapes such as GitHub, Slack, OpenAI-style, and AWS access keys;
+- SQL password literals such as `IDENTIFIED BY '...'` and `PASSWORD '...'`;
 - private-key blocks;
 - ANSI control sequences and terminal control characters.
 
