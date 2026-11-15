@@ -380,6 +380,7 @@ impl FromStr for DatabaseQueryResult {
 
 /// One bounded, sanitized query-history entry for the SQL workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DatabaseQueryHistory {
     pub id: String,
     pub server_id: String,
@@ -422,6 +423,7 @@ pub struct DatabaseQueryHistoryFilter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DatabaseSavedQuery {
     pub id: String,
     pub name: String,

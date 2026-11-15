@@ -834,6 +834,44 @@ Destructive SQL opens a confirmation before the confirmed execution is sent,
 and failures surface the SQLSTATE or MySQL error code plus position feedback
 when the engine reports one.
 
+### Query history and saved snippets
+
+`src-tauri/src/commands/database/history.rs` exposes the local history and
+snippet commands:
+
+| Command                             | Purpose                                            |
+| ----------------------------------- | -------------------------------------------------- |
+| `list_database_query_history`       | List sanitized history with connection/result/date |
+| `get_database_query_history_policy` | Read retention and size bounds                     |
+| `clear_database_query_history`      | Clear history after explicit confirmation          |
+| `list_database_saved_queries`       | List reusable snippets                             |
+| `create_database_saved_query`       | Save a sanitized snippet                           |
+| `update_database_saved_query`       | Update a snippet's name, engine, or SQL            |
+| `delete_database_saved_query`       | Delete a snippet after explicit confirmation       |
+
+The execution command records one row after a success, failure, or cancellation.
+`src-tauri/src/core/database_history.rs` sanitizes SQL and the short error
+summary, then calls the storage repository. The central redactor
+(`core/redaction.rs`) covers assignments, bearer tokens, URL credentials,
+private-key blocks, dotenv-style lines, common token prefixes, and SQL password
+literals such as `IDENTIFIED BY '...'` and `PASSWORD '...'`. The storage schema
+keeps only the connection id, engine, database name, sanitized SQL, result,
+duration, row count, short error summary, and start time; result grids,
+parameters, and raw engine output are never stored.
+
+History retention is enforced on every insert: the newest 1,000 rows are kept
+and older rows are deleted in the same storage call. One history SQL body is
+bounded to 8,192 characters and an error summary to 512 characters. Snippets
+allow 120-character names and 65,536-character SQL bodies; both are sanitized
+before storage. Clear-history and delete-snippet commands reject an unconfirmed
+request at the command layer, in addition to the React confirmation dialogs.
+
+`src/services/databaseHistory.ts` is the typed command boundary, and
+`src/stores/databaseHistoryStore.ts` owns loaded history, snippets, the policy,
+and pending/error state. `DatabaseSqlHistoryPanel` renders filters, the history
+list, snippet creation, insert-at-selection, and both confirmations inside the
+SQL workspace. Snippets for another engine are shown but cannot be inserted.
+
 ### Tests
 
 `src-tauri/tests/database_queries.rs` uses the fake adapter for both engines and
@@ -844,6 +882,11 @@ opt-in live MySQL and PostgreSQL suites add real SELECT/write execution,
 multi-statement results, limits, syntax-error code/position mapping,
 cancellation, and timeout on `SLEEP`/`pg_sleep`, including session closure after
 a timeout.
+
+`src-tauri/tests/database_history.rs` covers SQL and error redaction, oversized
+SQL bounding, retention pruning, connection/result/date filters, restart
+persistence, snippet sanitization/reuse/update/delete, and clear-history
+confirmation.
 
 The React SQL workspace suite covers adding, switching, and closing query tabs;
 current-statement, selection, Run all, and Ctrl+Enter execution; per-tab draft

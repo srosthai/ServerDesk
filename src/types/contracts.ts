@@ -819,6 +819,58 @@ export type DatabaseQueryOptions = {
   confirmed?: boolean;
 };
 
+export type DatabaseQueryHistoryResult = "success" | "failure" | "cancelled";
+
+/** One bounded, sanitized SQL history entry stored in the local database. */
+export type DatabaseQueryHistoryEntry = {
+  id: string;
+  serverId: string;
+  connectionId: string;
+  engine: DatabaseEngine;
+  databaseName: string | null;
+  sqlText: string;
+  result: DatabaseQueryHistoryResult;
+  durationMs: number;
+  rowCount: number | null;
+  errorSummary: string | null;
+  startedAt: number;
+};
+
+export type DatabaseQueryHistoryFilter = {
+  serverId?: string | null;
+  connectionId?: string | null;
+  result?: DatabaseQueryHistoryResult | null;
+  startedAfter?: number | null;
+  startedBefore?: number | null;
+  limit?: number | null;
+};
+
+/** Retention and size policy for SQL history and saved snippets. */
+export type DatabaseQueryHistoryPolicy = {
+  maxEntries: number;
+  maxSqlChars: number;
+  errorSummaryMaxChars: number;
+  snippetNameMaxChars: number;
+  snippetSqlMaxChars: number;
+  retention: string;
+};
+
+/** A reusable SQL snippet. Snippets are local and not tied to a server. */
+export type DatabaseSavedQuery = {
+  id: string;
+  name: string;
+  engine: DatabaseEngine;
+  sqlText: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type DatabaseSavedQueryInput = {
+  name: string;
+  engine: DatabaseEngine;
+  sql: string;
+};
+
 export type DatabaseExplorerNode =
   | { kind: "databases" }
   | { kind: "schemas" }
