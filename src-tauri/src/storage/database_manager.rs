@@ -24,6 +24,12 @@ pub const DEFAULT_DATABASE_QUERY_HISTORY_LIMIT: u32 = 200;
 /// Hard cap for one history query so a single call cannot load the whole table.
 pub const MAX_DATABASE_QUERY_HISTORY_LIMIT: u32 = 1_000;
 
+/// Maximum number of query-history rows kept on disk.
+///
+/// Recording a query prunes the oldest rows beyond this bound so the local
+/// history cannot grow without limit. Users can also clear it explicitly.
+pub const MAX_DATABASE_QUERY_HISTORY_RECORDS: u32 = 1_000;
+
 impl Database {
     pub fn create_database_connection(
         &self,
@@ -221,6 +227,15 @@ impl Database {
                     input.error_summary,
                     input.started_at,
                 ],
+            )?;
+
+            connection.execute(
+                "DELETE FROM database_query_history WHERE id NOT IN (
+                    SELECT id FROM database_query_history
+                    ORDER BY started_at DESC, id DESC
+                    LIMIT ?1
+                )",
+                params![i64::from(MAX_DATABASE_QUERY_HISTORY_RECORDS)],
             )?;
 
             get_database_query_history(connection, &id)?.ok_or(StorageError::NotFound)

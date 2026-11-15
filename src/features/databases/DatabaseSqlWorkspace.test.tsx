@@ -8,6 +8,17 @@ import {
   createDatabaseQueryRequestId,
   executeDatabaseSql,
 } from "@/services/databaseQueries";
+import {
+  clearDatabaseQueryHistory,
+  createDatabaseSavedQuery,
+  deleteDatabaseSavedQuery,
+  getDatabaseQueryHistoryPolicy,
+  listDatabaseQueryHistory,
+  listDatabaseSavedQueries,
+  updateDatabaseSavedQuery,
+} from "@/services/databaseHistory";
+import { useDatabaseHistoryStore } from "@/stores/databaseHistoryStore";
+import { useDatabaseProfileStore } from "@/stores/databaseProfileStore";
 import { useDatabaseQueryStore } from "@/stores/databaseQueryStore";
 import { useDatabaseWorkspaceStore } from "@/stores/databaseWorkspaceStore";
 import type {
@@ -23,6 +34,16 @@ vi.mock("@/services/databaseQueries", () => ({
   cancelDatabaseSql: vi.fn(),
   createDatabaseQueryRequestId: vi.fn(),
   executeDatabaseSql: vi.fn(),
+}));
+
+vi.mock("@/services/databaseHistory", () => ({
+  listDatabaseQueryHistory: vi.fn(),
+  getDatabaseQueryHistoryPolicy: vi.fn(),
+  clearDatabaseQueryHistory: vi.fn(),
+  listDatabaseSavedQueries: vi.fn(),
+  createDatabaseSavedQuery: vi.fn(),
+  updateDatabaseSavedQuery: vi.fn(),
+  deleteDatabaseSavedQuery: vi.fn(),
 }));
 
 const capabilities: DatabaseCapabilities = {
@@ -190,6 +211,36 @@ describe("DatabaseSqlWorkspace", () => {
     idCounter = 0;
     useDatabaseWorkspaceStore.setState({ tabs: {}, order: [], activeTabId: null });
     useDatabaseQueryStore.setState({ entries: {} });
+    useDatabaseProfileStore.setState({ profiles: { [profile.serverId]: [profile] } });
+    useDatabaseHistoryStore.getState().reset();
+    vi.mocked(getDatabaseQueryHistoryPolicy).mockResolvedValue({
+      maxEntries: 1_000,
+      maxSqlChars: 8_192,
+      errorSummaryMaxChars: 512,
+      snippetNameMaxChars: 120,
+      snippetSqlMaxChars: 65_536,
+      retention: "Keeps the newest 1,000 queries.",
+    });
+    vi.mocked(listDatabaseQueryHistory).mockResolvedValue([]);
+    vi.mocked(listDatabaseSavedQueries).mockResolvedValue([]);
+    vi.mocked(clearDatabaseQueryHistory).mockResolvedValue(undefined);
+    vi.mocked(createDatabaseSavedQuery).mockResolvedValue({
+      id: "snippet-1",
+      name: "Snippet",
+      engine: "postgresql",
+      sqlText: "SELECT 1",
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    vi.mocked(updateDatabaseSavedQuery).mockResolvedValue({
+      id: "snippet-1",
+      name: "Snippet",
+      engine: "postgresql",
+      sqlText: "SELECT 1",
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    vi.mocked(deleteDatabaseSavedQuery).mockResolvedValue(undefined);
     vi.mocked(createDatabaseQueryRequestId).mockImplementation(() => {
       idCounter += 1;
       return `request-${idCounter}`;
@@ -491,6 +542,33 @@ describe("DatabaseSqlWorkspace", () => {
         "request-2",
       );
     });
+  });
+
+  it("inserts a saved snippet into the active query tab", async () => {
+    const user = userEvent.setup();
+    vi.mocked(listDatabaseSavedQueries).mockResolvedValueOnce([
+      {
+        id: "snippet-1",
+        name: "Active users",
+        engine: "postgresql",
+        sqlText: "SELECT * FROM users WHERE active = true",
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ]);
+    openWorkspace();
+
+    await screen.findByText("Active users");
+    expect(sqlEditor().value).toBe("");
+
+    await user.click(screen.getByRole("button", { name: "Insert snippet Active users" }));
+
+    await waitFor(() => {
+      expect(sqlEditor().value).toBe("SELECT * FROM users WHERE active = true");
+    });
+    expect(screen.getByRole("status")).toHaveTextContent(
+      'Inserted "Active users" into the current query tab.',
+    );
   });
 
   it("exports CSV and JSON and copies the selected result set", async () => {
