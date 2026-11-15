@@ -322,6 +322,73 @@ pub fn resolve_insert(
     Ok(ResolvedInsert { values })
 }
 
+/// Resolves mapped CSV values against live column metadata. Import does not
+/// require a stable row identity, but it rejects generated and
+/// `GENERATED ALWAYS` columns and every value that cannot be parsed for the
+/// target type. A `None` value is SQL NULL; an empty string is an empty value.
+pub fn resolve_import_values(
+    metadata: &RowTableMetadata,
+    columns: &[usize],
+    values: &[Option<String>],
+) -> Result<Vec<ResolvedValue>, DatabaseError> {
+    if columns.is_empty() {
+        return Err(DatabaseError::validation(
+            "Map at least one destination column before importing.",
+        ));
+    }
+    if columns.len() != values.len() {
+        return Err(DatabaseError::internal(
+            "The CSV mapping did not match the imported value count.",
+        ));
+    }
+    let mut seen = HashSet::new();
+    let mut resolved = Vec::with_capacity(columns.len());
+    for (column_index, value) in columns.iter().zip(values) {
+        if !seen.insert(*column_index) {
+            return Err(DatabaseError::validation(
+                "A destination column is mapped more than once.",
+            ));
+        }
+        let column = metadata.column(*column_index)?;
+        if column.generated {
+            return Err(DatabaseError::validation(format!(
+                "Column {} is generated and cannot receive imported values.",
+                column.name
+            )));
+        }
+        if column.identity == ColumnIdentity::Always {
+            return Err(DatabaseError::validation(format!(
+                "Column {} is generated always and cannot receive imported values.",
+                column.name
+            )));
+        }
+        match value {
+            None => {
+                if !column.nullable {
+                    return Err(DatabaseError::validation(format!(
+                        "Column {} is not nullable.",
+                        column.name
+                    )));
+                }
+                resolved.push(ResolvedValue {
+                    column: *column_index,
+                    value: ResolvedWriteValue::Null,
+                    text: None,
+                });
+            }
+            Some(text) => {
+                let (bound, canonical) = parse_value(column, text)?;
+                resolved.push(ResolvedValue {
+                    column: *column_index,
+                    value: ResolvedWriteValue::Value(bound),
+                    text: Some(canonical),
+                });
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 /// Resolves one update request, including its identity and conflict guards.
 pub fn resolve_update(
     request: &RowUpdateRequest,

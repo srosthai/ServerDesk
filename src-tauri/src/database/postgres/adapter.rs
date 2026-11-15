@@ -25,12 +25,16 @@ use tokio::{
 use crate::storage::DatabaseEngine;
 
 use super::{
-    POSTGRES_DIALECT, actions as engine_actions, ddl as engine_ddl, queries as engine_queries,
-    rows as engine_rows, sql,
+    POSTGRES_DIALECT, actions as engine_actions, csv as engine_csv, ddl as engine_ddl,
+    queries as engine_queries, rows as engine_rows, sql,
 };
 use crate::database::{
     actions::{DatabaseDdlPreview, ValidatedDatabaseAction},
     capabilities::{DatabaseAction, DatabaseCapabilities, DatabaseVersion},
+    csv::{
+        CsvExportSink, CsvExportSource, CsvExportSummary, CsvImportObserver, CsvImportRequest,
+        CsvImportSource, CsvImportSummary,
+    },
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
     pagination::{Bounded, Page, PageRequest},
@@ -951,6 +955,77 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
             drop(guard.take());
         }
 
+        result
+    }
+
+    async fn export_csv(
+        &mut self,
+        source: &CsvExportSource,
+        sink: &mut dyn CsvExportSink,
+        control: &RowQueryControl,
+    ) -> Result<CsvExportSummary, DatabaseError> {
+        match source {
+            CsvExportSource::Table { .. } => {
+                self.require_capability(DatabaseAction::BrowseRows)?;
+            }
+            CsvExportSource::Query { .. } => {
+                self.require_capability(DatabaseAction::RunQuery)?;
+            }
+        }
+        if control.is_cancelled() {
+            return Err(DatabaseError::cancelled("The CSV export was cancelled."));
+        }
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let result = engine_csv::export(connection, source, sink, control).await;
+        if matches!(&result, Err(error) if matches!(
+            error.kind,
+            crate::database::DatabaseErrorKind::Cancelled
+                | crate::database::DatabaseErrorKind::Timeout
+                | crate::database::DatabaseErrorKind::Connection
+        )) {
+            // A dropped streaming query future can leave the protocol stream
+            // in an unknown state. Close the session instead of reusing it.
+            self.connected.store(false, Ordering::SeqCst);
+            drop(guard.take());
+        }
+        result
+    }
+
+    async fn import_csv(
+        &mut self,
+        request: &CsvImportRequest,
+        source: &mut dyn CsvImportSource,
+        observer: &mut dyn CsvImportObserver,
+        control: &RowQueryControl,
+    ) -> Result<CsvImportSummary, DatabaseError> {
+        self.require_capability(DatabaseAction::InsertRow)?;
+        if self.read_only {
+            return Err(DatabaseError::permission(
+                "The database session is read-only; CSV imports are disabled.",
+            ));
+        }
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let result = engine_csv::import(
+            connection,
+            request,
+            source,
+            observer,
+            control,
+            self.read_only,
+        )
+        .await
+        .map_err(|error| error.scoped_permission("table", request.table.name.as_str()));
+        if matches!(&result, Err(error) if matches!(
+            error.kind,
+            crate::database::DatabaseErrorKind::Cancelled
+                | crate::database::DatabaseErrorKind::Timeout
+                | crate::database::DatabaseErrorKind::Connection
+        )) {
+            self.connected.store(false, Ordering::SeqCst);
+            drop(guard.take());
+        }
         result
     }
 

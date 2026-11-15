@@ -6,6 +6,7 @@
 
 pub mod actions;
 pub mod capabilities;
+pub mod csv;
 pub mod discovery;
 pub mod history;
 pub mod profiles;

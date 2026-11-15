@@ -15,6 +15,7 @@ use super::{
 pub mod actions;
 pub mod adapter;
 pub mod capabilities;
+pub(crate) mod csv;
 pub mod ddl;
 pub mod queries;
 pub mod rows;
