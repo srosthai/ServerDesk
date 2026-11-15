@@ -13,6 +13,7 @@ import {
   ClockIcon,
   ColumnsIcon,
   EyeIcon,
+  FileCsvIcon,
   FunnelIcon,
   MagnifyingGlassIcon,
   PencilSimpleIcon,
@@ -73,6 +74,7 @@ import {
   visibleColumnNames,
   type CellPresentation,
 } from "@/features/databases/databaseDataGridModel";
+import { DatabaseCsvTransferDialog } from "@/features/databases/DatabaseCsvTransferDialog";
 import {
   EditRowDialog,
   InsertRowDialog,
@@ -560,6 +562,7 @@ export function DatabaseDataGrid({
   const [filterError, setFilterError] = useState<string | null>(null);
   const [searchDraft, setSearchDraft] = useState(grid.search);
   const [columnsOpen, setColumnsOpen] = useState(false);
+  const [csvMode, setCsvMode] = useState<"export" | "import" | null>(null);
   const [viewer, setViewer] = useState<ViewerTarget | null>(null);
   const [insertOpen, setInsertOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
@@ -1097,6 +1100,31 @@ export function DatabaseDataGrid({
           >
             <ColumnsIcon className="size-3.5" aria-hidden="true" />
             Columns
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => setCsvMode("export")}
+            disabled={!connected || loading}
+            aria-label="Export table to CSV"
+          >
+            <FileCsvIcon className="size-3.5" aria-hidden="true" />
+            Export CSV
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => setCsvMode("import")}
+            disabled={!result || readOnly || loading || allColumns.length === 0}
+            title={
+              readOnly
+                ? "Read-only profiles cannot import rows."
+                : "Preview and map a CSV file before importing"
+            }
+            aria-label="Import CSV into table"
+          >
+            <FileCsvIcon className="size-3.5" aria-hidden="true" />
+            Import CSV
           </Button>
           <Button
             variant="secondary"
@@ -1937,6 +1965,24 @@ export function DatabaseDataGrid({
         onConfirm={() => void handleDelete()}
         pending={writePending}
       />
+
+      {csvMode ? (
+        <DatabaseCsvTransferDialog
+          key={csvMode}
+          open
+          mode={csvMode}
+          onOpenChange={(open) => {
+            if (!open) {
+              setCsvMode(null);
+            }
+          }}
+          profileId={profileId}
+          table={{ database, schema, name: table }}
+          columns={allColumns}
+          readOnly={readOnly}
+          onImported={handleRefresh}
+        />
+      ) : null}
 
       <ColumnSettingsDialog
         open={columnsOpen}

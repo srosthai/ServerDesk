@@ -53,7 +53,7 @@ fn timeout_error(timeout: std::time::Duration) -> DatabaseError {
     ))
 }
 
-async fn bounded_query<F, T>(
+pub(crate) async fn bounded_query<F, T>(
     control: &RowQueryControl,
     deadline: Instant,
     future: F,
@@ -75,7 +75,7 @@ where
     }
 }
 
-fn bind_values<'q>(
+pub(crate) fn bind_values<'q>(
     mut query: Query<'q, Postgres, PgArguments>,
     values: &[SqlValue],
 ) -> Query<'q, Postgres, PgArguments> {
@@ -92,20 +92,20 @@ fn bind_values<'q>(
     query
 }
 
-fn qualified_table(metadata: &RowTableMetadata) -> Result<QualifiedName, DatabaseError> {
+pub(crate) fn qualified_table(metadata: &RowTableMetadata) -> Result<QualifiedName, DatabaseError> {
     let schema = metadata.schema.as_deref().ok_or_else(|| {
         DatabaseError::validation("Select a PostgreSQL schema before browsing table rows.")
     })?;
     QualifiedName::new([Identifier::new(schema)?, metadata.table.clone()])
 }
 
-fn alias(index: usize) -> Identifier {
+pub(crate) fn alias(index: usize) -> Identifier {
     Identifier::new(format!("sd_{index}")).expect("generated row alias is a valid identifier")
 }
 
 /// PostgreSQL renders every non-binary value through its type output function.
 /// Binary data is base64 so it can cross the typed text boundary safely.
-fn cell_expression(column: &RowColumn, truncate: bool) -> String {
+pub(crate) fn cell_expression(column: &RowColumn, truncate: bool) -> String {
     let quoted = POSTGRES_DIALECT.quote_identifier(&column.name);
     let raw = if column.kind == crate::database::rows::RowColumnKind::Binary {
         format!("encode({quoted}, 'base64')")
@@ -1113,7 +1113,7 @@ fn table_label(metadata: &RowTableMetadata) -> String {
     label
 }
 
-async fn begin_transaction(
+pub(crate) async fn begin_transaction(
     connection: &mut PgConnection,
     deadline: Instant,
 ) -> Result<sqlx::Transaction<'_, Postgres>, DatabaseError> {
@@ -1125,7 +1125,7 @@ async fn begin_transaction(
         .map_err(map_sqlx_error)
 }
 
-async fn commit_transaction(
+pub(crate) async fn commit_transaction(
     tx: sqlx::Transaction<'_, Postgres>,
     deadline: Instant,
 ) -> Result<(), DatabaseError> {
@@ -1144,7 +1144,7 @@ async fn commit_transaction(
     }
 }
 
-async fn fail_and_rollback(
+pub(crate) async fn fail_and_rollback(
     tx: sqlx::Transaction<'_, Postgres>,
     error: DatabaseError,
     deadline: Instant,

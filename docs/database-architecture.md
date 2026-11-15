@@ -37,6 +37,7 @@ src-tauri/src/commands/database/
   profiles.rs       saved profile CRUD, test, connect, reconnect, disconnect
   queries.rs        SQL analysis, bounded execution, and cancellation commands
   rows.rs           bounded row reads and cancellation commands
+  csv.rs            CSV preview, streaming export, transactional import, progress
   structure.rs      structure preview and table lifecycle execution + audit
   tunnels.rs        loopback SSH tunnel inspection commands
 
@@ -47,6 +48,7 @@ src-tauri/src/database/
   structure.rs      table/column/index/constraint validation, DDL previews, and table execution
   discovery.rs      explorer-node request/response and metadata service
   queries.rs        SQL request model, destructive analysis, limits, and cancellation
+  csv.rs            CSV codec, encoding, preview, transfer service, and cancellation
   row_service.rs    row-read service over the connection registry
   rows.rs           row request model, safe planning, cancellation, and page/result types
   capabilities.rs   action model, flags, version parsing
@@ -63,6 +65,7 @@ src-tauri/src/database/
     capabilities.rs MySQL version gates
     queries.rs      MySQL streaming SQL execution and result decoding
     rows.rs         MySQL row metadata, query builders, and bounded reads
+    csv.rs          MySQL streaming CSV export and transactional import
     sql.rs          MySQL-only metadata and row-browser SQL
   postgres/
     mod.rs          PostgreSQL dialect
@@ -72,6 +75,7 @@ src-tauri/src/database/
     capabilities.rs PostgreSQL version gates
     queries.rs      PostgreSQL streaming SQL execution and result decoding
     rows.rs         PostgreSQL row metadata, query builders, and bounded reads
+    csv.rs          PostgreSQL streaming CSV export and transactional import
     sql.rs          PostgreSQL-only metadata and row-browser SQL
 ```
 
@@ -1174,6 +1178,93 @@ temporal casts, sorting, exact counts, cancellation, injection attempts, and
 no-identity fallback. They bind no public port. The live path has been exercised
 against a PostgreSQL 18 container.
 
+## CSV import and export
+
+`src-tauri/src/commands/database/csv.rs` owns the CSV command surface:
+
+| Command                        | Purpose                                                        |
+| ------------------------------ | -------------------------------------------------------------- |
+| `preview_database_csv_import`  | Parse a bounded preview with headers, NULL state, and warnings |
+| `export_database_csv`          | Stream a table or one read-only query to a local CSV file      |
+| `import_database_csv`          | Map and import a CSV file into one table in one transaction    |
+| `cancel_database_csv_transfer` | Cancel one in-flight import or export by request id            |
+
+An export request names one table or one read-only SQL statement, an absolute
+destination path, a delimiter (`comma`, `semicolon`, `tab`, or `pipe`), an
+encoding (`utf8`, `utf8_bom`, `utf16_le`, `utf16_be`, or `latin1`), whether to
+write a header, and whether an existing destination may be replaced. A query
+export must be exactly one statement and is rejected before execution when the
+analysis finds a write. Table exports select every column without the
+row-browser display bound, so long values are written in full. Query exports
+also write every value returned by the statement; the ordinary SQL result grid
+remains bounded and separately marked as truncated.
+
+An import request names the target table, absolute source path, delimiter,
+encoding, header behavior, NULL mode, and source-to-target column mappings. The
+preview command parses at most 100 rows and returns full values, header names,
+row/column warnings, and `hasMore`; it never imports. `nullMode` is one of:
+
+- `{ "kind": "unquotedEmpty" }` — an unquoted empty field is SQL NULL, while a
+  quoted empty field (`""`) is an empty string. This is the default and matches
+  the export writer.
+- `{ "kind": "literal", "value": "NULL" }` — a field whose text exactly matches
+  the literal is SQL NULL.
+- `{ "kind": "never" }` — every field is a value, including empty fields.
+
+The parser streams characters from the file instead of loading it into memory.
+It accepts quoted fields with embedded delimiters, quotes, CR/LF newlines, and
+UTF-8 BOMs, UTF-16 LE/BE, and Latin-1 input. Malformed quotes and unexpected
+text after a closing quote fail with the one-based row and column. Rows whose
+field count differs from the header, or that contain NUL, are reported and
+skipped; type-conversion failures are also reported and skipped. A structural
+parse error or a driver failure rolls the whole import transaction back. The
+result therefore distinguishes `completed` with skipped-row warnings from
+`cancelled` with `transaction: rolled_back`; it never reports a partial import
+as success.
+
+### Bounds and safety
+
+| Bound                                  | Value                         |
+| -------------------------------------- | ----------------------------- |
+| Default / maximum CSV transfer timeout | 300 / 3,600 sec               |
+| Default / maximum preview rows         | 20 / 100                      |
+| Maximum CSV columns                    | 1,024                         |
+| Maximum characters in one CSV field    | 16,777,216 (reject, no trunc) |
+| Maximum warnings in one response       | 100, with `warningsTruncated` |
+
+Every export writes to a sibling hidden partial file and flushes it before an
+atomic rename. A cancelled or failed export removes the partial file, so an
+existing destination is never replaced by an incomplete export. The cancellation
+result says the partial file was removed and the destination was not changed.
+Imports stream directly from the source and use one database transaction; a
+cancel, timeout, or driver failure rolls back every row, while locally rejected
+rows are reported and skipped before commit.
+
+Progress is emitted as `database-csv-transfer-event`. It contains only the
+transfer id, direction, phase, status, row and byte counts, bounded warning
+text, and the incomplete marker. CSV paths, SQL text, row values, connection
+details, and credentials are never included. Audit history records one
+`database` category row per transfer with the direction, table or query source,
+engine, connection profile name, row counts, and result; it stores no path, SQL,
+or values.
+
+`src/services/databaseCsv.ts` is the typed command boundary.
+`src/stores/databaseCsvStore.ts` owns the preview, one active transfer,
+cancellation state, progress, and terminal result. The Data tab exposes
+Export CSV and Import CSV, and the SQL result panel exposes Full CSV, which
+re-runs the executed statement as one read-only export. The complete transfer
+wizard and backup/restore flows remain #184.
+
+### Tests
+
+`src-tauri/tests/database_csv.rs` covers quoted fields with embedded commas,
+quotes, and newlines; UTF-8, UTF-16 LE/BE, and Latin-1; Unicode and emoji; NULL
+versus empty string; ragged and malformed rows with row/column context; a
+20,000-row streaming file; full values beyond the 4,096-character row-browser
+display bound; cancellation and malformed-input rollback; and a CSV round-trip
+through the fake MySQL and PostgreSQL adapters. Partial-file cleanup is tested
+without a live database.
+
 ## Current limitations
 
 - One PostgreSQL connection browses only its connected database catalog.
@@ -1190,6 +1281,14 @@ against a PostgreSQL 18 container.
   but not rows or foreign keys. Copying data is deferred to the import/export
   slice so a duplicate cannot unexpectedly copy a large table.
 - MySQL table row counts are engine estimates (`TABLE_ROWS`); they are not exact.
+- CSV import rejects array, spatial, and other types the row editor cannot parse
+  safely; those columns are omitted from the mapping instead of being guessed.
+  Query-exported binary values use the SQL result hex representation and are not
+  a byte-for-byte import source for binary columns; table exports use base64 and
+  do round-trip.
+- CSV import is one transaction, so a very large file holds one transaction open
+  for the duration. Progress and cancellation remain available, but the user
+  should prefer smaller batches for very large imports.
 - The row browser and row editor read base tables, not views. A table without a
   stable primary key or complete non-null unique index stays read-only for
   insert, update, and delete.

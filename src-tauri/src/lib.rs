@@ -14,7 +14,7 @@ use crate::{
         ssh::{ConnectionManager, ConnectionTimeouts, RusshTransport, TunnelManager},
         terminal::TerminalManager,
     },
-    database::{DatabaseConnectionRegistry, QueryRegistry, RowQueryRegistry},
+    database::{CsvTransferRegistry, DatabaseConnectionRegistry, QueryRegistry, RowQueryRegistry},
 };
 
 async fn release_connections(app: &tauri::AppHandle) {
@@ -131,6 +131,7 @@ pub fn run() {
             app.manage(DatabaseConnectionRegistry::new(Arc::clone(&tunnels)));
             app.manage(RowQueryRegistry::default());
             app.manage(QueryRegistry::default());
+            app.manage(CsvTransferRegistry::default());
             app.manage(Arc::clone(&connections));
             app.manage(tunnels);
             app.manage(Arc::new(FileTransferManager::new(
@@ -195,6 +196,10 @@ pub fn run() {
             commands::database::history::delete_database_saved_query,
             commands::database::rows::read_database_table_rows,
             commands::database::rows::cancel_database_row_read,
+            commands::database::csv::preview_database_csv_import,
+            commands::database::csv::export_database_csv,
+            commands::database::csv::import_database_csv,
+            commands::database::csv::cancel_database_csv_transfer,
             commands::database::row_writes::insert_database_table_row,
             commands::database::row_writes::update_database_table_row,
             commands::database::row_writes::delete_database_table_rows,

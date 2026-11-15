@@ -7,6 +7,7 @@
 
 pub mod actions;
 pub mod capabilities;
+pub mod csv;
 pub mod dialect;
 pub mod discovery;
 pub mod errors;
@@ -30,6 +31,18 @@ pub use actions::{
 };
 pub use capabilities::{
     CapabilityFlags, CapabilitySnapshot, DatabaseAction, DatabaseCapabilities, DatabaseVersion,
+};
+pub use csv::{
+    CsvColumnMapping, CsvDelimiter, CsvEncoding, CsvExportRequest, CsvExportResult, CsvExportSink,
+    CsvExportSource, CsvExportSummary, CsvImportObserver, CsvImportOptions, CsvImportPreview,
+    CsvImportRequest, CsvImportResult, CsvImportSource, CsvImportSourceFile, CsvImportSummary,
+    CsvNullMode, CsvPreviewField, CsvPreviewRow, CsvSourceRow, CsvTempFile, CsvTransferDirection,
+    CsvTransferEventSink, CsvTransferGuard, CsvTransferPhase, CsvTransferProgress,
+    CsvTransferRegistry, CsvTransferStatus, CsvWarning, CsvWriter, DATABASE_CSV_TRANSFER_EVENT,
+    DEFAULT_CSV_PREVIEW_ROWS, DEFAULT_CSV_TIMEOUT, DatabaseCsvService, MAX_CSV_COLUMNS,
+    MAX_CSV_FIELD_CHARACTERS, MAX_CSV_PREVIEW_ROWS, MAX_CSV_REPORTED_ISSUES,
+    MAX_CSV_REQUEST_ID_LENGTH, MAX_CSV_TIMEOUT, csv_transfer_timeout, preview_csv_import,
+    validate_csv_request_id,
 };
 pub use dialect::{
     Identifier, IdentifierQuoter, MAX_BIND_PARAMETERS, MAX_IDENTIFIER_LENGTH, ParameterizedQuery,
