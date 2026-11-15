@@ -25,6 +25,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { CopyButton } from "@/components/ui/copy-button";
 import { EngineBadge } from "@/features/databases/DatabaseConnectionList";
 import { DatabaseSqlEditor } from "@/features/databases/DatabaseSqlEditor";
+import { DatabaseSqlHistoryPanel } from "@/features/databases/DatabaseSqlHistoryPanel";
 import {
   downloadTextFile,
   findSqlStatementRanges,
@@ -43,6 +44,7 @@ import {
   formatDatabaseEndpoint,
 } from "@/features/databases/databaseProfileForm";
 import { useDatabaseQueryStore, type DatabaseQueryEntry } from "@/stores/databaseQueryStore";
+import { useDatabaseProfileStore } from "@/stores/databaseProfileStore";
 import {
   useDatabaseWorkspaceStore,
   type DatabaseSqlLastRun,
@@ -52,12 +54,15 @@ import {
 import type {
   CommandError,
   DatabaseConnectionSnapshot,
+  DatabaseProfile,
   DatabaseQueryResultSet,
+  DatabaseSavedQuery,
   DatabaseSqlAnalysis,
 } from "@/types/contracts";
 
 const ROW_LIMIT_OPTIONS = [100, 500, 1_000, 5_000] as const;
 const TIMEOUT_OPTIONS = [5_000, 10_000, 30_000] as const;
+const EMPTY_CONNECTIONS: DatabaseProfile[] = [];
 
 type PendingRun = {
   queryTabId: string;
@@ -699,6 +704,9 @@ export function DatabaseSqlWorkspace({
     queryTabs.find((queryTab) => queryTab.id === workspaceTab.activeSqlTabId) ?? queryTabs[0];
   const queryEntries = useDatabaseQueryStore((state) => state.entries);
   const queryEntry = activeQueryTab ? queryEntries[activeQueryTab.id] : undefined;
+  const connections = useDatabaseProfileStore(
+    (state) => state.profiles[tab.serverId] ?? EMPTY_CONNECTIONS,
+  );
   const [confirmation, setConfirmation] = useState<PendingRun | null>(null);
   const [cancelling, setCancelling] = useState(false);
 
@@ -940,6 +948,35 @@ export function DatabaseSqlWorkspace({
     useDatabaseWorkspaceStore
       .getState()
       .setSqlQuerySelection(tab.profileId, activeQueryTab.id, index, index);
+  }
+
+  function handleInsertSnippet(snippet: DatabaseSavedQuery) {
+    if (!activeQueryTab) {
+      return;
+    }
+    const sql = activeQueryTab.sql;
+    const start = Math.min(Math.max(activeQueryTab.selectionStart, 0), sql.length);
+    const end = Math.min(Math.max(activeQueryTab.selectionEnd, start), sql.length);
+    const prefix = sql.slice(0, start);
+    const suffix = sql.slice(end);
+    const leading =
+      prefix.length > 0 && !prefix.endsWith("\n") && !prefix.endsWith(" ") ? "\n" : "";
+    const trailing =
+      suffix.length > 0 && !suffix.startsWith("\n") && !suffix.startsWith(" ") ? "\n" : "";
+    const insertion = `${leading}${snippet.sqlText}${trailing}`;
+    const nextSql = `${prefix}${insertion}${suffix}`;
+    const cursor = prefix.length + insertion.length;
+
+    useDatabaseWorkspaceStore.getState().setSqlQueryText(tab.profileId, activeQueryTab.id, nextSql);
+    useDatabaseWorkspaceStore
+      .getState()
+      .setSqlQuerySelection(tab.profileId, activeQueryTab.id, cursor, cursor);
+
+    const textarea = document.getElementById(
+      `database-sql-editor-${tab.profileId}`,
+    ) as HTMLTextAreaElement | null;
+    textarea?.focus();
+    textarea?.setSelectionRange(cursor, cursor);
   }
 
   if (!activeQueryTab) {
@@ -1311,6 +1348,17 @@ export function DatabaseSqlWorkspace({
           </div>
         </div>
       ) : null}
+
+      <DatabaseSqlHistoryPanel
+        profileId={tab.profileId}
+        serverId={tab.serverId}
+        engine={tab.engine}
+        connectionName={tab.name}
+        currentSql={activeQueryTab.sql}
+        connections={connections}
+        refreshToken={queryEntry?.updatedAt}
+        onInsertSnippet={handleInsertSnippet}
+      />
 
       <p className="flex items-center gap-1.5 px-1 text-[10px] leading-5 text-muted-foreground">
         <InfoIcon className="size-3 shrink-0" aria-hidden="true" />

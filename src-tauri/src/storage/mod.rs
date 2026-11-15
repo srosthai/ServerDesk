@@ -14,6 +14,7 @@ mod servers;
 pub use database::Database;
 pub use database_manager::{
     DEFAULT_DATABASE_QUERY_HISTORY_LIMIT, MAX_DATABASE_QUERY_HISTORY_LIMIT,
+    MAX_DATABASE_QUERY_HISTORY_RECORDS,
 };
 pub use error::StorageError;
 pub use history::MAX_OPERATION_HISTORY_RECORDS;
