@@ -1257,8 +1257,14 @@ or values.
 `src/stores/databaseCsvStore.ts` owns the preview, one active transfer,
 cancellation state, progress, and terminal result. The Data tab exposes
 Export CSV and Import CSV, and the SQL result panel exposes Full CSV, which
-re-runs the executed statement as one read-only export. The complete transfer
-wizard and backup/restore flows remain #184.
+re-runs the executed statement as one read-only export. The CSV wizard adds a
+file picker, delimiter/encoding/header/NULL options, a bounded preview with
+source-to-target column mapping, and a review step that names the connection,
+server, table, and file before an acknowledged import. Progress shows row and
+byte counts, phase, and elapsed time; a cancelled or failed import is reported
+as a rolled-back transaction, never as success. The same dialog is available
+from the Operations tab, where table and column metadata are loaded for the
+selected connection.
 
 ### Tests
 
@@ -1366,7 +1372,18 @@ typed command boundaries. `src/stores/databaseDumpStore.ts` and
 `src/stores/databaseBackupStore.ts` own tool detection, one active transfer,
 cancellation state, progress, the restore preview, and the terminal result. The
 backup store refuses to send a restore without an acknowledged confirmation.
-The full dump, backup, and restore wizard remains #184.
+The Operations tab exposes SQL dump export/restore and backup/restore wizards.
+Export selects a database, schema, table set, or PostgreSQL cluster plus a
+format, remote or local output, overwrite policy, and ownership option; the
+review step shows the resolved scope, tool, and destination. Restore builds the
+read-only preview first, disables the action when the source or target changes,
+and opens a confirmation that names the server, connection, target database,
+tool, and exact replaced-data text. Progress reports phase, bytes, percentage,
+and elapsed time. Terminal results show the tool, exit status, duration,
+verified size, warnings, `partialRemoved`, `tempCleaned`, and
+`mayBeIncomplete`; a restore that may have changed the target disables retry
+and asks the user to verify it first. Active transfers and recent operation
+records are scoped to the owning connection tab.
 
 ### Tests
 
@@ -1381,7 +1398,10 @@ redaction. Command builders additionally assert that `--password` never appears
 and that the password variable is read from the temporary file. Frontend
 service and store tests cover backup command payloads, previews, success,
 failure, missing tools, overwrite conflicts, cancellation, incomplete restore
-state, and refusal to restore without confirmation.
+state, and refusal to restore without confirmation. Component tests exercise
+the CSV and dump wizards, file selection, mapping, progress, cancel, retry,
+permission-denied and disconnected states, overwrite and restore confirmations,
+partial-result disclosure, and per-connection operation history.
 
 ## Current limitations
 

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
+  ArchiveBoxIcon,
   BracketsCurlyIcon,
   CheckCircleIcon,
   CircleNotchIcon,
@@ -481,6 +482,19 @@ function ResultPanel({
                   <FileCsvIcon className="size-3.5" aria-hidden="true" />
                   Full CSV
                 </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 gap-1.5 px-2 text-[11px]"
+                  onClick={() =>
+                    useDatabaseWorkspaceStore.getState().setActiveView(tab.profileId, "operations")
+                  }
+                  title="Open SQL dump, backup, and restore operations for this connection"
+                >
+                  <ArchiveBoxIcon className="size-3.5" aria-hidden="true" />
+                  Backup
+                </Button>
               </div>
             ) : null}
           </div>
@@ -524,6 +538,7 @@ function ResultPanel({
             }
           }}
           profileId={tab.profileId}
+          profileName={tab.name}
           table={{
             database: tab.selection?.database ?? null,
             schema: tab.selection?.schema ?? null,
