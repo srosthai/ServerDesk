@@ -482,11 +482,48 @@ impl ConnectionManager {
             .await
     }
 
+    /// Executes a fixed command with a caller-provided timeout.
+    ///
+    /// Long-running maintenance commands such as SQL dumps use this path. The
+    /// caller remains responsible for stopping the remote process when the
+    /// timeout or a cancellation request ends the wait.
+    pub async fn execute_with_timeout(
+        &self,
+        server_id: &str,
+        command: &str,
+        timeout: Duration,
+    ) -> Result<super::CommandOutput, AppError> {
+        if timeout.is_zero() {
+            return Err(AppError::validation(
+                "The command timeout must be greater than zero.",
+            ));
+        }
+
+        self.execute_with_limit_and_timeout(server_id, command, None, timeout)
+            .await
+    }
+
     async fn execute_with_limit(
         &self,
         server_id: &str,
         command: &str,
         max_output_bytes: Option<usize>,
+    ) -> Result<super::CommandOutput, AppError> {
+        self.execute_with_limit_and_timeout(
+            server_id,
+            command,
+            max_output_bytes,
+            self.timeouts.command,
+        )
+        .await
+    }
+
+    async fn execute_with_limit_and_timeout(
+        &self,
+        server_id: &str,
+        command: &str,
+        max_output_bytes: Option<usize>,
+        command_timeout: Duration,
     ) -> Result<super::CommandOutput, AppError> {
         if command.trim().is_empty() {
             return Err(AppError::validation("Command cannot be empty."));
@@ -501,7 +538,7 @@ impl ConnectionManager {
             }
         };
 
-        match tokio::time::timeout(self.timeouts.command, execution).await {
+        match tokio::time::timeout(command_timeout, execution).await {
             Err(_) => {
                 if !self.session_is_healthy(&session).await {
                     let error = AppError::network(
@@ -516,7 +553,7 @@ impl ConnectionManager {
                 }
                 Err(AppError::timeout(format!(
                     "The remote command timed out after {} seconds.",
-                    timeout_seconds(self.timeouts.command)
+                    timeout_seconds(command_timeout)
                 ))
                 .with_details(
                     "The session is still connected, but the command may still be running on the \

@@ -17,6 +17,7 @@ pub mod adapter;
 pub mod capabilities;
 pub(crate) mod csv;
 pub mod ddl;
+pub mod dump;
 pub mod queries;
 pub mod rows;
 pub mod sql;

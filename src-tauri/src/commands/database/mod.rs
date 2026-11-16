@@ -8,6 +8,7 @@ pub mod actions;
 pub mod capabilities;
 pub mod csv;
 pub mod discovery;
+pub mod dump;
 pub mod history;
 pub mod profiles;
 pub mod queries;

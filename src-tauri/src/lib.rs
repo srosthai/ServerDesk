@@ -14,11 +14,17 @@ use crate::{
         ssh::{ConnectionManager, ConnectionTimeouts, RusshTransport, TunnelManager},
         terminal::TerminalManager,
     },
-    database::{CsvTransferRegistry, DatabaseConnectionRegistry, QueryRegistry, RowQueryRegistry},
+    database::{
+        CsvTransferRegistry, DatabaseConnectionRegistry, DumpTransferRegistry, QueryRegistry,
+        RowQueryRegistry,
+    },
 };
 
 async fn release_connections(app: &tauri::AppHandle) {
     if let Some(transfers) = app.try_state::<Arc<FileTransferManager>>() {
+        transfers.cancel_all();
+    }
+    if let Some(transfers) = app.try_state::<DumpTransferRegistry>() {
         transfers.cancel_all();
     }
     if let Some(databases) = app.try_state::<DatabaseConnectionRegistry>() {
@@ -132,6 +138,7 @@ pub fn run() {
             app.manage(RowQueryRegistry::default());
             app.manage(QueryRegistry::default());
             app.manage(CsvTransferRegistry::default());
+            app.manage(DumpTransferRegistry::default());
             app.manage(Arc::clone(&connections));
             app.manage(tunnels);
             app.manage(Arc::new(FileTransferManager::new(
@@ -200,6 +207,10 @@ pub fn run() {
             commands::database::csv::export_database_csv,
             commands::database::csv::import_database_csv,
             commands::database::csv::cancel_database_csv_transfer,
+            commands::database::dump::get_database_dump_tools,
+            commands::database::dump::export_database_dump,
+            commands::database::dump::import_database_dump,
+            commands::database::dump::cancel_database_dump,
             commands::database::row_writes::insert_database_table_row,
             commands::database::row_writes::update_database_table_row,
             commands::database::row_writes::delete_database_table_rows,
