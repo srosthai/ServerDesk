@@ -26,7 +26,8 @@ use crate::storage::DatabaseEngine;
 
 use super::{
     POSTGRES_DIALECT, actions as engine_actions, csv as engine_csv, ddl as engine_ddl,
-    objects as engine_objects, queries as engine_queries, rows as engine_rows, sql,
+    objects as engine_objects, queries as engine_queries, roles as engine_roles,
+    rows as engine_rows, sql,
 };
 use crate::database::{
     actions::{DatabaseDdlPreview, ValidatedDatabaseAction},
@@ -44,6 +45,10 @@ use crate::database::{
     },
     pagination::{Bounded, Page, PageRequest},
     queries::{QueryControl, QueryExecutionResult, QueryRequest},
+    roles::{
+        PrivilegeGrant, PrivilegeTarget, PrivilegeTargetKind, RoleDdlPlan, RoleGrantData, RoleKind,
+        RoleRef, RoleSummary, ValidatedRoleAction,
+    },
     row_writes::{RowDeleteRequest, RowInsertRequest, RowUpdateRequest, RowWriteResult},
     rows::{RowQueryControl, RowReadRequest, RowReadResult},
     structure::{StructureDdlPreview, ValidatedStructureAction},
@@ -1197,6 +1202,181 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
         Ok(())
     }
 
+    async fn list_roles(&self, page: PageRequest) -> Result<Page<RoleSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseRoles)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::LIST_ROLES)
+                .bind(i64::from(page.limit) + 1)
+                .bind(i64::try_from(page.offset).unwrap_or(i64::MAX))
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+
+        let roles = rows
+            .iter()
+            .map(postgres_role_summary)
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+        Ok(Page::from_items(roles, page, None))
+    }
+
+    async fn role_summary(&self, role: &RoleRef) -> Result<Option<RoleSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseRoles)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let row = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::ROLE_SUMMARY)
+                .bind(&role.name)
+                .fetch_optional(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+        row.as_ref().map(postgres_role_summary).transpose()
+    }
+
+    async fn role_grants(&self, role: &RoleRef) -> Result<RoleGrantData, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseRoles)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let mut direct = Vec::new();
+
+        let table_rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::ROLE_TABLE_GRANTS)
+                .bind(&role.name)
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+        for row in &table_rows {
+            direct.push(PrivilegeGrant {
+                privilege: decode(row, "privilege")?,
+                target: PrivilegeTarget {
+                    kind: PrivilegeTargetKind::Table,
+                    database: None,
+                    schema: Some(Identifier::new(decode::<String>(row, "schema_name")?)?),
+                    object: Some(Identifier::new(decode::<String>(row, "object_name")?)?),
+                },
+                grantable: decode(row, "grantable")?,
+            });
+        }
+
+        let schema_rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::ROLE_SCHEMA_GRANTS)
+                .bind(&role.name)
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+        for row in &schema_rows {
+            direct.push(PrivilegeGrant {
+                privilege: decode(row, "privilege")?,
+                target: PrivilegeTarget {
+                    kind: PrivilegeTargetKind::Schema,
+                    database: None,
+                    schema: Some(Identifier::new(decode::<String>(row, "schema_name")?)?),
+                    object: None,
+                },
+                grantable: decode(row, "grantable")?,
+            });
+        }
+
+        let sequence_rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::ROLE_SEQUENCE_GRANTS)
+                .bind(&role.name)
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+        for row in &sequence_rows {
+            direct.push(PrivilegeGrant {
+                privilege: decode(row, "privilege")?,
+                target: PrivilegeTarget {
+                    kind: PrivilegeTargetKind::Sequence,
+                    database: None,
+                    schema: Some(Identifier::new(decode::<String>(row, "schema_name")?)?),
+                    object: Some(Identifier::new(decode::<String>(row, "object_name")?)?),
+                },
+                grantable: decode(row, "grantable")?,
+            });
+        }
+
+        let database_rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::ROLE_DATABASE_GRANTS)
+                .bind(&role.name)
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+        for row in &database_rows {
+            direct.push(PrivilegeGrant {
+                privilege: decode(row, "privilege")?,
+                target: PrivilegeTarget {
+                    kind: PrivilegeTargetKind::Database,
+                    database: Some(Identifier::new(decode::<String>(row, "database_name")?)?),
+                    schema: None,
+                    object: None,
+                },
+                grantable: decode(row, "grantable")?,
+            });
+        }
+
+        let member_rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::ROLE_MEMBERSHIPS)
+                .bind(&role.name)
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+        let member_of = member_rows
+            .iter()
+            .map(|row| {
+                Ok(RoleRef {
+                    name: decode(row, "role_name")?,
+                    host: None,
+                })
+            })
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+
+        Ok(RoleGrantData { direct, member_of })
+    }
+
+    async fn preview_role_action(
+        &self,
+        action: &ValidatedRoleAction,
+    ) -> Result<RoleDdlPlan, DatabaseError> {
+        self.require_connection()?;
+        action.ensure_supported(&self.capabilities)?;
+        engine_roles::preview(action)
+    }
+
+    async fn execute_role_action(
+        &mut self,
+        action: &ValidatedRoleAction,
+    ) -> Result<(), DatabaseError> {
+        self.require_connection()?;
+        let preview = self.preview_role_action(action).await?;
+        for statement in &preview.statements {
+            self.execute_statement(statement).await?;
+        }
+        Ok(())
+    }
+
     async fn object_counts(&self, scope: &MetadataScope) -> Result<ObjectCounts, DatabaseError> {
         self.require_capability(DatabaseAction::BrowseTables)?;
         let schema = self.schema_filter(scope)?;
@@ -1996,6 +2176,24 @@ fn constraint_kind(kind: &str) -> ConstraintKind {
         "CHECK" => ConstraintKind::Check,
         _ => ConstraintKind::Other,
     }
+}
+
+fn postgres_role_summary(row: &PgRow) -> Result<RoleSummary, DatabaseError> {
+    let can_login: bool = decode(row, "can_login")?;
+    Ok(RoleSummary {
+        name: decode(row, "name")?,
+        host: None,
+        kind: if can_login {
+            RoleKind::User
+        } else {
+            RoleKind::Role
+        },
+        can_login: MetadataValue::available(can_login),
+        superuser: MetadataValue::available(decode(row, "superuser")?),
+        create_database: MetadataValue::available(decode(row, "create_database")?),
+        create_role: MetadataValue::available(decode(row, "create_role")?),
+        inherit: MetadataValue::available(decode(row, "inherit")?),
+    })
 }
 
 pub(crate) fn decode<'r, T>(row: &'r PgRow, column: &str) -> Result<T, DatabaseError>

@@ -268,8 +268,57 @@ pub const TABLE_TRIGGERS: &str = "SELECT TRIGGER_NAME AS name, \
     WHERE TRIGGER_SCHEMA = ? AND EVENT_OBJECT_TABLE = ? \
     ORDER BY TRIGGER_NAME LIMIT ?";
 
-pub const LIST_ROLES: &str = "SELECT DISTINCT FROM_USER AS name FROM mysql.role_edges \
-    ORDER BY FROM_USER";
+/// Lists accounts without selecting authentication columns or password
+/// hashes. A MySQL role is inferred from `mysql.role_edges`; a role that has
+/// never been granted to a member is therefore shown as an account until it is
+/// used. `can_login` reflects `account_locked`.
+pub const LIST_ROLES: &str = "SELECT u.User AS name, u.Host AS host, \
+    CASE WHEN EXISTS ( \
+        SELECT 1 FROM mysql.role_edges e \
+        WHERE e.FROM_USER = u.User AND e.FROM_HOST = u.Host \
+    ) THEN 1 ELSE 0 END AS is_role, \
+    u.account_locked = 'N' AS can_login, \
+    u.Super_priv = 'Y' AS superuser, \
+    u.Create_priv = 'Y' AS create_database \
+    FROM mysql.user u \
+    ORDER BY u.User, u.Host LIMIT ? OFFSET ?";
+
+pub const ROLE_SUMMARY: &str = "SELECT u.User AS name, u.Host AS host, \
+    CASE WHEN EXISTS ( \
+        SELECT 1 FROM mysql.role_edges e \
+        WHERE e.FROM_USER = u.User AND e.FROM_HOST = u.Host \
+    ) THEN 1 ELSE 0 END AS is_role, \
+    u.account_locked = 'N' AS can_login, \
+    u.Super_priv = 'Y' AS superuser, \
+    u.Create_priv = 'Y' AS create_database \
+    FROM mysql.user u \
+    WHERE u.User = ? AND u.Host = ? LIMIT 1";
+
+/// Global, database, and table privileges for one account. Column-level
+/// privileges are deliberately excluded until the typed target model supports
+/// columns; this query never reads password or authentication columns.
+pub const ROLE_DIRECT_GRANTS: &str = "SELECT 'global' AS target_kind, \
+    NULL AS database_name, NULL AS schema_name, NULL AS object_name, \
+    PRIVILEGE_TYPE AS privilege, IS_GRANTABLE = 'YES' AS grantable \
+    FROM information_schema.USER_PRIVILEGES \
+    WHERE GRANTEE = CONCAT('''', ?, '''@''', ?, '''') \
+    AND PRIVILEGE_TYPE <> 'GRANT OPTION' \
+    UNION ALL \
+    SELECT 'database', TABLE_SCHEMA, NULL, NULL, PRIVILEGE_TYPE, \
+    IS_GRANTABLE = 'YES' \
+    FROM information_schema.SCHEMA_PRIVILEGES \
+    WHERE GRANTEE = CONCAT('''', ?, '''@''', ?, '''') \
+    AND PRIVILEGE_TYPE <> 'GRANT OPTION' \
+    UNION ALL \
+    SELECT 'table', TABLE_SCHEMA, TABLE_SCHEMA, TABLE_NAME, PRIVILEGE_TYPE, \
+    IS_GRANTABLE = 'YES' \
+    FROM information_schema.TABLE_PRIVILEGES \
+    WHERE GRANTEE = CONCAT('''', ?, '''@''', ?, '''') \
+    AND PRIVILEGE_TYPE <> 'GRANT OPTION'";
+
+pub const ROLE_MEMBERSHIPS: &str = "SELECT FROM_USER AS role_name, \
+    FROM_HOST AS role_host FROM mysql.role_edges \
+    WHERE TO_USER = ? AND TO_HOST = ? ORDER BY FROM_USER, FROM_HOST";
 
 pub const LIST_SESSIONS: &str = "SELECT ID AS session_id, USER AS user, HOST AS host, \
     DB AS database_name, COMMAND AS command, TIME AS elapsed_seconds, STATE AS state, \

@@ -12,6 +12,7 @@ import {
   PlugsIcon,
   PlusIcon,
   RowsIcon,
+  ShieldCheckIcon,
   TableIcon,
   TreeStructureIcon,
   WarningCircleIcon,
@@ -27,6 +28,7 @@ import { PageHeader } from "@/components/ui/page-header";
 import { ErrorState, LoadingState } from "@/components/ui/states";
 import { StatusBadge } from "@/components/ui/status-badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { DatabaseAccessPanel } from "@/features/databases/DatabaseAccessPanel";
 import { DatabaseConnectionList, EngineBadge } from "@/features/databases/DatabaseConnectionList";
 import { DatabaseActionDialog } from "@/features/databases/DatabaseActionDialog";
 import { DatabaseDataGrid } from "@/features/databases/DatabaseDataGrid";
@@ -56,6 +58,7 @@ import {
   objectCapabilitiesFor,
   objectRefForSelection,
 } from "@/features/databases/databaseObjectModel";
+import { roleCapabilitiesFor } from "@/features/databases/databaseRolesModel";
 import {
   databaseRowId,
   objectRowId,
@@ -161,6 +164,14 @@ const databaseTabs: DatabaseTab[] = [
     emptyTitle: "No operations queued",
     emptyDescription:
       "Imports, exports, backups, and restores will report progress and cancellation from this workspace.",
+  },
+  {
+    value: "access",
+    label: "Access",
+    icon: ShieldCheckIcon,
+    emptyTitle: "No connection selected",
+    emptyDescription:
+      "Open a saved connection to list users and roles, inspect effective privileges, and preview every grant or revoke before applying it.",
   },
 ];
 
@@ -996,6 +1007,27 @@ function DatabaseManagerPage() {
   const structureCapabilities = useMemo(
     () =>
       structureCapabilitiesFor({
+        engine: selectedEngineForStructure,
+        version: selectedSnapshot?.version?.version,
+        connected: structureConnected,
+        readOnly: selectedSnapshot?.readOnly ?? selectedProfile?.readOnly ?? false,
+        actions: selectedSnapshot?.capabilities?.actions,
+        flags: selectedSnapshot?.capabilities?.flags,
+      }),
+    [
+      selectedEngineForStructure,
+      selectedProfile?.readOnly,
+      selectedSnapshot?.capabilities?.actions,
+      selectedSnapshot?.capabilities?.flags,
+      selectedSnapshot?.readOnly,
+      selectedSnapshot?.version?.version,
+      structureConnected,
+    ],
+  );
+
+  const roleCapabilities = useMemo(
+    () =>
+      roleCapabilitiesFor({
         engine: selectedEngineForStructure,
         version: selectedSnapshot?.version?.version,
         connected: structureConnected,
@@ -1896,6 +1928,24 @@ function DatabaseManagerPage() {
                               icon={<WrenchIcon className="size-4" aria-hidden="true" />}
                               title="No connection selected"
                               description="Open a saved connection before starting imports, exports, backups, or restores."
+                            />
+                          )
+                        ) : tab.value === "access" ? (
+                          structureProfile ? (
+                            <DatabaseAccessPanel
+                              profileId={structureProfile.id}
+                              profileName={structureProfile.name}
+                              engine={selectedEngineForStructure}
+                              connected={structureConnected}
+                              readOnly={selectedSnapshot?.readOnly ?? structureProfile.readOnly}
+                              capabilities={roleCapabilities}
+                              scope={tableWorkspaceScope}
+                            />
+                          ) : (
+                            <EmptyState
+                              icon={<ShieldCheckIcon className="size-4" aria-hidden="true" />}
+                              title="No connection selected"
+                              description="Open a saved connection before listing users, roles, and grants."
                             />
                           )
                         ) : (

@@ -13,6 +13,7 @@ pub mod history;
 pub mod objects;
 pub mod profiles;
 pub mod queries;
+pub mod roles;
 pub mod row_writes;
 pub mod rows;
 pub mod structure;

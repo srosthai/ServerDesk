@@ -17,6 +17,7 @@ import {
   previewDatabaseStructureAction,
   runDatabaseStructureAction,
 } from "@/services/databaseStructure";
+import { getDatabaseRolePrivileges, listDatabaseRoles } from "@/services/databaseRoles";
 import { createDatabaseRowRequestId, readTableRows } from "@/services/databaseRows";
 import {
   connectDatabaseProfile,
@@ -33,6 +34,7 @@ import { databaseExplorerNodeKey, useDatabaseExplorerStore } from "@/stores/data
 import { useDatabaseProfileStore } from "@/stores/databaseProfileStore";
 import { useDatabaseQueryStore } from "@/stores/databaseQueryStore";
 import { useDatabaseRowStore } from "@/stores/databaseRowStore";
+import { useDatabaseRoleStore } from "@/stores/databaseRoleStore";
 import { useDatabaseWorkspaceStore } from "@/stores/databaseWorkspaceStore";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useServerStore } from "@/stores/serverStore";
@@ -54,6 +56,9 @@ import type {
   DatabaseBounded,
   DatabaseDependencySummary,
   DatabaseMetadataValue,
+  DatabasePage,
+  DatabaseRolePrivilegeSnapshot,
+  DatabaseRoleSummary,
   DatabaseTableDependencies,
   DatabaseTableSummary,
   DatabaseTestResult,
@@ -108,6 +113,13 @@ vi.mock("@/services/databaseDiscovery", () => ({
 vi.mock("@/services/databaseStructure", () => ({
   previewDatabaseStructureAction: vi.fn(),
   runDatabaseStructureAction: vi.fn(),
+}));
+
+vi.mock("@/services/databaseRoles", () => ({
+  listDatabaseRoles: vi.fn(),
+  getDatabaseRolePrivileges: vi.fn(),
+  previewDatabaseRoleAction: vi.fn(),
+  runDatabaseRoleAction: vi.fn(),
 }));
 
 vi.mock("@/services/databaseRows", () => ({
@@ -214,6 +226,7 @@ const capabilities: DatabaseCapabilities = {
     "browse_constraints",
     "browse_views",
     "browse_sequences",
+    "browse_roles",
     "show_object_size",
     "create_table",
     "rename_table",
@@ -228,6 +241,7 @@ const capabilities: DatabaseCapabilities = {
     "rename_index",
     "drop_index",
     "create_check_constraint",
+    "manage_roles",
     "create_generated_column",
     "create_identity_column",
     "run_query",
@@ -662,6 +676,45 @@ const testResult: DatabaseTestResult = {
   testedAt: 2,
 };
 
+const roleSummary: DatabaseRoleSummary = {
+  name: "reporting",
+  host: null,
+  kind: "user",
+  canLogin: { status: "available", value: true },
+  superuser: { status: "available", value: false },
+  createDatabase: { status: "available", value: false },
+  createRole: { status: "available", value: false },
+  inherit: { status: "available", value: true },
+};
+
+const rolePage: DatabasePage<DatabaseRoleSummary> = {
+  items: [roleSummary],
+  limit: 100,
+  offset: 0,
+  hasMore: false,
+  total: 1,
+};
+
+const roleSnapshot: DatabaseRolePrivilegeSnapshot = {
+  role: { name: "reporting", host: null },
+  direct: [
+    {
+      privilege: "SELECT",
+      target: { kind: "table", schema: "public", object: "orders" },
+      grantable: false,
+    },
+  ],
+  memberOf: [],
+  effective: [
+    {
+      privilege: "SELECT",
+      target: { kind: "table", schema: "public", object: "orders" },
+      grantable: false,
+      sources: ["direct"],
+    },
+  ],
+};
+
 function renderPage() {
   return render(
     <MemoryRouter>
@@ -845,6 +898,7 @@ describe("DatabaseManagerPage", () => {
     });
     useDatabaseExplorerStore.setState({ nodes: {}, error: null, commandError: null });
     useDatabaseWorkspaceStore.setState({ tabs: {}, order: [], activeTabId: null });
+    useDatabaseRoleStore.setState({ entries: {} });
     useDatabaseQueryStore.setState({ entries: {} });
     useDatabaseRowStore.setState({ entries: {} });
     vi.mocked(createDatabaseRowRequestId).mockReturnValue("row-request-page");
@@ -920,6 +974,10 @@ describe("DatabaseManagerPage", () => {
     vi.mocked(runDatabaseStructureAction).mockImplementation((_profileId, request) =>
       Promise.resolve(structureResult(request)),
     );
+    vi.mocked(listDatabaseRoles).mockReset();
+    vi.mocked(listDatabaseRoles).mockResolvedValue(rolePage);
+    vi.mocked(getDatabaseRolePrivileges).mockReset();
+    vi.mocked(getDatabaseRolePrivileges).mockResolvedValue(roleSnapshot);
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
       value: { writeText: vi.fn().mockResolvedValue(undefined) },
@@ -1112,6 +1170,26 @@ describe("DatabaseManagerPage", () => {
 
     expect(screen.getByRole("tab", { name: "Structure" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("heading", { name: "No table selected" })).toBeInTheDocument();
+  });
+
+  it("opens the advanced access workspace for roles and grants", async () => {
+    const user = userEvent.setup();
+    useConnectedServer();
+    useProfileStore();
+    useDatabaseWorkspaceStore.getState().openTab(profile);
+    renderPage();
+
+    await user.click(screen.getByRole("tab", { name: "Access" }));
+
+    expect(
+      await screen.findByRole("heading", { name: /Users, roles & grants/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Advanced")).toBeInTheDocument();
+    expect(listDatabaseRoles).toHaveBeenCalledWith(profile.id, {
+      limit: 100,
+      offset: 0,
+    });
+    expect((await screen.findAllByText("reporting")).length).toBeGreaterThan(0);
   });
 
   it("shows the selected database and schema in the workspace header", async () => {
