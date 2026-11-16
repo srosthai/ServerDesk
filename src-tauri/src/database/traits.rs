@@ -25,6 +25,7 @@ use super::{
     },
     pagination::{Bounded, Page, PageRequest},
     queries::{QueryControl, QueryExecutionResult, QueryRequest},
+    roles::{RoleDdlPlan, RoleGrantData, RoleRef, RoleSummary, ValidatedRoleAction},
     row_writes::{RowDeleteRequest, RowInsertRequest, RowUpdateRequest, RowWriteResult},
     rows::{RowQueryControl, RowReadRequest, RowReadResult},
     structure::{StructureDdlPreview, ValidatedStructureAction},
@@ -633,6 +634,33 @@ pub trait DatabaseAdapter: Send + Sync {
         request: &RowDeleteRequest,
         control: &RowQueryControl,
     ) -> Result<RowWriteResult, DatabaseError>;
+
+    /// Lists database users and roles. Engines without server roles return a
+    /// capability error rather than an empty page.
+    async fn list_roles(&self, page: PageRequest) -> Result<Page<RoleSummary>, DatabaseError>;
+
+    /// Re-reads one role after a create or alter action. `None` means the role
+    /// is not present or not visible to this account.
+    async fn role_summary(&self, role: &RoleRef) -> Result<Option<RoleSummary>, DatabaseError>;
+
+    /// Reads direct grants and memberships for one role. Effective privileges
+    /// are expanded by the shared service so the diff logic is identical for
+    /// every engine.
+    async fn role_grants(&self, role: &RoleRef) -> Result<RoleGrantData, DatabaseError>;
+
+    /// Generates the exact grant/revoke or role DDL for one validated action
+    /// without executing it.
+    async fn preview_role_action(
+        &self,
+        action: &ValidatedRoleAction,
+    ) -> Result<RoleDdlPlan, DatabaseError>;
+
+    /// Executes one validated role action after re-running the same preview
+    /// path. The caller re-reads role metadata and privileges afterwards.
+    async fn execute_role_action(
+        &mut self,
+        action: &ValidatedRoleAction,
+    ) -> Result<(), DatabaseError>;
 
     /// Returns a bounded dependency inventory for one table. Callers use it
     /// before destructive structure changes so the UI can name the foreign

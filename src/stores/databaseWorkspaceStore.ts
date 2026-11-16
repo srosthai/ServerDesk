@@ -13,6 +13,7 @@ export const DATABASE_WORKSPACE_VIEWS = [
   "sql",
   "indexes",
   "operations",
+  "access",
 ] as const;
 
 export type DatabaseWorkspaceView = (typeof DATABASE_WORKSPACE_VIEWS)[number];

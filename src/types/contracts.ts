@@ -1636,6 +1636,171 @@ export type DatabaseObjectActionResult = {
   durationMs: number;
 };
 
+export type DatabaseRoleKind = "user" | "role";
+
+export type DatabaseRoleRef = {
+  name: string;
+  host?: string | null;
+};
+
+export type DatabaseRoleSummary = {
+  name: string;
+  host?: string | null;
+  kind: DatabaseRoleKind;
+  canLogin: DatabaseMetadataValue<boolean>;
+  superuser: DatabaseMetadataValue<boolean>;
+  createDatabase: DatabaseMetadataValue<boolean>;
+  createRole: DatabaseMetadataValue<boolean>;
+  inherit: DatabaseMetadataValue<boolean>;
+};
+
+export type DatabasePrivilegeTargetKind = "global" | "database" | "schema" | "table" | "sequence";
+
+export type DatabasePrivilegeTarget = {
+  kind: DatabasePrivilegeTargetKind;
+  database?: string | null;
+  schema?: string | null;
+  object?: string | null;
+};
+
+export type DatabasePrivilege =
+  | "select"
+  | "insert"
+  | "update"
+  | "delete"
+  | "truncate"
+  | "references"
+  | "trigger"
+  | "create"
+  | "drop"
+  | "alter"
+  | "index"
+  | "execute"
+  | "usage"
+  | "connect"
+  | "temporary"
+  | "create_temporary_tables"
+  | "lock_tables"
+  | "create_view"
+  | "show_view"
+  | "create_routine"
+  | "alter_routine"
+  | "event";
+
+export type DatabasePrivilegeGrant = {
+  privilege: string;
+  target: DatabasePrivilegeTarget;
+  grantable: boolean;
+};
+
+export type DatabaseEffectivePrivilege = DatabasePrivilegeGrant & {
+  sources: string[];
+};
+
+export type DatabaseRolePrivilegeSnapshot = {
+  role: DatabaseRoleRef;
+  direct: DatabasePrivilegeGrant[];
+  memberOf: DatabaseRoleRef[];
+  effective: DatabaseEffectivePrivilege[];
+};
+
+export type DatabasePrivilegeDiff = {
+  before: DatabaseEffectivePrivilege[];
+  after: DatabaseEffectivePrivilege[];
+  added: DatabaseEffectivePrivilege[];
+  removed: DatabaseEffectivePrivilege[];
+};
+
+export type DatabaseRoleAttributeChange = {
+  attribute: string;
+  before: string;
+  after: string;
+};
+
+export type DatabaseRoleActionRequest =
+  | {
+      kind: "create_role";
+      name: string;
+      host?: string | null;
+      roleKind: DatabaseRoleKind;
+      canLogin?: boolean | null;
+      superuser?: boolean | null;
+      createDatabase?: boolean | null;
+      createRole?: boolean | null;
+      inherit?: boolean | null;
+    }
+  | {
+      kind: "alter_role";
+      name: string;
+      host?: string | null;
+      canLogin?: boolean | null;
+      superuser?: boolean | null;
+      createDatabase?: boolean | null;
+      createRole?: boolean | null;
+      inherit?: boolean | null;
+    }
+  | {
+      kind: "grant_privileges";
+      grantee: DatabaseRoleRef;
+      privileges: DatabasePrivilege[];
+      target: DatabasePrivilegeTarget;
+      withGrantOption?: boolean;
+    }
+  | {
+      kind: "revoke_privileges";
+      grantee: DatabaseRoleRef;
+      privileges: DatabasePrivilege[];
+      target: DatabasePrivilegeTarget;
+      revokeGrantOption?: boolean;
+    }
+  | {
+      kind: "grant_role";
+      role: DatabaseRoleRef;
+      member: DatabaseRoleRef;
+    }
+  | {
+      kind: "revoke_role";
+      role: DatabaseRoleRef;
+      member: DatabaseRoleRef;
+    };
+
+export type DatabaseRoleActionKind =
+  | "create_role"
+  | "alter_role"
+  | "grant_privileges"
+  | "revoke_privileges"
+  | "grant_role"
+  | "revoke_role";
+
+export type DatabaseRoleDdlPreview = {
+  action: DatabaseRoleActionKind;
+  engine: DatabaseEngine;
+  role: DatabaseRoleRef;
+  target?: DatabasePrivilegeTarget | null;
+  statements: string[];
+  ddl: string;
+  warnings: string[];
+  destructive: boolean;
+  requiresConfirmation: boolean;
+  privilegeDiff: DatabasePrivilegeDiff;
+  roleChanges: DatabaseRoleAttributeChange[];
+};
+
+export type DatabaseRoleActionResult = {
+  action: DatabaseRoleActionKind;
+  engine: DatabaseEngine;
+  role: DatabaseRoleRef;
+  target?: DatabasePrivilegeTarget | null;
+  statements: string[];
+  warnings: string[];
+  verified: boolean;
+  verification: string;
+  verificationError?: string | null;
+  privilegeDiff: DatabasePrivilegeDiff;
+  roleChanges: DatabaseRoleAttributeChange[];
+  durationMs: number;
+};
+
 export type ProjectType = "laravel";
 
 export type OperationCategory = "command" | "service" | "artisan" | "sftp" | "queue" | "database";
