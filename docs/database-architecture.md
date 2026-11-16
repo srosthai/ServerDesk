@@ -1272,14 +1272,27 @@ without a live database.
 
 ## SQL dump and restore
 
-`src-tauri/src/commands/database/dump.rs` owns the SQL dump command surface:
+`src-tauri/src/commands/database/dump.rs` owns the SQL dump and backup
+command surface:
 
-| Command                   | Purpose                                                        |
-| ------------------------- | -------------------------------------------------------------- |
-| `get_database_dump_tools` | Detect remote tools and compare major versions with the server |
-| `export_database_dump`    | Dump one scope to a remote path or a controlled local path     |
-| `import_database_dump`    | Restore one SQL or archive dump into a target database         |
-| `cancel_database_dump`    | Cancel one in-flight export or restore by request id           |
+| Command                     | Purpose                                                             |
+| --------------------------- | ------------------------------------------------------------------- |
+| `get_database_dump_tools`   | Detect remote tools and compare major versions with the server      |
+| `export_database_dump`      | Dump one scope to a remote path or a controlled local path          |
+| `import_database_dump`      | Restore one SQL or archive dump into a target database              |
+| `cancel_database_dump`      | Cancel one in-flight export or restore by request id                |
+| `get_database_backup_tools` | Backup workflow alias for the same read-only tool inventory         |
+| `create_database_backup`    | Backup workflow alias for `export_database_dump`                    |
+| `preview_database_restore`  | Build the confirmation document for a restore without changing data |
+| `restore_database_backup`   | Backup workflow alias for `import_database_dump`                    |
+| `cancel_database_backup`    | Backup workflow alias for `cancel_database_dump`                    |
+
+Both request types accept an optional `tool` field. Omitting it selects the
+engine-appropriate default. Supplying a tool that cannot perform the selected
+scope or format returns a typed `capability` error before any remote command
+runs. The default mapping is `mysqldump`/`mysql` for MySQL, `pg_dump` or
+`pg_dumpall` for PostgreSQL exports, and `psql` or `pg_restore` for PostgreSQL
+restores.
 
 Dump tools run on the remote server over the authenticated SSH session, not on
 the desktop. MySQL exports use `mysqldump`; MySQL restores use `mysql`.
@@ -1337,29 +1350,38 @@ Progress is emitted as `database-dump-event` with the transfer id, direction,
 phase, status, byte counts, a bounded static message, and the incomplete marker.
 Tool stderr is not streamed to the UI. The terminal result includes the tool and
 version, exit code, verified size, warnings, redacted failure summary, cleanup
-flags, and duration. Restores require `confirmed: true`; a cancelled or failed
-restore returns `mayBeIncomplete: true` because the target database may contain
-partially restored objects. Audit history records the engine, scope label,
-format, destination kind, size, warnings, and result, but never a path, SQL,
-tool stderr, or credential.
+flags, and duration. A restore requires both `confirmed: true` and a
+`confirmation` document naming the server id and name, the exact target
+database, and the exact `replacedData` text returned by
+`preview_database_restore`. A bare boolean, a different server, a different
+database, or different replaced-data text is rejected with a `validation` error
+before a connection, tool check, upload, or remote command. A cancelled or
+failed restore returns `mayBeIncomplete: true` because the target database may
+contain partially restored objects. Audit history records the engine, server
+name, connection profile name, scope label, format, destination kind, size,
+warnings, and result, but never a path, SQL, tool stderr, or credential.
 
-`src/services/databaseDump.ts` is the typed command boundary.
-`src/stores/databaseDumpStore.ts` owns tool detection, one active transfer,
-cancellation state, progress, and the terminal result. The full dump and restore
-wizard remains #184.
+`src/services/databaseDump.ts` and `src/services/databaseBackup.ts` are the
+typed command boundaries. `src/stores/databaseDumpStore.ts` and
+`src/stores/databaseBackupStore.ts` own tool detection, one active transfer,
+cancellation state, progress, the restore preview, and the terminal result. The
+backup store refuses to send a restore without an acknowledged confirmation.
+The full dump, backup, and restore wizard remains #184.
 
 ### Tests
 
 `database::dump` unit tests use a fake remote session to cover tool detection,
 missing and incompatible tools, database/schema/table/cluster command
-construction, hostile identifiers, plain SQL and archive restore commands,
-successful remote and local exports, size verification, failure summaries,
-cancellation with process kill, partial-file cleanup, local download failure,
-restore confirmation, failed restore reporting, and credential redaction.
-Command builders additionally assert that `--password` never appears and that
-the password variable is read from the temporary file. Frontend store tests
-cover detection, export success, cancelled restore state, cancellation, errors,
-and stale progress events.
+construction, hostile identifiers, explicit tool selection, plain SQL and
+archive restore commands, successful remote and local exports, size
+verification, empty and failed dumps, overwrite protection, failure summaries,
+cancellation with process kill, restore preview, restore confirmation naming,
+cancelled restore partial state, local download failure, and credential
+redaction. Command builders additionally assert that `--password` never appears
+and that the password variable is read from the temporary file. Frontend
+service and store tests cover backup command payloads, previews, success,
+failure, missing tools, overwrite conflicts, cancellation, incomplete restore
+state, and refusal to restore without confirmation.
 
 ## Current limitations
 
