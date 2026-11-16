@@ -10,6 +10,7 @@ pub mod csv;
 pub mod discovery;
 pub mod dump;
 pub mod history;
+pub mod objects;
 pub mod profiles;
 pub mod queries;
 pub mod row_writes;

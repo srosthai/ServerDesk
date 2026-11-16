@@ -15,6 +15,7 @@ pub mod dump_remote;
 pub mod errors;
 pub mod fake;
 pub mod mysql;
+pub mod objects;
 pub mod pagination;
 pub mod postgres;
 pub mod queries;
@@ -72,6 +73,16 @@ pub use errors::{DatabaseError, DatabaseErrorKind};
 pub use fake::FakeDatabaseAdapter;
 pub use fake::FakeRowTable;
 pub use mysql::MysqlDatabaseAdapter;
+pub use objects::{
+    DatabaseObjectKind, DatabaseObjectService, MAX_OBJECT_BODY_LENGTH,
+    MAX_OBJECT_DEFINITION_LENGTH, MAX_OBJECT_QUERY_LENGTH, MAX_ROUTINE_ARGUMENTS_LENGTH,
+    MAX_ROUTINE_RETURN_TYPE_LENGTH, MAX_TRIGGER_ARGUMENTS_LENGTH, MAX_TRIGGER_EVENTS,
+    ObjectActionKind, ObjectActionRequest, ObjectActionResult, ObjectDdlPreview, ObjectDefinition,
+    ObjectRef, ObjectRefRequest, RoutineKind, RoutineSummary, SequenceDataType, SequenceDetails,
+    TriggerBodyRequest, TriggerDetails, TriggerEvent, TriggerSummary, TriggerTiming,
+    ValidatedObjectAction, ValidatedTriggerBody, execute_object_with_adapter,
+    preview_object_with_adapter,
+};
 pub use pagination::{
     Bounded, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, MAX_PAGE_OFFSET, Page, PageRequest,
 };

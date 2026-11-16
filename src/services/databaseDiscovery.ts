@@ -10,10 +10,12 @@ import type {
   DatabaseObjectCounts,
   DatabasePage,
   DatabaseSchemaSummary,
+  DatabaseRoutineSummary,
   DatabaseSequenceSummary,
   DatabaseSummary,
   DatabaseTableDependencies,
   DatabaseTableSummary,
+  DatabaseTriggerSummary,
   DatabaseViewSummary,
 } from "@/types/contracts";
 
@@ -23,6 +25,8 @@ export const databaseDiscoveryCommands = {
   tables: "list_database_tables",
   views: "list_database_views",
   sequences: "list_database_sequences",
+  routines: "list_database_routines",
+  triggers: "list_database_triggers",
   columns: "list_database_columns",
   indexes: "list_database_indexes",
   constraints: "list_database_constraints",
@@ -100,6 +104,30 @@ export function listSequences(
   page: DatabaseDiscoveryPage = {},
 ): Promise<DatabasePage<DatabaseSequenceSummary>> {
   return invoke<DatabasePage<DatabaseSequenceSummary>>(databaseDiscoveryCommands.sequences, {
+    profileId,
+    ...scopeArgs(scope),
+    ...pageArgs(page),
+  });
+}
+
+export function listRoutines(
+  profileId: string,
+  scope: DatabaseDiscoveryScope = {},
+  page: DatabaseDiscoveryPage = {},
+): Promise<DatabasePage<DatabaseRoutineSummary>> {
+  return invoke<DatabasePage<DatabaseRoutineSummary>>(databaseDiscoveryCommands.routines, {
+    profileId,
+    ...scopeArgs(scope),
+    ...pageArgs(page),
+  });
+}
+
+export function listTriggers(
+  profileId: string,
+  scope: DatabaseDiscoveryScope = {},
+  page: DatabaseDiscoveryPage = {},
+): Promise<DatabasePage<DatabaseTriggerSummary>> {
+  return invoke<DatabasePage<DatabaseTriggerSummary>>(databaseDiscoveryCommands.triggers, {
     profileId,
     ...scopeArgs(scope),
     ...pageArgs(page),

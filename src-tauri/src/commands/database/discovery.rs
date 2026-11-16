@@ -12,8 +12,9 @@ use crate::{
     database::{
         ColumnSummary, ConstraintSummary, DEFAULT_PAGE_LIMIT, DatabaseConnectionRegistry,
         DatabaseDiscoveryService, DatabaseSummary, ExplorerNode, ExplorerNodePayload, IndexSummary,
-        MAX_PAGE_LIMIT, MetadataScope, ObjectCounts, Page, PageRequest, SchemaSummary,
-        SequenceSummary, TableDependencies, TableRef, TableSummary, ViewSummary,
+        MAX_PAGE_LIMIT, MetadataScope, ObjectCounts, Page, PageRequest, RoutineSummary,
+        SchemaSummary, SequenceSummary, TableDependencies, TableRef, TableSummary, TriggerSummary,
+        ViewSummary,
     },
 };
 
@@ -111,7 +112,39 @@ pub async fn list_database_sequences(
         .await
 }
 
-/// Returns table/view/sequence counts for one explorer node.
+/// Lists functions and procedures visible in one schema.
+#[tauri::command]
+pub async fn list_database_routines(
+    connections: State<'_, DatabaseConnectionRegistry>,
+    profile_id: String,
+    database: Option<String>,
+    schema: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u64>,
+) -> Result<Page<RoutineSummary>, AppError> {
+    let scope = scope(database, schema)?;
+    DatabaseDiscoveryService::new(connections.inner())
+        .routines(&profile_id, &scope, page(limit, offset))
+        .await
+}
+
+/// Lists triggers visible in one schema.
+#[tauri::command]
+pub async fn list_database_triggers(
+    connections: State<'_, DatabaseConnectionRegistry>,
+    profile_id: String,
+    database: Option<String>,
+    schema: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u64>,
+) -> Result<Page<TriggerSummary>, AppError> {
+    let scope = scope(database, schema)?;
+    DatabaseDiscoveryService::new(connections.inner())
+        .triggers(&profile_id, &scope, page(limit, offset))
+        .await
+}
+
+/// Returns table/view/sequence/routine/trigger counts for one explorer node.
 #[tauri::command]
 pub async fn get_database_object_counts(
     connections: State<'_, DatabaseConnectionRegistry>,

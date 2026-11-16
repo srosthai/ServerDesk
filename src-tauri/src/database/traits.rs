@@ -19,6 +19,10 @@ use super::{
     },
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
+    objects::{
+        ObjectDdlPreview, ObjectDefinition, ObjectRef, RoutineSummary, TriggerSummary,
+        ValidatedObjectAction,
+    },
     pagination::{Bounded, Page, PageRequest},
     queries::{QueryControl, QueryExecutionResult, QueryRequest},
     row_writes::{RowDeleteRequest, RowInsertRequest, RowUpdateRequest, RowWriteResult},
@@ -234,6 +238,8 @@ pub struct ObjectCounts {
     pub views: MetadataValue<u64>,
     pub materialized_views: MetadataValue<u64>,
     pub sequences: MetadataValue<u64>,
+    pub routines: MetadataValue<u64>,
+    pub triggers: MetadataValue<u64>,
 }
 
 /// How a column produces its value when it is not supplied by the caller.
@@ -499,6 +505,42 @@ pub trait DatabaseAdapter: Send + Sync {
         scope: &MetadataScope,
         page: PageRequest,
     ) -> Result<Page<SequenceSummary>, DatabaseError>;
+
+    /// Lists routines visible in the selected scope. Engines that do not expose
+    /// routines return a capability error rather than an empty page.
+    async fn list_routines(
+        &self,
+        scope: &MetadataScope,
+        page: PageRequest,
+    ) -> Result<Page<RoutineSummary>, DatabaseError>;
+
+    /// Lists triggers visible in the selected scope.
+    async fn list_triggers(
+        &self,
+        scope: &MetadataScope,
+        page: PageRequest,
+    ) -> Result<Page<TriggerSummary>, DatabaseError>;
+
+    /// Reads one bounded object definition. A missing object returns a typed
+    /// query error; the caller must not guess a definition from a summary.
+    async fn object_definition(
+        &self,
+        object: &ObjectRef,
+    ) -> Result<ObjectDefinition, DatabaseError>;
+
+    /// Generates engine-specific DDL for one object action without executing
+    /// it. This is a planning method only.
+    async fn preview_object_action(
+        &self,
+        action: &ValidatedObjectAction,
+    ) -> Result<ObjectDdlPreview, DatabaseError>;
+
+    /// Executes one validated object action after re-running the same preview
+    /// path. The caller re-reads metadata afterwards.
+    async fn execute_object_action(
+        &mut self,
+        action: &ValidatedObjectAction,
+    ) -> Result<(), DatabaseError>;
 
     /// Returns bounded object counts for one explorer node in a single query.
     async fn object_counts(&self, scope: &MetadataScope) -> Result<ObjectCounts, DatabaseError>;

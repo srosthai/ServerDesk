@@ -70,11 +70,51 @@ pub const LIST_VIEWS: &str = "SELECT TABLE_SCHEMA AS database_name, TABLE_NAME A
     WHERE (? IS NULL OR TABLE_SCHEMA = ?) \
     ORDER BY TABLE_SCHEMA, TABLE_NAME LIMIT ? OFFSET ?";
 
+pub const VIEW_DEFINITION: &str = "SELECT TABLE_SCHEMA AS database_name, TABLE_NAME AS name, \
+    VIEW_DEFINITION AS view_query, DEFINER AS owner, CHECK_OPTION AS check_option, \
+    IS_UPDATABLE AS is_updatable \
+    FROM information_schema.VIEWS \
+    WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ? LIMIT 1";
+
+pub const LIST_ROUTINES: &str = "SELECT ROUTINE_SCHEMA AS database_name, ROUTINE_NAME AS name, \
+    ROUTINE_TYPE AS routine_type, DTD_IDENTIFIER AS return_type, \
+    EXTERNAL_LANGUAGE AS language, DEFINER AS owner, ROUTINE_DEFINITION AS definition, \
+    ROUTINE_BODY AS body_type \
+    FROM information_schema.ROUTINES \
+    WHERE (? IS NULL OR ROUTINE_SCHEMA = ?) \
+    ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME LIMIT ? OFFSET ?";
+
+pub const ROUTINE_DEFINITION: &str = "SELECT ROUTINE_SCHEMA AS database_name, \
+    ROUTINE_NAME AS name, ROUTINE_TYPE AS routine_type, DTD_IDENTIFIER AS return_type, \
+    EXTERNAL_LANGUAGE AS language, DEFINER AS owner, ROUTINE_DEFINITION AS definition, \
+    ROUTINE_BODY AS body_type \
+    FROM information_schema.ROUTINES \
+    WHERE ROUTINE_SCHEMA = COALESCE(?, DATABASE()) AND ROUTINE_NAME = ? \
+    AND (? IS NULL OR ROUTINE_TYPE = ?) LIMIT 1";
+
+pub const LIST_TRIGGERS: &str = "SELECT TRIGGER_SCHEMA AS database_name, TRIGGER_NAME AS name, \
+    EVENT_OBJECT_TABLE AS table_name, ACTION_TIMING AS timing, \
+    EVENT_MANIPULATION AS event_name, DEFINER AS owner, ACTION_STATEMENT AS statement \
+    FROM information_schema.TRIGGERS \
+    WHERE (? IS NULL OR TRIGGER_SCHEMA = ?) \
+    ORDER BY TRIGGER_SCHEMA, TRIGGER_NAME LIMIT ? OFFSET ?";
+
+pub const TRIGGER_DEFINITION: &str = "SELECT TRIGGER_SCHEMA AS database_name, \
+    TRIGGER_NAME AS name, EVENT_OBJECT_TABLE AS table_name, ACTION_TIMING AS timing, \
+    EVENT_MANIPULATION AS event_name, DEFINER AS owner, ACTION_STATEMENT AS statement, \
+    ACTION_ORDER AS action_order, ACTION_ORIENTATION AS action_orientation \
+    FROM information_schema.TRIGGERS \
+    WHERE TRIGGER_SCHEMA = COALESCE(?, DATABASE()) AND TRIGGER_NAME = ? LIMIT 1";
+
 pub const OBJECT_COUNTS: &str = "SELECT \
     CAST(COALESCE(SUM(CASE WHEN TABLE_TYPE = 'BASE TABLE' THEN 1 ELSE 0 END), 0) AS SIGNED) \
         AS table_count, \
     CAST(COALESCE(SUM(CASE WHEN TABLE_TYPE = 'VIEW' THEN 1 ELSE 0 END), 0) AS SIGNED) \
-        AS view_count \
+        AS view_count, \
+    (SELECT COUNT(*) FROM information_schema.ROUTINES r \
+        WHERE (? IS NULL OR r.ROUTINE_SCHEMA = ?)) AS routine_count, \
+    (SELECT COUNT(*) FROM information_schema.TRIGGERS tr \
+        WHERE (? IS NULL OR tr.TRIGGER_SCHEMA = ?)) AS trigger_count \
     FROM information_schema.TABLES \
     WHERE (? IS NULL OR TABLE_SCHEMA = ?)";
 
@@ -227,18 +267,6 @@ pub const TABLE_TRIGGERS: &str = "SELECT TRIGGER_NAME AS name, \
     FROM information_schema.TRIGGERS \
     WHERE TRIGGER_SCHEMA = ? AND EVENT_OBJECT_TABLE = ? \
     ORDER BY TRIGGER_NAME LIMIT ?";
-
-pub const LIST_ROUTINES: &str = "SELECT ROUTINE_SCHEMA AS database_name, ROUTINE_NAME AS name, \
-    ROUTINE_TYPE AS routine_type \
-    FROM information_schema.ROUTINES \
-    WHERE (? IS NULL OR ROUTINE_SCHEMA = ?) \
-    ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME";
-
-pub const LIST_TRIGGERS: &str = "SELECT TRIGGER_SCHEMA AS database_name, TRIGGER_NAME AS name, \
-    EVENT_OBJECT_TABLE AS table_name, EVENT_MANIPULATION AS event, ACTION_TIMING AS timing \
-    FROM information_schema.TRIGGERS \
-    WHERE (? IS NULL OR TRIGGER_SCHEMA = ?) \
-    ORDER BY TRIGGER_SCHEMA, TRIGGER_NAME";
 
 pub const LIST_ROLES: &str = "SELECT DISTINCT FROM_USER AS name FROM mysql.role_edges \
     ORDER BY FROM_USER";

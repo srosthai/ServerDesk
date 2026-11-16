@@ -13,10 +13,12 @@ import type {
   DatabaseExplorerNodePayload,
   DatabasePage,
   DatabaseProfile,
+  DatabaseRoutineSummary,
   DatabaseSchemaSummary,
   DatabaseSequenceSummary,
   DatabaseSummary,
   DatabaseTableSummary,
+  DatabaseTriggerSummary,
   DatabaseViewSummary,
 } from "@/types/contracts";
 
@@ -41,8 +43,11 @@ const capabilities: DatabaseCapabilities = {
     schemas: true,
     sequences: true,
     materializedViews: true,
+    viewManagement: true,
     routines: true,
+    routineEdit: true,
     triggers: true,
+    triggerEdit: true,
     roles: true,
     sessions: true,
     transactions: true,
@@ -162,6 +167,27 @@ const usersSequence: DatabaseSequenceSummary = {
   ...metadata,
 };
 
+const userEmailRoutine: DatabaseRoutineSummary = {
+  database: "app",
+  schema: "public",
+  name: "user_email",
+  kind: "function",
+  language: { status: "available", value: "sql" },
+  returnType: { status: "available", value: "text" },
+  arguments: { status: "available", value: "user_id bigint" },
+  ...metadata,
+};
+
+const usersAuditTrigger: DatabaseTriggerSummary = {
+  database: "app",
+  schema: "public",
+  name: "users_audit",
+  table: "users",
+  timing: "after",
+  events: ["insert"],
+  ...metadata,
+};
+
 function page<T>(items: T[]): DatabasePage<T> {
   return { items, limit: 100, offset: 0, hasMore: false, total: items.length };
 }
@@ -191,6 +217,16 @@ const sequencesPayload: DatabaseExplorerNodePayload = {
   payload: page([usersSequence]),
 };
 
+const routinesPayload: DatabaseExplorerNodePayload = {
+  nodeKind: "routines",
+  payload: page([userEmailRoutine]),
+};
+
+const triggersPayload: DatabaseExplorerNodePayload = {
+  nodeKind: "triggers",
+  payload: page([usersAuditTrigger]),
+};
+
 function payloadForNode(node: DatabaseExplorerNode): DatabaseExplorerNodePayload {
   switch (node.kind) {
     case "databases":
@@ -203,6 +239,10 @@ function payloadForNode(node: DatabaseExplorerNode): DatabaseExplorerNodePayload
       return viewsPayload;
     case "sequences":
       return sequencesPayload;
+    case "routines":
+      return routinesPayload;
+    case "triggers":
+      return triggersPayload;
     default:
       return {
         nodeKind: "objectCounts",
@@ -211,6 +251,8 @@ function payloadForNode(node: DatabaseExplorerNode): DatabaseExplorerNodePayload
           views: { status: "available", value: 1 },
           materializedViews: unavailable,
           sequences: { status: "available", value: 1 },
+          routines: { status: "available", value: 1 },
+          triggers: { status: "available", value: 1 },
         },
       };
   }
@@ -371,6 +413,36 @@ describe("DatabaseExplorerTree", () => {
       const nodes = vi.mocked(refreshExplorerNode).mock.calls.map((call) => call[1]);
       expect(nodes).toEqual(expect.arrayContaining([{ kind: "databases" }, { kind: "schemas" }]));
     });
+  });
+
+  it("lists routines and triggers next to views and sequences", async () => {
+    const user = userEvent.setup();
+    render(<Harness />);
+
+    await expandPrimary(user);
+    await user.click(screen.getByRole("treeitem", { name: /^app/ }));
+    await user.click(screen.getByRole("treeitem", { name: /^Schemas/ }));
+    await screen.findByRole("treeitem", { name: /^public/ });
+    await user.click(screen.getByRole("treeitem", { name: /^public/ }));
+
+    expect(screen.getByRole("treeitem", { name: /^Routines/ })).toBeInTheDocument();
+    expect(screen.getByRole("treeitem", { name: /^Triggers/ })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("treeitem", { name: /^Routines/ }));
+    expect(await screen.findByRole("treeitem", { name: /^user_email/ })).toBeInTheDocument();
+    expect(loadExplorerNode).toHaveBeenCalledWith(
+      primaryProfile.id,
+      { kind: "routines", database: "app", schema: "public" },
+      undefined,
+    );
+
+    await user.click(screen.getByRole("treeitem", { name: /^Triggers/ }));
+    expect(await screen.findByRole("treeitem", { name: /^users_audit/ })).toBeInTheDocument();
+    expect(loadExplorerNode).toHaveBeenCalledWith(
+      primaryProfile.id,
+      { kind: "triggers", database: "app", schema: "public" },
+      undefined,
+    );
   });
 
   it("renders an empty node state without hiding the connection", async () => {

@@ -27,7 +27,7 @@ use crate::storage::DatabaseEngine;
 
 use super::{
     MYSQL_DIALECT, actions as engine_actions, csv as engine_csv, ddl as engine_ddl,
-    queries as engine_queries, rows as engine_rows, sql,
+    objects as engine_objects, queries as engine_queries, rows as engine_rows, sql,
 };
 use crate::database::{
     actions::{DatabaseDdlPreview, ValidatedDatabaseAction},
@@ -36,8 +36,13 @@ use crate::database::{
         CsvExportSink, CsvExportSource, CsvExportSummary, CsvImportObserver, CsvImportRequest,
         CsvImportSource, CsvImportSummary,
     },
-    dialect::{Identifier, SqlDialect},
+    dialect::{Identifier, IdentifierQuoter, SqlDialect},
     errors::DatabaseError,
+    objects::{
+        DatabaseObjectKind, ObjectDdlPreview, ObjectDefinition, ObjectRef, RoutineKind,
+        RoutineSummary, TriggerDetails, TriggerEvent, TriggerSummary, TriggerTiming,
+        ValidatedObjectAction,
+    },
     pagination::{Bounded, Page, PageRequest},
     queries::{QueryControl, QueryExecutionResult, QueryRequest},
     row_writes::{RowDeleteRequest, RowInsertRequest, RowUpdateRequest, RowWriteResult},
@@ -281,6 +286,218 @@ impl MysqlDatabaseAdapter {
             (None, Some(schema)) => Ok(Some(schema.to_string())),
             (None, None) => Ok(None),
         }
+    }
+
+    fn object_database(object: &ObjectRef) -> Result<Option<String>, DatabaseError> {
+        match (
+            object.database.as_ref().map(|value| value.as_str()),
+            object.schema.as_ref().map(|value| value.as_str()),
+        ) {
+            (Some(database), Some(schema)) if database != schema => Err(DatabaseError::validation(
+                "MySQL uses one database/schema namespace; the object reference values must match.",
+            )),
+            (Some(database), _) => Ok(Some(database.to_string())),
+            (None, Some(schema)) => Ok(Some(schema.to_string())),
+            (None, None) => Ok(None),
+        }
+    }
+
+    async fn view_definition(&self, object: &ObjectRef) -> Result<ObjectDefinition, DatabaseError> {
+        let database = Self::object_database(object)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let row = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::VIEW_DEFINITION)
+                .bind(database.as_deref())
+                .bind(object.name.as_str())
+                .fetch_optional(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("view", object.name.as_str()))?
+        .ok_or_else(|| DatabaseError::query("The view does not exist or is not visible."))?;
+
+        let database_name: String = decode(&row, "database_name")?;
+        let name: String = decode(&row, "name")?;
+        let query: Option<String> = decode(&row, "view_query")?;
+        let definition = query.as_ref().map(|query| {
+            format!(
+                "CREATE VIEW {}.{} AS\n{}",
+                MYSQL_DIALECT
+                    .quote_identifier(&Identifier::new(database_name.clone()).unwrap_or_else(
+                        |_| Identifier::new("unknown").expect("static identifier")
+                    )),
+                MYSQL_DIALECT.quote_identifier(&Identifier::new(name.clone()).unwrap_or_else(
+                    |_| { Identifier::new("unknown").expect("static identifier") }
+                )),
+                query
+            )
+        });
+
+        Ok(ObjectDefinition {
+            kind: DatabaseObjectKind::View,
+            database: Some(database_name.clone()),
+            schema: Some(database_name),
+            name,
+            owner: decode::<Option<String>>(&row, "owner")?.into(),
+            language: MetadataValue::Unavailable,
+            routine_kind: MetadataValue::Unavailable,
+            arguments: MetadataValue::Unavailable,
+            return_type: MetadataValue::Unavailable,
+            view_query: query.into(),
+            routine_body: MetadataValue::Unavailable,
+            definition: definition.into(),
+            trigger: None,
+            sequence: None,
+            truncated: false,
+        })
+    }
+
+    async fn routine_definition(
+        &self,
+        object: &ObjectRef,
+    ) -> Result<ObjectDefinition, DatabaseError> {
+        let database = Self::object_database(object)?;
+        let routine_type = object.routine_kind.map(|kind| match kind {
+            RoutineKind::Function => "FUNCTION",
+            RoutineKind::Procedure => "PROCEDURE",
+        });
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let row = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::ROUTINE_DEFINITION)
+                .bind(database.as_deref())
+                .bind(object.name.as_str())
+                .bind(routine_type)
+                .bind(routine_type)
+                .fetch_optional(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("routine", object.name.as_str()))?
+        .ok_or_else(|| DatabaseError::query("The routine does not exist or is not visible."))?;
+
+        let database_name: String = decode(&row, "database_name")?;
+        let routine_type: String = decode(&row, "routine_type")?;
+        let body: Option<String> = decode(&row, "definition")?;
+        let arguments: Option<String> = None;
+        let return_type: Option<String> = decode(&row, "return_type")?;
+        let definition = body.as_ref().map(|body| {
+            let header = match routine_type.as_str() {
+                "PROCEDURE" => format!(
+                    "CREATE PROCEDURE {}({})",
+                    object.name.as_str(),
+                    arguments.as_deref().unwrap_or("")
+                ),
+                _ => format!(
+                    "CREATE FUNCTION {}({}) RETURNS {}",
+                    object.name.as_str(),
+                    arguments.as_deref().unwrap_or(""),
+                    return_type.as_deref().unwrap_or("?")
+                ),
+            };
+            format!("{header}\n{body}")
+        });
+
+        Ok(ObjectDefinition {
+            kind: DatabaseObjectKind::Routine,
+            database: Some(database_name.clone()),
+            schema: Some(database_name),
+            name: decode(&row, "name")?,
+            owner: decode::<Option<String>>(&row, "owner")?.into(),
+            language: decode::<Option<String>>(&row, "language")?.into(),
+            routine_kind: MetadataValue::available(routine_kind(&routine_type)?),
+            arguments: arguments.into(),
+            return_type: return_type.into(),
+            view_query: MetadataValue::Unavailable,
+            routine_body: body.clone().into(),
+            definition: definition.into(),
+            trigger: None,
+            sequence: None,
+            truncated: false,
+        })
+    }
+
+    async fn trigger_definition(
+        &self,
+        object: &ObjectRef,
+    ) -> Result<ObjectDefinition, DatabaseError> {
+        let database = Self::object_database(object)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let row = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::TRIGGER_DEFINITION)
+                .bind(database.as_deref())
+                .bind(object.name.as_str())
+                .fetch_optional(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("trigger", object.name.as_str()))?
+        .ok_or_else(|| DatabaseError::query("The trigger does not exist or is not visible."))?;
+
+        let database_name: String = decode(&row, "database_name")?;
+        let table: String = decode(&row, "table_name")?;
+        let timing_text: String = decode(&row, "timing")?;
+        let event_text: String = decode(&row, "event_name")?;
+        let statement: String = decode(&row, "statement")?;
+        let timing = TriggerTiming::from_mysql(&timing_text)
+            .ok_or_else(|| DatabaseError::query("MySQL returned an unknown trigger timing."))?;
+        let event = TriggerEvent::from_mysql(&event_text)
+            .ok_or_else(|| DatabaseError::query("MySQL returned an unknown trigger event."))?;
+        let definition = format!(
+            "CREATE TRIGGER {}.{} {} {} ON {}.{} FOR EACH ROW\n{}",
+            MYSQL_DIALECT
+                .quote_identifier(&Identifier::new(database_name.clone()).unwrap_or_else(|_| {
+                    Identifier::new("unknown").expect("static identifier")
+                })),
+            MYSQL_DIALECT.quote_identifier(
+                &Identifier::new(decode::<String>(&row, "name")?)
+                    .unwrap_or_else(|_| { Identifier::new("unknown").expect("static identifier") })
+            ),
+            timing.as_sql(),
+            event.as_sql(),
+            MYSQL_DIALECT
+                .quote_identifier(&Identifier::new(database_name.clone()).unwrap_or_else(|_| {
+                    Identifier::new("unknown").expect("static identifier")
+                })),
+            MYSQL_DIALECT.quote_identifier(
+                &Identifier::new(table.clone())
+                    .unwrap_or_else(|_| Identifier::new("unknown").expect("static identifier"))
+            ),
+            statement
+        );
+
+        Ok(ObjectDefinition {
+            kind: DatabaseObjectKind::Trigger,
+            database: Some(database_name.clone()),
+            schema: Some(database_name),
+            name: decode(&row, "name")?,
+            owner: decode::<Option<String>>(&row, "owner")?.into(),
+            language: MetadataValue::Unavailable,
+            routine_kind: MetadataValue::Unavailable,
+            arguments: MetadataValue::Unavailable,
+            return_type: MetadataValue::Unavailable,
+            view_query: MetadataValue::Unavailable,
+            routine_body: MetadataValue::Unavailable,
+            definition: MetadataValue::available(definition),
+            trigger: Some(TriggerDetails {
+                table,
+                timing,
+                events: vec![event],
+                statement: MetadataValue::available(statement),
+                function_name: MetadataValue::Unavailable,
+                function: MetadataValue::Unavailable,
+            }),
+            sequence: None,
+            truncated: false,
+        })
     }
 
     /// Reads InnoDB statistics refresh timestamps for the current page only.
@@ -746,6 +963,146 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
         ))
     }
 
+    async fn list_routines(
+        &self,
+        scope: &MetadataScope,
+        page: PageRequest,
+    ) -> Result<Page<RoutineSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseRoutines)?;
+        let database = Self::scope_name(scope)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::LIST_ROUTINES)
+                .bind(database.as_deref())
+                .bind(database.as_deref())
+                .bind(i64::from(page.limit) + 1)
+                .bind(i64::try_from(page.offset).unwrap_or(i64::MAX))
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+
+        let routines = rows
+            .iter()
+            .map(|row| {
+                let database: String = decode(row, "database_name")?;
+                let routine_type: String = decode(row, "routine_type")?;
+                Ok(RoutineSummary {
+                    database: Some(database.clone()),
+                    schema: Some(database),
+                    name: decode(row, "name")?,
+                    kind: routine_kind(&routine_type)?,
+                    language: decode::<Option<String>>(row, "language")?.into(),
+                    return_type: decode::<Option<String>>(row, "return_type")?.into(),
+                    arguments: MetadataValue::Unavailable,
+                    owner: decode::<Option<String>>(row, "owner")?.into(),
+                })
+            })
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+
+        Ok(Page::from_items(routines, page, None))
+    }
+
+    async fn list_triggers(
+        &self,
+        scope: &MetadataScope,
+        page: PageRequest,
+    ) -> Result<Page<TriggerSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseTriggers)?;
+        let database = Self::scope_name(scope)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::LIST_TRIGGERS)
+                .bind(database.as_deref())
+                .bind(database.as_deref())
+                .bind(i64::from(page.limit) + 1)
+                .bind(i64::try_from(page.offset).unwrap_or(i64::MAX))
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+
+        let triggers = rows
+            .iter()
+            .map(|row| {
+                let database: String = decode(row, "database_name")?;
+                let timing: String = decode(row, "timing")?;
+                let event: String = decode(row, "event_name")?;
+                Ok(TriggerSummary {
+                    database: Some(database.clone()),
+                    schema: Some(database),
+                    name: decode(row, "name")?,
+                    table: decode(row, "table_name")?,
+                    timing: TriggerTiming::from_mysql(&timing).ok_or_else(|| {
+                        DatabaseError::query("MySQL returned an unknown trigger timing.")
+                    })?,
+                    events: vec![TriggerEvent::from_mysql(&event).ok_or_else(|| {
+                        DatabaseError::query("MySQL returned an unknown trigger event.")
+                    })?],
+                    owner: decode::<Option<String>>(row, "owner")?.into(),
+                })
+            })
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+
+        Ok(Page::from_items(triggers, page, None))
+    }
+
+    async fn object_definition(
+        &self,
+        object: &ObjectRef,
+    ) -> Result<ObjectDefinition, DatabaseError> {
+        self.require_connection()?;
+        match object.kind {
+            DatabaseObjectKind::View | DatabaseObjectKind::MaterializedView => {
+                if object.kind == DatabaseObjectKind::MaterializedView {
+                    return Err(DatabaseError::capability(
+                        "MySQL does not support materialized views.",
+                    ));
+                }
+                self.require_capability(DatabaseAction::BrowseViews)?;
+                self.view_definition(object).await
+            }
+            DatabaseObjectKind::Routine => {
+                self.require_capability(DatabaseAction::BrowseRoutines)?;
+                self.routine_definition(object).await
+            }
+            DatabaseObjectKind::Trigger => {
+                self.require_capability(DatabaseAction::BrowseTriggers)?;
+                self.trigger_definition(object).await
+            }
+            DatabaseObjectKind::Sequence => Err(DatabaseError::capability(
+                "MySQL does not support sequences.",
+            )),
+        }
+    }
+
+    async fn preview_object_action(
+        &self,
+        action: &ValidatedObjectAction,
+    ) -> Result<ObjectDdlPreview, DatabaseError> {
+        self.require_connection()?;
+        action.ensure_supported(&self.capabilities)?;
+        engine_objects::preview(action)
+    }
+
+    async fn execute_object_action(
+        &mut self,
+        action: &ValidatedObjectAction,
+    ) -> Result<(), DatabaseError> {
+        self.require_connection()?;
+        let preview = self.preview_object_action(action).await?;
+        for statement in &preview.statements {
+            self.execute_statement(statement).await?;
+        }
+        Ok(())
+    }
+
     async fn object_counts(&self, scope: &MetadataScope) -> Result<ObjectCounts, DatabaseError> {
         self.require_capability(DatabaseAction::BrowseTables)?;
         let database = Self::scope_name(scope)?;
@@ -754,6 +1111,10 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
         let row = timeout_at(
             tokio::time::Instant::now() + self.operation_timeout,
             sqlx::query(sql::OBJECT_COUNTS)
+                .bind(database.as_deref())
+                .bind(database.as_deref())
+                .bind(database.as_deref())
+                .bind(database.as_deref())
                 .bind(database.as_deref())
                 .bind(database.as_deref())
                 .fetch_one(&mut *connection),
@@ -767,6 +1128,8 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
             views: MetadataValue::available(decode_count(&row, "view_count")?),
             materialized_views: MetadataValue::Unavailable,
             sequences: MetadataValue::Unavailable,
+            routines: MetadataValue::available(decode_count(&row, "routine_count")?),
+            triggers: MetadataValue::available(decode_count(&row, "trigger_count")?),
         })
     }
 
@@ -1601,6 +1964,16 @@ where
     })
 }
 
+fn routine_kind(value: &str) -> Result<RoutineKind, DatabaseError> {
+    match value.to_ascii_uppercase().as_str() {
+        "FUNCTION" => Ok(RoutineKind::Function),
+        "PROCEDURE" => Ok(RoutineKind::Procedure),
+        _ => Err(DatabaseError::query(
+            "MySQL returned an unknown routine type.",
+        )),
+    }
+}
+
 fn decode_flag(row: &MySqlRow, column: &str) -> Result<bool, DatabaseError> {
     Ok(decode::<i64>(row, column)? != 0)
 }
@@ -2329,9 +2702,59 @@ mod tests {
                 .iter()
                 .any(|view| view.name == "serverdesk_probe_view")
         );
+        let triggers = adapter
+            .list_triggers(&scope, PageRequest::new(500, 0))
+            .await
+            .expect("list triggers");
+        assert!(
+            triggers
+                .items
+                .iter()
+                .any(|trigger| trigger.name == "serverdesk_probe_trigger"
+                    && trigger.table == "serverdesk_writable_probe")
+        );
+
+        let view_ref = ObjectRef {
+            kind: DatabaseObjectKind::View,
+            database: Some(Identifier::new(&fixture.database).expect("database")),
+            schema: None,
+            name: Identifier::new("serverdesk_probe_view").expect("view"),
+            routine_kind: None,
+            arguments: None,
+            table: None,
+        };
+        let definition = adapter
+            .object_definition(&view_ref)
+            .await
+            .expect("view definition");
+        assert!(
+            definition
+                .view_query
+                .value()
+                .is_some_and(|query| query.contains("serverdesk_writable_probe"))
+        );
+
+        let trigger_ref = ObjectRef {
+            kind: DatabaseObjectKind::Trigger,
+            database: Some(Identifier::new(&fixture.database).expect("database")),
+            schema: None,
+            name: Identifier::new("serverdesk_probe_trigger").expect("trigger"),
+            routine_kind: None,
+            arguments: None,
+            table: Some(Identifier::new("serverdesk_writable_probe").expect("table")),
+        };
+        let definition = adapter
+            .object_definition(&trigger_ref)
+            .await
+            .expect("trigger definition");
+        let details = definition.trigger.expect("trigger details");
+        assert_eq!(details.table, "serverdesk_writable_probe");
+        assert_eq!(details.events, vec![TriggerEvent::Insert]);
+
         let counts = adapter.object_counts(&scope).await.expect("object counts");
         assert!(counts.tables.value().is_some_and(|value| *value >= 1));
         assert!(counts.views.value().is_some_and(|value| *value >= 1));
+        assert!(counts.triggers.value().is_some_and(|value| *value >= 1));
         assert_eq!(counts.sequences, MetadataValue::Unavailable);
 
         let databases = adapter
