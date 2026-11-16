@@ -26,7 +26,7 @@ use crate::storage::DatabaseEngine;
 
 use super::{
     POSTGRES_DIALECT, actions as engine_actions, csv as engine_csv, ddl as engine_ddl,
-    queries as engine_queries, rows as engine_rows, sql,
+    objects as engine_objects, queries as engine_queries, rows as engine_rows, sql,
 };
 use crate::database::{
     actions::{DatabaseDdlPreview, ValidatedDatabaseAction},
@@ -35,8 +35,13 @@ use crate::database::{
         CsvExportSink, CsvExportSource, CsvExportSummary, CsvImportObserver, CsvImportRequest,
         CsvImportSource, CsvImportSummary,
     },
-    dialect::{Identifier, SqlDialect},
+    dialect::{Identifier, IdentifierQuoter, SqlDialect},
     errors::DatabaseError,
+    objects::{
+        DatabaseObjectKind, ObjectDdlPreview, ObjectDefinition, ObjectRef, RoutineKind,
+        RoutineSummary, SequenceDetails, TriggerDetails, TriggerEvent, TriggerSummary,
+        TriggerTiming, ValidatedObjectAction,
+    },
     pagination::{Bounded, Page, PageRequest},
     queries::{QueryControl, QueryExecutionResult, QueryRequest},
     row_writes::{RowDeleteRequest, RowInsertRequest, RowUpdateRequest, RowWriteResult},
@@ -293,6 +298,307 @@ impl PostgresDatabaseAdapter {
             .schema
             .as_ref()
             .map(|schema| schema.as_str().to_string()))
+    }
+    async fn view_definition(&self, object: &ObjectRef) -> Result<ObjectDefinition, DatabaseError> {
+        let schema = object.schema.as_ref().map(Identifier::as_str);
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let row = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::VIEW_DEFINITION)
+                .bind(schema)
+                .bind(object.name.as_str())
+                .fetch_optional(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("view", object.name.as_str()))?
+        .ok_or_else(|| DatabaseError::query("The view does not exist or is not visible."))?;
+
+        let view_type: String = decode(&row, "view_type")?;
+        let kind = if view_type.eq_ignore_ascii_case("MATERIALIZED VIEW") {
+            DatabaseObjectKind::MaterializedView
+        } else {
+            DatabaseObjectKind::View
+        };
+        if object.kind != kind {
+            return Err(DatabaseError::validation(format!(
+                "The selected object is a {}, not a {}.",
+                kind.as_str(),
+                object.kind.as_str()
+            )));
+        }
+        let database: String = decode(&row, "database_name")?;
+        let schema_name: String = decode(&row, "schema_name")?;
+        let name: String = decode(&row, "name")?;
+        let query: String = decode(&row, "view_query")?;
+        let definition = format!(
+            "CREATE {}VIEW {}.{} AS\n{}",
+            if kind == DatabaseObjectKind::MaterializedView {
+                "MATERIALIZED "
+            } else {
+                ""
+            },
+            POSTGRES_DIALECT.quote_identifier(
+                &Identifier::new(schema_name.clone())
+                    .unwrap_or_else(|_| Identifier::new("public").expect("static identifier"))
+            ),
+            POSTGRES_DIALECT.quote_identifier(
+                &Identifier::new(name.clone())
+                    .unwrap_or_else(|_| Identifier::new("view").expect("static identifier"))
+            ),
+            query
+        );
+        Ok(ObjectDefinition {
+            kind,
+            database: Some(database),
+            schema: Some(schema_name),
+            name,
+            owner: decode::<Option<String>>(&row, "owner")?.into(),
+            language: MetadataValue::Unavailable,
+            routine_kind: MetadataValue::Unavailable,
+            arguments: MetadataValue::Unavailable,
+            return_type: MetadataValue::Unavailable,
+            view_query: MetadataValue::available(query),
+            routine_body: MetadataValue::Unavailable,
+            definition: MetadataValue::available(definition),
+            trigger: None,
+            sequence: None,
+            truncated: false,
+        })
+    }
+
+    async fn routine_definition(
+        &self,
+        object: &ObjectRef,
+    ) -> Result<ObjectDefinition, DatabaseError> {
+        let schema = object.schema.as_ref().map(Identifier::as_str);
+        let prokind = object.routine_kind.map(RoutineKind::postgres_kind);
+        let arguments = object.arguments.as_deref();
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let row = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::ROUTINE_DEFINITION)
+                .bind(schema)
+                .bind(object.name.as_str())
+                .bind(prokind)
+                .bind(arguments)
+                .fetch_optional(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("routine", object.name.as_str()))?
+        .ok_or_else(|| DatabaseError::query("The routine does not exist or is not visible."))?;
+
+        let routine_type: String = decode(&row, "routine_type")?;
+        let database: String = decode(&row, "database_name")?;
+        let schema_name: String = decode(&row, "schema_name")?;
+        let name: String = decode(&row, "name")?;
+        let definition: Option<String> = decode(&row, "definition")?;
+        let routine_body: Option<String> = decode(&row, "routine_body")?;
+        let arguments: Option<String> = decode(&row, "arguments")?;
+        let return_type: Option<String> = decode(&row, "return_type")?;
+
+        Ok(ObjectDefinition {
+            kind: DatabaseObjectKind::Routine,
+            database: Some(database),
+            schema: Some(schema_name),
+            name,
+            owner: decode::<Option<String>>(&row, "owner")?.into(),
+            language: decode::<Option<String>>(&row, "language")?.into(),
+            routine_kind: MetadataValue::available(routine_kind(&routine_type)?),
+            arguments: arguments.into(),
+            return_type: return_type.into(),
+            view_query: MetadataValue::Unavailable,
+            routine_body: routine_body.into(),
+            definition: definition.into(),
+            trigger: None,
+            sequence: None,
+            truncated: false,
+        })
+    }
+
+    async fn trigger_definition(
+        &self,
+        object: &ObjectRef,
+    ) -> Result<ObjectDefinition, DatabaseError> {
+        let schema = object.schema.as_ref().map(Identifier::as_str);
+        let table = object.table.as_ref().map(Identifier::as_str);
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let row = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::TRIGGER_DEFINITION)
+                .bind(schema)
+                .bind(object.name.as_str())
+                .bind(table)
+                .fetch_optional(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("trigger", object.name.as_str()))?
+        .ok_or_else(|| DatabaseError::query("The trigger does not exist or is not visible."))?;
+
+        let trigger_type: i32 = decode(&row, "trigger_type")?;
+        let database: String = decode(&row, "database_name")?;
+        let schema_name: String = decode(&row, "schema_name")?;
+        let table_name: String = decode(&row, "table_name")?;
+        let trigger_definition: Option<String> = decode(&row, "definition")?;
+        let function_name: Option<String> = decode(&row, "function_name")?;
+        let function_definition: Option<String> = decode(&row, "function_definition")?;
+        let name: String = decode(&row, "name")?;
+        let timing = TriggerTiming::from_postgres(trigger_type);
+        let events = TriggerEvent::from_postgres(trigger_type);
+
+        Ok(ObjectDefinition {
+            kind: DatabaseObjectKind::Trigger,
+            database: Some(database),
+            schema: Some(schema_name),
+            name,
+            owner: decode::<Option<String>>(&row, "owner")?.into(),
+            language: MetadataValue::Unavailable,
+            routine_kind: MetadataValue::Unavailable,
+            arguments: MetadataValue::Unavailable,
+            return_type: MetadataValue::Unavailable,
+            view_query: MetadataValue::Unavailable,
+            routine_body: MetadataValue::Unavailable,
+            definition: function_definition.clone().into(),
+            trigger: Some(TriggerDetails {
+                table: table_name,
+                timing,
+                events,
+                statement: trigger_definition.into(),
+                function_name: function_name.into(),
+                function: function_definition.into(),
+            }),
+            sequence: None,
+            truncated: false,
+        })
+    }
+
+    async fn sequence_definition(
+        &self,
+        object: &ObjectRef,
+    ) -> Result<ObjectDefinition, DatabaseError> {
+        let schema = object.schema.as_ref().map(Identifier::as_str);
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let row = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::SEQUENCE_DEFINITION)
+                .bind(schema)
+                .bind(object.name.as_str())
+                .fetch_optional(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)
+        .map_err(|error| error.scoped_permission("sequence", object.name.as_str()))?
+        .ok_or_else(|| DatabaseError::query("The sequence does not exist or is not visible."))?;
+
+        let database: String = decode(&row, "database_name")?;
+        let schema_name: String = decode(&row, "schema_name")?;
+        let name: String = decode(&row, "name")?;
+        let data_type: Option<String> = decode(&row, "data_type")?;
+        let start_value: Option<String> = decode(&row, "start_value")?;
+        let minimum: Option<String> = decode(&row, "minimum")?;
+        let maximum: Option<String> = decode(&row, "maximum")?;
+        let increment: Option<String> = decode(&row, "increment_by")?;
+        let cycle: Option<String> = decode(&row, "cycle")?;
+        let current_value = self
+            .sequence_current_value(connection, &schema_name, &name)
+            .await;
+
+        let definition = format!(
+            "CREATE SEQUENCE {}.{}{}{}{}{}",
+            POSTGRES_DIALECT.quote_identifier(
+                &Identifier::new(schema_name.clone())
+                    .unwrap_or_else(|_| Identifier::new("public").expect("static identifier"))
+            ),
+            POSTGRES_DIALECT.quote_identifier(
+                &Identifier::new(name.clone())
+                    .unwrap_or_else(|_| Identifier::new("sequence").expect("static identifier"))
+            ),
+            data_type
+                .as_deref()
+                .map(|value| format!(" AS {value}"))
+                .unwrap_or_default(),
+            increment
+                .as_deref()
+                .map(|value| format!(" INCREMENT BY {value}"))
+                .unwrap_or_default(),
+            minimum
+                .as_deref()
+                .map(|value| format!(" MINVALUE {value}"))
+                .unwrap_or_default(),
+            maximum
+                .as_deref()
+                .map(|value| format!(" MAXVALUE {value}"))
+                .unwrap_or_default(),
+        );
+
+        Ok(ObjectDefinition {
+            kind: DatabaseObjectKind::Sequence,
+            database: Some(database),
+            schema: Some(schema_name),
+            name,
+            owner: decode::<Option<String>>(&row, "owner")?.into(),
+            language: MetadataValue::Unavailable,
+            routine_kind: MetadataValue::Unavailable,
+            arguments: MetadataValue::Unavailable,
+            return_type: MetadataValue::Unavailable,
+            view_query: MetadataValue::Unavailable,
+            routine_body: MetadataValue::Unavailable,
+            definition: MetadataValue::available(definition),
+            trigger: None,
+            sequence: Some(SequenceDetails {
+                data_type: data_type.into(),
+                start_value: start_value.into(),
+                increment: increment.into(),
+                minimum: minimum.into(),
+                maximum: maximum.into(),
+                current_value: current_value.into(),
+                cache: MetadataValue::Unavailable,
+                cycle: cycle
+                    .as_deref()
+                    .map_or(MetadataValue::Unavailable, |value| {
+                        MetadataValue::available(value.eq_ignore_ascii_case("YES"))
+                    }),
+            }),
+            truncated: false,
+        })
+    }
+
+    async fn sequence_current_value(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        schema: &str,
+        name: &str,
+    ) -> Option<String> {
+        let schema = Identifier::new(schema).ok()?;
+        let name = Identifier::new(name).ok()?;
+        let statement = format!(
+            "SELECT last_value::text AS current_value FROM {}.{}",
+            POSTGRES_DIALECT.quote_identifier(&schema),
+            POSTGRES_DIALECT.quote_identifier(&name)
+        );
+        let result = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sqlx::AssertSqlSafe(statement)).fetch_optional(&mut *connection),
+        )
+        .await;
+        let Ok(Ok(row)) = result else {
+            return None;
+        };
+        row.and_then(|row| {
+            row.try_get::<Option<String>, _>("current_value")
+                .ok()
+                .flatten()
+        })
     }
 }
 
@@ -759,6 +1065,138 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
         Ok(Page::from_items(sequences, page, None))
     }
 
+    async fn list_routines(
+        &self,
+        scope: &MetadataScope,
+        page: PageRequest,
+    ) -> Result<Page<RoutineSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseRoutines)?;
+        let schema = self.schema_filter(scope)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::LIST_ROUTINES)
+                .bind(schema.as_deref())
+                .bind(i64::from(page.limit) + 1)
+                .bind(i64::try_from(page.offset).unwrap_or(i64::MAX))
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+
+        let routines = rows
+            .iter()
+            .map(|row| {
+                let routine_type: String = decode(row, "routine_type")?;
+                Ok(RoutineSummary {
+                    database: Some(decode(row, "database_name")?),
+                    schema: Some(decode(row, "schema_name")?),
+                    name: decode(row, "name")?,
+                    kind: routine_kind(&routine_type)?,
+                    language: decode::<Option<String>>(row, "language")?.into(),
+                    return_type: decode::<Option<String>>(row, "return_type")?.into(),
+                    arguments: decode::<Option<String>>(row, "arguments")?.into(),
+                    owner: decode::<Option<String>>(row, "owner")?.into(),
+                })
+            })
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+
+        Ok(Page::from_items(routines, page, None))
+    }
+
+    async fn list_triggers(
+        &self,
+        scope: &MetadataScope,
+        page: PageRequest,
+    ) -> Result<Page<TriggerSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseTriggers)?;
+        let schema = self.schema_filter(scope)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::LIST_TRIGGERS)
+                .bind(schema.as_deref())
+                .bind(i64::from(page.limit) + 1)
+                .bind(i64::try_from(page.offset).unwrap_or(i64::MAX))
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+
+        let triggers = rows
+            .iter()
+            .map(|row| {
+                let trigger_type: i32 = decode(row, "trigger_type")?;
+                Ok(TriggerSummary {
+                    database: Some(decode(row, "database_name")?),
+                    schema: Some(decode(row, "schema_name")?),
+                    name: decode(row, "name")?,
+                    table: decode(row, "table_name")?,
+                    timing: TriggerTiming::from_postgres(trigger_type),
+                    events: TriggerEvent::from_postgres(trigger_type),
+                    owner: decode::<Option<String>>(row, "owner")?.into(),
+                })
+            })
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+
+        Ok(Page::from_items(triggers, page, None))
+    }
+
+    async fn object_definition(
+        &self,
+        object: &ObjectRef,
+    ) -> Result<ObjectDefinition, DatabaseError> {
+        self.require_connection()?;
+        self.ensure_database_matches(object.database.as_ref().map(Identifier::as_str))?;
+        match object.kind {
+            DatabaseObjectKind::View | DatabaseObjectKind::MaterializedView => {
+                self.require_capability(DatabaseAction::BrowseViews)?;
+                if object.kind == DatabaseObjectKind::MaterializedView {
+                    self.require_capability(DatabaseAction::BrowseMaterializedViews)?;
+                }
+                self.view_definition(object).await
+            }
+            DatabaseObjectKind::Routine => {
+                self.require_capability(DatabaseAction::BrowseRoutines)?;
+                self.routine_definition(object).await
+            }
+            DatabaseObjectKind::Trigger => {
+                self.require_capability(DatabaseAction::BrowseTriggers)?;
+                self.trigger_definition(object).await
+            }
+            DatabaseObjectKind::Sequence => {
+                self.require_capability(DatabaseAction::BrowseSequences)?;
+                self.sequence_definition(object).await
+            }
+        }
+    }
+
+    async fn preview_object_action(
+        &self,
+        action: &ValidatedObjectAction,
+    ) -> Result<ObjectDdlPreview, DatabaseError> {
+        self.require_connection()?;
+        self.ensure_database_matches(action.object().database.as_ref().map(Identifier::as_str))?;
+        action.ensure_supported(&self.capabilities)?;
+        engine_objects::preview(action)
+    }
+
+    async fn execute_object_action(
+        &mut self,
+        action: &ValidatedObjectAction,
+    ) -> Result<(), DatabaseError> {
+        self.require_connection()?;
+        let preview = self.preview_object_action(action).await?;
+        for statement in &preview.statements {
+            self.execute_statement(statement).await?;
+        }
+        Ok(())
+    }
+
     async fn object_counts(&self, scope: &MetadataScope) -> Result<ObjectCounts, DatabaseError> {
         self.require_capability(DatabaseAction::BrowseTables)?;
         let schema = self.schema_filter(scope)?;
@@ -797,6 +1235,8 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
             views: count("view_count")?,
             materialized_views,
             sequences,
+            routines: count("routine_count")?,
+            triggers: count("trigger_count")?,
         })
     }
 
@@ -1569,6 +2009,16 @@ where
     })
 }
 
+fn routine_kind(value: &str) -> Result<RoutineKind, DatabaseError> {
+    match value.to_ascii_uppercase().as_str() {
+        "FUNCTION" => Ok(RoutineKind::Function),
+        "PROCEDURE" => Ok(RoutineKind::Procedure),
+        _ => Err(DatabaseError::query(
+            "PostgreSQL returned an unknown routine type.",
+        )),
+    }
+}
+
 /// Maps SQLx errors into the shared taxonomy without exposing the raw driver
 /// display text. Authentication failures intentionally omit the server
 /// message, which can echo the account, host, or connection string.
@@ -2329,10 +2779,87 @@ mod tests {
         );
         assert!(sequence.metadata.owner.is_available());
 
+        let routines = adapter
+            .list_routines(&scope, PageRequest::new(500, 0))
+            .await
+            .expect("list routines");
+        assert!(
+            routines
+                .items
+                .iter()
+                .any(|routine| routine.name == "serverdesk_probe_trigger_fn")
+        );
+        let triggers = adapter
+            .list_triggers(&scope, PageRequest::new(500, 0))
+            .await
+            .expect("list triggers");
+        assert!(
+            triggers
+                .items
+                .iter()
+                .any(|trigger| trigger.name == "serverdesk_probe_trigger"
+                    && trigger.table == "serverdesk_writable_probe")
+        );
+
+        let view_ref = ObjectRef {
+            kind: DatabaseObjectKind::View,
+            database: Some(Identifier::new(&fixture.database).expect("database")),
+            schema: Some(Identifier::new("public").expect("schema")),
+            name: Identifier::new("serverdesk_probe_view").expect("view"),
+            routine_kind: None,
+            arguments: None,
+            table: None,
+        };
+        let definition = adapter
+            .object_definition(&view_ref)
+            .await
+            .expect("view definition");
+        assert!(
+            definition
+                .view_query
+                .value()
+                .is_some_and(|query| query.contains("serverdesk_writable_probe"))
+        );
+
+        let trigger_ref = ObjectRef {
+            kind: DatabaseObjectKind::Trigger,
+            database: Some(Identifier::new(&fixture.database).expect("database")),
+            schema: Some(Identifier::new("public").expect("schema")),
+            name: Identifier::new("serverdesk_probe_trigger").expect("trigger"),
+            routine_kind: None,
+            arguments: None,
+            table: Some(Identifier::new("serverdesk_writable_probe").expect("table")),
+        };
+        let definition = adapter
+            .object_definition(&trigger_ref)
+            .await
+            .expect("trigger definition");
+        let details = definition.trigger.expect("trigger details");
+        assert_eq!(details.table, "serverdesk_writable_probe");
+        assert!(details.events.contains(&TriggerEvent::Insert));
+
+        let sequence_ref = ObjectRef {
+            kind: DatabaseObjectKind::Sequence,
+            database: Some(Identifier::new(&fixture.database).expect("database")),
+            schema: Some(Identifier::new("public").expect("schema")),
+            name: Identifier::new("serverdesk_probe_seq").expect("sequence"),
+            routine_kind: None,
+            arguments: None,
+            table: None,
+        };
+        let definition = adapter
+            .object_definition(&sequence_ref)
+            .await
+            .expect("sequence definition");
+        let details = definition.sequence.expect("sequence details");
+        assert_eq!(details.increment.value().map(String::as_str), Some("2"));
+
         let counts = adapter.object_counts(&scope).await.expect("object counts");
         assert!(counts.tables.value().is_some_and(|value| *value >= 1));
         assert!(counts.views.value().is_some_and(|value| *value >= 1));
         assert!(counts.sequences.value().is_some_and(|value| *value >= 1));
+        assert!(counts.routines.value().is_some_and(|value| *value >= 1));
+        assert!(counts.triggers.value().is_some_and(|value| *value >= 1));
         assert!(counts.materialized_views.is_available());
 
         let table = TableRef::new(

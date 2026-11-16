@@ -18,7 +18,13 @@ pub fn flags_for(version: Option<DatabaseVersion>) -> CapabilityFlags {
         sequences: false,
         materialized_views: false,
         routines: true,
+        // MySQL has no CREATE OR REPLACE for routines. Editing is available
+        // through a drop-and-create preview that always requires confirmation.
+        routine_edit: true,
         triggers: true,
+        // MySQL has no CREATE OR REPLACE TRIGGER; editing uses drop-and-create.
+        trigger_edit: true,
+        view_management: true,
         // Server roles were added in MySQL 8.0.
         roles: at_least(version, 8, 0, 0),
         sessions: true,

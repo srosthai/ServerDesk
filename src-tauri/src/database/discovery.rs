@@ -11,6 +11,7 @@ use crate::core::AppError;
 
 use super::{
     errors::DatabaseError,
+    objects::{RoutineSummary, TriggerSummary},
     pagination::{Page, PageRequest},
     service::DatabaseConnectionRegistry,
     traits::{
@@ -44,6 +45,18 @@ pub enum ExplorerNode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         schema: Option<String>,
     },
+    Routines {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        database: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schema: Option<String>,
+    },
+    Triggers {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        database: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schema: Option<String>,
+    },
     ObjectCounts {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         database: Option<String>,
@@ -67,6 +80,12 @@ impl ExplorerNode {
             | Self::Sequences {
                 database, schema, ..
             }
+            | Self::Routines {
+                database, schema, ..
+            }
+            | Self::Triggers {
+                database, schema, ..
+            }
             | Self::ObjectCounts {
                 database, schema, ..
             } => MetadataScope::new(database.as_deref(), schema.as_deref()).map(Some),
@@ -80,6 +99,8 @@ impl ExplorerNode {
             Self::Tables { .. } => ExplorerNodeKind::Tables,
             Self::Views { .. } => ExplorerNodeKind::Views,
             Self::Sequences { .. } => ExplorerNodeKind::Sequences,
+            Self::Routines { .. } => ExplorerNodeKind::Routines,
+            Self::Triggers { .. } => ExplorerNodeKind::Triggers,
             Self::ObjectCounts { .. } => ExplorerNodeKind::ObjectCounts,
         }
     }
@@ -93,6 +114,8 @@ pub enum ExplorerNodeKind {
     Tables,
     Views,
     Sequences,
+    Routines,
+    Triggers,
     ObjectCounts,
 }
 
@@ -106,6 +129,8 @@ pub enum ExplorerNodePayload {
     Tables(Page<TableSummary>),
     Views(Page<ViewSummary>),
     Sequences(Page<SequenceSummary>),
+    Routines(Page<RoutineSummary>),
+    Triggers(Page<TriggerSummary>),
     ObjectCounts(ObjectCounts),
 }
 
@@ -117,6 +142,8 @@ impl ExplorerNodePayload {
             Self::Tables(_) => ExplorerNodeKind::Tables,
             Self::Views(_) => ExplorerNodeKind::Views,
             Self::Sequences(_) => ExplorerNodeKind::Sequences,
+            Self::Routines(_) => ExplorerNodeKind::Routines,
+            Self::Triggers(_) => ExplorerNodeKind::Triggers,
             Self::ObjectCounts(_) => ExplorerNodeKind::ObjectCounts,
         }
     }
@@ -190,6 +217,34 @@ impl<'a> DatabaseDiscoveryService<'a> {
         let adapter = adapter.lock().await;
         adapter
             .list_sequences(scope, page)
+            .await
+            .map_err(AppError::from)
+    }
+
+    pub async fn routines(
+        &self,
+        profile_id: &str,
+        scope: &MetadataScope,
+        page: PageRequest,
+    ) -> Result<Page<RoutineSummary>, AppError> {
+        let adapter = self.connections.adapter(profile_id).await?;
+        let adapter = adapter.lock().await;
+        adapter
+            .list_routines(scope, page)
+            .await
+            .map_err(AppError::from)
+    }
+
+    pub async fn triggers(
+        &self,
+        profile_id: &str,
+        scope: &MetadataScope,
+        page: PageRequest,
+    ) -> Result<Page<TriggerSummary>, AppError> {
+        let adapter = self.connections.adapter(profile_id).await?;
+        let adapter = adapter.lock().await;
+        adapter
+            .list_triggers(scope, page)
             .await
             .map_err(AppError::from)
     }
@@ -292,6 +347,18 @@ impl<'a> DatabaseDiscoveryService<'a> {
                 let scope = scope.expect("sequences always have a validated scope");
                 Ok(ExplorerNodePayload::Sequences(
                     self.sequences(profile_id, &scope, page).await?,
+                ))
+            }
+            ExplorerNode::Routines { .. } => {
+                let scope = scope.expect("routines always have a validated scope");
+                Ok(ExplorerNodePayload::Routines(
+                    self.routines(profile_id, &scope, page).await?,
+                ))
+            }
+            ExplorerNode::Triggers { .. } => {
+                let scope = scope.expect("triggers always have a validated scope");
+                Ok(ExplorerNodePayload::Triggers(
+                    self.triggers(profile_id, &scope, page).await?,
                 ))
             }
             ExplorerNode::ObjectCounts { .. } => {
@@ -406,6 +473,8 @@ mod tests {
                 views: MetadataValue::Unavailable,
                 materialized_views: MetadataValue::Unavailable,
                 sequences: MetadataValue::Unavailable,
+                routines: MetadataValue::Unavailable,
+                triggers: MetadataValue::Unavailable,
             })
             .kind(),
             ExplorerNodeKind::ObjectCounts

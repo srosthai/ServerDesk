@@ -40,6 +40,11 @@ import {
   DatabaseTableStructurePanel,
 } from "@/features/databases/DatabaseStructurePanels";
 import { DatabaseStructureActionHost } from "@/features/databases/DatabaseStructureDialogs";
+import { DatabaseObjectPanel } from "@/features/databases/DatabaseObjectPanel";
+import {
+  DatabaseObjectActionHost,
+  type DatabaseObjectIntent,
+} from "@/features/databases/DatabaseObjectDialogs";
 import {
   findTableSummary,
   structureCapabilitiesFor,
@@ -48,9 +53,14 @@ import {
   type DatabaseTableScope,
 } from "@/features/databases/databaseStructureModel";
 import {
+  objectCapabilitiesFor,
+  objectRefForSelection,
+} from "@/features/databases/databaseObjectModel";
+import {
   databaseRowId,
   objectRowId,
   type DatabaseExplorerSelection,
+  type DatabaseObjectGroupKind,
 } from "@/features/databases/databaseExplorerTreeModel";
 import { DatabaseProfileDialog } from "@/features/databases/DatabaseProfileDialog";
 import {
@@ -84,6 +94,7 @@ import type {
   DatabaseConnectionSnapshot,
   DatabaseConnectionState,
   DatabaseDdlPreview,
+  DatabaseObjectActionResult,
   DatabaseProfile,
   DatabaseStructureActionResult,
   DatabaseTableSummary,
@@ -481,6 +492,7 @@ function DatabaseExplorerRail({
   onAddConnection,
   onRetry,
   onCreateDatabase,
+  onCreateObject,
   onSetActiveDatabase,
   onRenameDatabase,
   onDropDatabase,
@@ -498,6 +510,12 @@ function DatabaseExplorerRail({
   onAddConnection: () => void;
   onRetry: () => void;
   onCreateDatabase: (profile: DatabaseProfile) => void;
+  onCreateObject: (
+    profile: DatabaseProfile,
+    group: DatabaseObjectGroupKind,
+    database: string,
+    schema: string | null,
+  ) => void;
   onSetActiveDatabase: (profile: DatabaseProfile, database: string) => void;
   onRenameDatabase: (profile: DatabaseProfile, database: string) => void;
   onDropDatabase: (profile: DatabaseProfile, database: string) => void;
@@ -561,6 +579,7 @@ function DatabaseExplorerRail({
         onAddConnection={onAddConnection}
         onRetryProfiles={onRetry}
         onCreateDatabase={onCreateDatabase}
+        onCreateObject={onCreateObject}
         onSetActiveDatabase={onSetActiveDatabase}
         onRenameDatabase={onRenameDatabase}
         onDropDatabase={onDropDatabase}
@@ -841,6 +860,8 @@ function DatabaseManagerPage() {
   const [dropPending, setDropPending] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [structureIntent, setStructureIntent] = useState<DatabaseStructureIntent | null>(null);
+  const [objectIntent, setObjectIntent] = useState<DatabaseObjectIntent | null>(null);
+  const [objectRefreshToken, setObjectRefreshToken] = useState(0);
   const [tableSummaryOverrides, setTableSummaryOverrides] = useState<
     Record<string, DatabaseTableSummary>
   >({});
@@ -948,6 +969,30 @@ function DatabaseManagerPage() {
 
   const selectedEngineForStructure = selectedEngine ?? activeTab?.engine ?? "postgresql";
   const structureConnected = selectedSnapshot?.state === "connected";
+  const selectedObjectRef = useMemo(
+    () => objectRefForSelection(activeExplorerSelection),
+    [activeExplorerSelection],
+  );
+  const objectCapabilities = useMemo(
+    () =>
+      objectCapabilitiesFor({
+        engine: selectedEngineForStructure,
+        version: selectedSnapshot?.version?.version,
+        connected: structureConnected,
+        readOnly: selectedSnapshot?.readOnly ?? selectedProfile?.readOnly ?? false,
+        actions: selectedSnapshot?.capabilities?.actions,
+        flags: selectedSnapshot?.capabilities?.flags,
+      }),
+    [
+      selectedEngineForStructure,
+      selectedProfile?.readOnly,
+      selectedSnapshot?.capabilities?.actions,
+      selectedSnapshot?.capabilities?.flags,
+      selectedSnapshot?.readOnly,
+      selectedSnapshot?.version?.version,
+      structureConnected,
+    ],
+  );
   const structureCapabilities = useMemo(
     () =>
       structureCapabilitiesFor({
@@ -1030,6 +1075,57 @@ function DatabaseManagerPage() {
       schema: profile.engine === "mysql" ? null : scope.schema,
     });
     return payload !== null;
+  }
+
+  function handleCreateObject(
+    _profile: DatabaseProfile,
+    group: DatabaseObjectGroupKind,
+    database: string,
+    schema: string | null,
+  ): void {
+    if (group === "tables") {
+      return;
+    }
+    const kind: "view" | "routine" | "trigger" | "sequence" =
+      group === "views"
+        ? "view"
+        : group === "routines"
+          ? "routine"
+          : group === "triggers"
+            ? "trigger"
+            : "sequence";
+    setObjectIntent({ type: "create", kind, database, schema });
+  }
+
+  async function refreshObjectExplorer(
+    object: NonNullable<typeof selectedObjectRef>,
+  ): Promise<void> {
+    const profile = structureProfile;
+    if (!profile) {
+      return;
+    }
+    const nodeKind =
+      object.kind === "routine"
+        ? "routines"
+        : object.kind === "trigger"
+          ? "triggers"
+          : object.kind === "sequence"
+            ? "sequences"
+            : "views";
+    try {
+      await useDatabaseExplorerStore.getState().refreshNode(profile.id, {
+        kind: nodeKind,
+        database: object.database,
+        schema: object.schema,
+      });
+    } catch {
+      // The action already succeeded; a stale explorer node is recoverable.
+    }
+    setObjectRefreshToken((current) => current + 1);
+  }
+
+  async function handleObjectActionCompleted(result: DatabaseObjectActionResult): Promise<void> {
+    await refreshObjectExplorer(result.object);
   }
 
   async function handleStructureActionCompleted(
@@ -1550,6 +1646,7 @@ function DatabaseManagerPage() {
               }
             }}
             onCreateDatabase={(profile) => setDatabaseAction({ mode: "create", profile })}
+            onCreateObject={handleCreateObject}
             onSetActiveDatabase={(profile, database) =>
               void handleSetActiveDatabase(profile, database)
             }
@@ -1606,7 +1703,20 @@ function DatabaseManagerPage() {
                             onRetry={() => void fetchServers()}
                           />
                         ) : tab.value === "overview" ? (
-                          selectedTableScope && structureProfile ? (
+                          selectedObjectRef && structureProfile ? (
+                            <DatabaseObjectPanel
+                              key={`${structureProfile.id}:${selectedObjectRef.kind}:${selectedObjectRef.name}:${objectRefreshToken}`}
+                              profile={structureProfile}
+                              profileName={structureProfile.name}
+                              connected={structureConnected}
+                              object={selectedObjectRef}
+                              capabilities={objectCapabilities}
+                              onIntent={setObjectIntent}
+                              onRefreshExplorer={() =>
+                                void refreshObjectExplorer(selectedObjectRef)
+                              }
+                            />
+                          ) : selectedTableScope && structureProfile ? (
                             <DatabaseTableOverviewPanel
                               scope={selectedTableScope}
                               profileName={structureProfile.name}
@@ -1639,7 +1749,20 @@ function DatabaseManagerPage() {
                             />
                           )
                         ) : tab.value === "structure" ? (
-                          selectedTableScope && structureProfile ? (
+                          selectedObjectRef && structureProfile ? (
+                            <DatabaseObjectPanel
+                              key={`${structureProfile.id}:${selectedObjectRef.kind}:${selectedObjectRef.name}:${objectRefreshToken}`}
+                              profile={structureProfile}
+                              profileName={structureProfile.name}
+                              connected={structureConnected}
+                              object={selectedObjectRef}
+                              capabilities={objectCapabilities}
+                              onIntent={setObjectIntent}
+                              onRefreshExplorer={() =>
+                                void refreshObjectExplorer(selectedObjectRef)
+                              }
+                            />
+                          ) : selectedTableScope && structureProfile ? (
                             <DatabaseTableStructurePanel
                               scope={selectedTableScope}
                               profileName={structureProfile.name}
@@ -2014,6 +2137,20 @@ function DatabaseManagerPage() {
           }
         />
       ) : null}
+
+      <DatabaseObjectActionHost
+        key={`${objectIntent?.type ?? "none"}-${
+          objectIntent?.type === "create" ? objectIntent.kind : (selectedObjectRef?.kind ?? "")
+        }-${selectedObjectRef?.name ?? ""}`}
+        profileId={structureProfile?.id ?? null}
+        profileName={structureProfile?.name ?? "this connection"}
+        engine={selectedEngineForStructure}
+        connected={structureConnected}
+        readOnly={selectedSnapshot?.readOnly ?? structureProfile?.readOnly ?? false}
+        intent={objectIntent}
+        onClose={() => setObjectIntent(null)}
+        onCompleted={(result) => void handleObjectActionCompleted(result)}
+      />
     </div>
   );
 }

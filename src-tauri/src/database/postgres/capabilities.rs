@@ -18,7 +18,10 @@ pub fn flags_for(version: Option<DatabaseVersion>) -> CapabilityFlags {
         // Materialized views were added in PostgreSQL 9.3.
         materialized_views: at_least(version, 9, 3, 0),
         routines: true,
+        routine_edit: true,
         triggers: true,
+        trigger_edit: true,
+        view_management: true,
         roles: true,
         // pg_stat_activity has been available since PostgreSQL 8.1, but keep
         // unknown-version detection conservative for the session tools.
