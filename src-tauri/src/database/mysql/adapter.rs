@@ -27,7 +27,8 @@ use crate::storage::DatabaseEngine;
 
 use super::{
     MYSQL_DIALECT, actions as engine_actions, csv as engine_csv, ddl as engine_ddl,
-    objects as engine_objects, queries as engine_queries, rows as engine_rows, sql,
+    objects as engine_objects, queries as engine_queries, roles as engine_roles,
+    rows as engine_rows, sql,
 };
 use crate::database::{
     actions::{DatabaseDdlPreview, ValidatedDatabaseAction},
@@ -45,6 +46,10 @@ use crate::database::{
     },
     pagination::{Bounded, Page, PageRequest},
     queries::{QueryControl, QueryExecutionResult, QueryRequest},
+    roles::{
+        PrivilegeGrant, PrivilegeTarget, PrivilegeTargetKind, RoleDdlPlan, RoleGrantData, RoleKind,
+        RoleRef, RoleSummary, ValidatedRoleAction,
+    },
     row_writes::{RowDeleteRequest, RowInsertRequest, RowUpdateRequest, RowWriteResult},
     rows::{RowQueryControl, RowReadRequest, RowReadResult},
     structure::{StructureDdlPreview, ValidatedStructureAction},
@@ -1103,6 +1108,142 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
         Ok(())
     }
 
+    async fn list_roles(&self, page: PageRequest) -> Result<Page<RoleSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseRoles)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::LIST_ROLES)
+                .bind(i64::from(page.limit) + 1)
+                .bind(i64::try_from(page.offset).unwrap_or(i64::MAX))
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+
+        let roles = rows
+            .iter()
+            .map(mysql_role_summary)
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+        Ok(Page::from_items(roles, page, None))
+    }
+
+    async fn role_summary(&self, role: &RoleRef) -> Result<Option<RoleSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseRoles)?;
+        let host = role.host.as_deref().unwrap_or("%");
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let row = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::ROLE_SUMMARY)
+                .bind(&role.name)
+                .bind(host)
+                .fetch_optional(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+        row.as_ref().map(mysql_role_summary).transpose()
+    }
+
+    async fn role_grants(&self, role: &RoleRef) -> Result<RoleGrantData, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseRoles)?;
+        let host = role.host.as_deref().unwrap_or("%");
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::ROLE_DIRECT_GRANTS)
+                .bind(&role.name)
+                .bind(host)
+                .bind(&role.name)
+                .bind(host)
+                .bind(&role.name)
+                .bind(host)
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+
+        let direct = rows
+            .iter()
+            .map(|row| {
+                let kind: String = decode(row, "target_kind")?;
+                let database = decode::<Option<String>>(row, "database_name")?;
+                let schema = decode::<Option<String>>(row, "schema_name")?;
+                let object = decode::<Option<String>>(row, "object_name")?;
+                let target = PrivilegeTarget {
+                    kind: match kind.as_str() {
+                        "global" => PrivilegeTargetKind::Global,
+                        "database" => PrivilegeTargetKind::Database,
+                        "table" => PrivilegeTargetKind::Table,
+                        _ => {
+                            return Err(DatabaseError::query(
+                                "MySQL returned an unknown privilege target.",
+                            ));
+                        }
+                    },
+                    database: database.as_deref().map(Identifier::new).transpose()?,
+                    schema: schema.as_deref().map(Identifier::new).transpose()?,
+                    object: object.as_deref().map(Identifier::new).transpose()?,
+                };
+                let grantable: i64 = decode(row, "grantable")?;
+                Ok(PrivilegeGrant {
+                    privilege: decode(row, "privilege")?,
+                    target,
+                    grantable: grantable != 0,
+                })
+            })
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+
+        let member_rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::ROLE_MEMBERSHIPS)
+                .bind(&role.name)
+                .bind(host)
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+
+        let member_of = member_rows
+            .iter()
+            .map(|row| {
+                Ok(RoleRef {
+                    name: decode(row, "role_name")?,
+                    host: Some(decode(row, "role_host")?),
+                })
+            })
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+
+        Ok(RoleGrantData { direct, member_of })
+    }
+
+    async fn preview_role_action(
+        &self,
+        action: &ValidatedRoleAction,
+    ) -> Result<RoleDdlPlan, DatabaseError> {
+        self.require_connection()?;
+        action.ensure_supported(&self.capabilities)?;
+        engine_roles::preview(action)
+    }
+
+    async fn execute_role_action(
+        &mut self,
+        action: &ValidatedRoleAction,
+    ) -> Result<(), DatabaseError> {
+        self.require_connection()?;
+        let preview = self.preview_role_action(action).await?;
+        for statement in &preview.statements {
+            self.execute_statement(statement).await?;
+        }
+        Ok(())
+    }
+
     async fn object_counts(&self, scope: &MetadataScope) -> Result<ObjectCounts, DatabaseError> {
         self.require_capability(DatabaseAction::BrowseTables)?;
         let database = Self::scope_name(scope)?;
@@ -1976,6 +2117,27 @@ fn routine_kind(value: &str) -> Result<RoutineKind, DatabaseError> {
 
 fn decode_flag(row: &MySqlRow, column: &str) -> Result<bool, DatabaseError> {
     Ok(decode::<i64>(row, column)? != 0)
+}
+
+fn mysql_role_summary(row: &MySqlRow) -> Result<RoleSummary, DatabaseError> {
+    let is_role: i64 = decode(row, "is_role")?;
+    let can_login: i64 = decode(row, "can_login")?;
+    let superuser: i64 = decode(row, "superuser")?;
+    let create_database: i64 = decode(row, "create_database")?;
+    Ok(RoleSummary {
+        name: decode(row, "name")?,
+        host: Some(decode(row, "host")?),
+        kind: if is_role != 0 {
+            RoleKind::Role
+        } else {
+            RoleKind::User
+        },
+        can_login: MetadataValue::available(can_login != 0),
+        superuser: MetadataValue::available(superuser != 0),
+        create_database: MetadataValue::available(create_database != 0),
+        create_role: MetadataValue::Unavailable,
+        inherit: MetadataValue::Unavailable,
+    })
 }
 
 fn decode_count(row: &MySqlRow, column: &str) -> Result<u64, DatabaseError> {
