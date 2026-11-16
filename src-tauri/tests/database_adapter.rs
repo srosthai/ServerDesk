@@ -299,6 +299,18 @@ async fn explorer_payload(
                 .await
                 .expect("sequences"),
         ),
+        ExplorerNode::Routines { .. } => serverdesk_lib::database::ExplorerNodePayload::Routines(
+            adapter
+                .list_routines(&scope, PageRequest::default())
+                .await
+                .expect("routines"),
+        ),
+        ExplorerNode::Triggers { .. } => serverdesk_lib::database::ExplorerNodePayload::Triggers(
+            adapter
+                .list_triggers(&scope, PageRequest::default())
+                .await
+                .expect("triggers"),
+        ),
         ExplorerNode::ObjectCounts { .. } => {
             serverdesk_lib::database::ExplorerNodePayload::ObjectCounts(
                 adapter.object_counts(&scope).await.expect("counts"),

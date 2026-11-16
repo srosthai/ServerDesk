@@ -144,6 +144,8 @@ const counts: DatabaseObjectCounts = {
   views: { status: "available", value: 1 },
   materializedViews: unavailable,
   sequences: unavailable,
+  routines: unavailable,
+  triggers: unavailable,
 };
 
 function page<T>(items: T[]): DatabasePage<T> {

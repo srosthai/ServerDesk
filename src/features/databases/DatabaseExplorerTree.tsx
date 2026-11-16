@@ -14,7 +14,9 @@ import {
   CircleNotchIcon,
   DatabaseIcon,
   EyeIcon,
+  FunctionIcon,
   KeyIcon,
+  LightningIcon,
   ListNumbersIcon,
   LockKeyIcon,
   MagnifyingGlassIcon,
@@ -40,6 +42,7 @@ import {
   type BuildDatabaseExplorerRowsInput,
   type DatabaseExplorerRow,
   type DatabaseExplorerSelection,
+  type DatabaseObjectGroupKind,
 } from "@/features/databases/databaseExplorerTreeModel";
 import { cn } from "@/lib/utils";
 import { databaseExplorerNodeKey, useDatabaseExplorerStore } from "@/stores/databaseExplorerStore";
@@ -57,6 +60,12 @@ type DatabaseExplorerTreeProps = {
   onAddConnection: () => void;
   onRetryProfiles: () => void;
   onCreateDatabase?: (profile: DatabaseProfile) => void;
+  onCreateObject?: (
+    profile: DatabaseProfile,
+    group: DatabaseObjectGroupKind,
+    database: string,
+    schema: string | null,
+  ) => void;
   onSetActiveDatabase?: (profile: DatabaseProfile, database: string) => void;
   onRenameDatabase?: (profile: DatabaseProfile, database: string) => void;
   onDropDatabase?: (profile: DatabaseProfile, database: string) => void;
@@ -84,16 +93,34 @@ function RowIcon({ row }: { row: DatabaseExplorerRow }) {
         <ListNumbersIcon className={className} aria-hidden={ariaHidden} />
       ) : row.label === "Views" ? (
         <EyeIcon className={className} aria-hidden={ariaHidden} />
+      ) : row.label === "Routines" ? (
+        <FunctionIcon className={className} aria-hidden={ariaHidden} />
+      ) : row.label === "Triggers" ? (
+        <LightningIcon className={className} aria-hidden={ariaHidden} />
       ) : (
         <TableIcon className={className} aria-hidden={ariaHidden} />
       );
     case "view":
       return <EyeIcon className={className} aria-hidden={ariaHidden} />;
+    case "routine":
+      return <FunctionIcon className={className} aria-hidden={ariaHidden} />;
+    case "trigger":
+      return <LightningIcon className={className} aria-hidden={ariaHidden} />;
     case "sequence":
       return <KeyIcon className={className} aria-hidden={ariaHidden} />;
     default:
       return <TableIcon className={className} aria-hidden={ariaHidden} />;
   }
+}
+
+function creatableObjectGroup(row: DatabaseExplorerRow): DatabaseObjectGroupKind | null {
+  if (row.kind !== "object-group" || !row.discoveryNode) {
+    return null;
+  }
+  const kind = row.discoveryNode.kind;
+  return kind === "views" || kind === "routines" || kind === "triggers" || kind === "sequences"
+    ? kind
+    : null;
 }
 
 function StatusRow({
@@ -224,6 +251,7 @@ function DatabaseExplorerTree({
   onAddConnection,
   onRetryProfiles,
   onCreateDatabase,
+  onCreateObject,
   onSetActiveDatabase,
   onRenameDatabase,
   onDropDatabase,
@@ -897,6 +925,32 @@ function DatabaseExplorerTree({
                         </button>
                       ) : null}
                     </>
+                  ) : null}
+                  {creatableObjectGroup(row) && onCreateObject && rowProfile && row.database ? (
+                    <button
+                      type="button"
+                      aria-label={`Create ${creatableObjectGroup(row)} in ${row.database}`}
+                      title={
+                        !rowConnected
+                          ? "Connect the profile before creating an object."
+                          : rowReadOnly
+                            ? "This connection profile is read-only. Create requires a writable profile."
+                            : `Create ${creatableObjectGroup(row)?.replace(/s$/, "")} in ${row.database}`
+                      }
+                      disabled={!rowConnected || rowReadOnly}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onCreateObject(
+                          rowProfile,
+                          creatableObjectGroup(row) as DatabaseObjectGroupKind,
+                          row.database as string,
+                          row.schema,
+                        );
+                      }}
+                      className="grid size-6 shrink-0 place-items-center rounded-sm text-muted-foreground opacity-0 outline-none transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:opacity-100 disabled:opacity-40"
+                    >
+                      <PlusIcon className="size-3" aria-hidden="true" />
+                    </button>
                   ) : null}
                   {row.discoveryNode ? (
                     <button

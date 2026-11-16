@@ -107,6 +107,14 @@ function appendPage(
       return next.nodeKind === "sequences"
         ? { nodeKind: "sequences", payload: mergePage(current.payload, next.payload) }
         : null;
+    case "routines":
+      return next.nodeKind === "routines"
+        ? { nodeKind: "routines", payload: mergePage(current.payload, next.payload) }
+        : null;
+    case "triggers":
+      return next.nodeKind === "triggers"
+        ? { nodeKind: "triggers", payload: mergePage(current.payload, next.payload) }
+        : null;
     default:
       return null;
   }

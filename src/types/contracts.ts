@@ -314,8 +314,18 @@ export type DatabaseAction =
   | "drop_index"
   | "create_check_constraint"
   | "create_view"
+  | "replace_view"
+  | "drop_view"
   | "create_routine"
+  | "edit_routine"
+  | "drop_routine"
   | "create_trigger"
+  | "edit_trigger"
+  | "drop_trigger"
+  | "create_sequence"
+  | "alter_sequence"
+  | "drop_sequence"
+  | "drop_materialized_view"
   | "manage_roles"
   | "kill_session"
   | "cancel_query"
@@ -335,7 +345,10 @@ export type CapabilityFlags = {
   sequences: boolean;
   materializedViews: boolean;
   routines: boolean;
+  routineEdit: boolean;
   triggers: boolean;
+  triggerEdit: boolean;
+  viewManagement: boolean;
   roles: boolean;
   sessions: boolean;
   transactions: boolean;
@@ -540,11 +553,39 @@ export type DatabaseSequenceSummary = {
   increment: DatabaseMetadataValue<string>;
 } & DatabaseObjectMetadata;
 
+export type DatabaseRoutineKind = "function" | "procedure";
+
+export type DatabaseRoutineSummary = {
+  database: string | null;
+  schema: string | null;
+  name: string;
+  kind: DatabaseRoutineKind;
+  language: DatabaseMetadataValue<string>;
+  returnType: DatabaseMetadataValue<string>;
+  arguments: DatabaseMetadataValue<string>;
+  owner: DatabaseMetadataValue<string>;
+};
+
+export type DatabaseTriggerTiming = "before" | "after" | "instead_of";
+export type DatabaseTriggerEvent = "insert" | "update" | "delete" | "truncate";
+
+export type DatabaseTriggerSummary = {
+  database: string | null;
+  schema: string | null;
+  name: string;
+  table: string;
+  timing: DatabaseTriggerTiming;
+  events: DatabaseTriggerEvent[];
+  owner: DatabaseMetadataValue<string>;
+};
+
 export type DatabaseObjectCounts = {
   tables: DatabaseMetadataValue<number>;
   views: DatabaseMetadataValue<number>;
   materializedViews: DatabaseMetadataValue<number>;
   sequences: DatabaseMetadataValue<number>;
+  routines: DatabaseMetadataValue<number>;
+  triggers: DatabaseMetadataValue<number>;
 };
 
 export type DatabasePage<T> = {
@@ -1198,6 +1239,8 @@ export type DatabaseExplorerNode =
   | ({ kind: "tables" } & DatabaseDiscoveryScope)
   | ({ kind: "views" } & DatabaseDiscoveryScope)
   | ({ kind: "sequences" } & DatabaseDiscoveryScope)
+  | ({ kind: "routines" } & DatabaseDiscoveryScope)
+  | ({ kind: "triggers" } & DatabaseDiscoveryScope)
   | ({ kind: "objectCounts" } & DatabaseDiscoveryScope);
 
 export type DatabaseExplorerNodeKind = DatabaseExplorerNode["kind"];
@@ -1208,6 +1251,8 @@ export type DatabaseExplorerNodePayload =
   | { nodeKind: "tables"; payload: DatabasePage<DatabaseTableSummary> }
   | { nodeKind: "views"; payload: DatabasePage<DatabaseViewSummary> }
   | { nodeKind: "sequences"; payload: DatabasePage<DatabaseSequenceSummary> }
+  | { nodeKind: "routines"; payload: DatabasePage<DatabaseRoutineSummary> }
+  | { nodeKind: "triggers"; payload: DatabasePage<DatabaseTriggerSummary> }
   | { nodeKind: "objectCounts"; payload: DatabaseObjectCounts };
 
 export type DatabaseActionKind = "create" | "rename" | "drop" | "set_active";
@@ -1432,6 +1477,162 @@ export type DatabaseStructureActionResult = {
   verification: string;
   verificationError?: string | null;
   metadata?: DatabaseTableSummary | null;
+  durationMs: number;
+};
+
+export type DatabaseObjectKind = "view" | "materialized_view" | "routine" | "trigger" | "sequence";
+
+export type DatabaseSequenceDataType = "small_int" | "integer" | "big_int";
+
+export type DatabaseObjectRef = {
+  kind: DatabaseObjectKind;
+  database?: string | null;
+  schema?: string | null;
+  name: string;
+  routineKind?: DatabaseRoutineKind | null;
+  arguments?: string | null;
+  table?: string | null;
+};
+
+export type DatabaseTriggerBodyInput =
+  | { kind: "statement"; body: string }
+  | {
+      kind: "function";
+      schema?: string | null;
+      name: string;
+      arguments?: string | null;
+    };
+
+export type DatabaseObjectActionRequest =
+  | ({
+      kind: "create_view";
+      name: string;
+      query: string;
+      orReplace?: boolean;
+    } & DatabaseStructureTableScope)
+  | ({ kind: "drop_view"; name: string; materialized?: boolean } & DatabaseStructureTableScope)
+  | ({
+      kind: "create_routine";
+      name: string;
+      routineKind: DatabaseRoutineKind;
+      arguments?: string | null;
+      returnType?: string | null;
+      language?: string | null;
+      body: string;
+      orReplace?: boolean;
+    } & DatabaseStructureTableScope)
+  | ({
+      kind: "drop_routine";
+      name: string;
+      routineKind: DatabaseRoutineKind;
+      arguments?: string | null;
+    } & DatabaseStructureTableScope)
+  | ({
+      kind: "create_trigger";
+      name: string;
+      table: string;
+      timing: DatabaseTriggerTiming;
+      events: DatabaseTriggerEvent[];
+      body: DatabaseTriggerBodyInput;
+      orReplace?: boolean;
+    } & DatabaseStructureTableScope)
+  | ({ kind: "drop_trigger"; name: string; table: string } & DatabaseStructureTableScope)
+  | ({
+      kind: "create_sequence";
+      name: string;
+      dataType?: DatabaseSequenceDataType | null;
+      start?: number | null;
+      increment?: number | null;
+      minimum?: number | null;
+      maximum?: number | null;
+      cache?: number | null;
+      cycle?: boolean;
+    } & DatabaseStructureTableScope)
+  | ({
+      kind: "alter_sequence";
+      name: string;
+      increment?: number | null;
+      minimum?: number | null;
+      maximum?: number | null;
+      restart?: number | null;
+      cache?: number | null;
+      cycle?: boolean | null;
+    } & DatabaseStructureTableScope)
+  | ({ kind: "drop_sequence"; name: string } & DatabaseStructureTableScope)
+  | ({ kind: "refresh_materialized_view"; name: string } & DatabaseStructureTableScope)
+  | ({ kind: "drop_materialized_view"; name: string } & DatabaseStructureTableScope);
+
+export type DatabaseObjectActionKind =
+  | "create_view"
+  | "replace_view"
+  | "drop_view"
+  | "create_routine"
+  | "replace_routine"
+  | "drop_routine"
+  | "create_trigger"
+  | "replace_trigger"
+  | "drop_trigger"
+  | "create_sequence"
+  | "alter_sequence"
+  | "drop_sequence"
+  | "refresh_materialized_view"
+  | "drop_materialized_view";
+
+export type DatabaseObjectDefinition = {
+  kind: DatabaseObjectKind;
+  database: string | null;
+  schema: string | null;
+  name: string;
+  owner: DatabaseMetadataValue<string>;
+  language: DatabaseMetadataValue<string>;
+  routineKind: DatabaseMetadataValue<DatabaseRoutineKind>;
+  arguments: DatabaseMetadataValue<string>;
+  returnType: DatabaseMetadataValue<string>;
+  viewQuery: DatabaseMetadataValue<string>;
+  routineBody: DatabaseMetadataValue<string>;
+  definition: DatabaseMetadataValue<string>;
+  trigger: {
+    table: string;
+    timing: DatabaseTriggerTiming;
+    events: DatabaseTriggerEvent[];
+    statement: DatabaseMetadataValue<string>;
+    functionName: DatabaseMetadataValue<string>;
+    function: DatabaseMetadataValue<string>;
+  } | null;
+  sequence: {
+    dataType: DatabaseMetadataValue<string>;
+    startValue: DatabaseMetadataValue<string>;
+    increment: DatabaseMetadataValue<string>;
+    minimum: DatabaseMetadataValue<string>;
+    maximum: DatabaseMetadataValue<string>;
+    currentValue: DatabaseMetadataValue<string>;
+    cache: DatabaseMetadataValue<string>;
+    cycle: DatabaseMetadataValue<boolean>;
+  } | null;
+  truncated: boolean;
+};
+
+export type DatabaseObjectDdlPreview = {
+  action: DatabaseObjectActionKind;
+  engine: DatabaseEngine;
+  object: DatabaseObjectRef;
+  statements: string[];
+  ddl: string;
+  warnings: string[];
+  destructive: boolean;
+  requiresConfirmation: boolean;
+};
+
+export type DatabaseObjectActionResult = {
+  action: DatabaseObjectActionKind;
+  engine: DatabaseEngine;
+  object: DatabaseObjectRef;
+  statements: string[];
+  warnings: string[];
+  verified: boolean;
+  verification: string;
+  verificationError?: string | null;
+  definition?: DatabaseObjectDefinition | null;
   durationMs: number;
 };
 

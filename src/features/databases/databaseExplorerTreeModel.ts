@@ -8,17 +8,23 @@ import type {
   DatabaseExplorerNodePayload,
   DatabasePage,
   DatabaseProfile,
+  DatabaseRoutineSummary,
   DatabaseSchemaSummary,
   DatabaseSequenceSummary,
   DatabaseSummary,
   DatabaseTableSummary,
+  DatabaseTriggerSummary,
   DatabaseViewSummary,
 } from "@/types/contracts";
 
 export type DatabaseObjectSummary =
-  DatabaseTableSummary | DatabaseViewSummary | DatabaseSequenceSummary;
+  | DatabaseTableSummary
+  | DatabaseViewSummary
+  | DatabaseSequenceSummary
+  | DatabaseRoutineSummary
+  | DatabaseTriggerSummary;
 
-export type DatabaseObjectGroupKind = "tables" | "views" | "sequences";
+export type DatabaseObjectGroupKind = "tables" | "views" | "routines" | "triggers" | "sequences";
 
 export type DatabaseExplorerRowKind =
   | "connection"
@@ -28,9 +34,14 @@ export type DatabaseExplorerRowKind =
   | "object-group"
   | "table"
   | "view"
+  | "routine"
+  | "trigger"
   | "sequence"
   | "status"
   | "load-more";
+
+export type DatabaseExplorerObjectKind =
+  "view" | "materialized_view" | "routine" | "trigger" | "sequence";
 
 export type DatabaseExplorerStatusTone =
   "loading" | "empty" | "error" | "permission" | "disconnected" | "info";
@@ -46,6 +57,9 @@ export type DatabaseExplorerSelection = {
   database: string | null;
   schema: string | null;
   objectName: string | null;
+  objectKind?: DatabaseExplorerObjectKind | null;
+  objectTable?: string | null;
+  objectArguments?: string | null;
 };
 
 export type DatabaseExplorerRow = {
@@ -60,6 +74,9 @@ export type DatabaseExplorerRow = {
   database: string | null;
   schema: string | null;
   objectName: string | null;
+  objectKind?: DatabaseExplorerObjectKind | null;
+  objectTable?: string | null;
+  objectArguments?: string | null;
   discoveryNode: DatabaseExplorerNode | null;
   expandable: boolean;
   expanded: boolean;
@@ -146,6 +163,9 @@ export function databaseExplorerSelectionForRow(
     database: row.database,
     schema: row.schema,
     objectName: row.objectName,
+    objectKind: row.objectKind ?? null,
+    objectTable: row.objectTable ?? null,
+    objectArguments: row.objectArguments ?? null,
   };
 }
 
@@ -284,6 +304,10 @@ function objectGroupLabel(group: DatabaseObjectGroupKind): string {
       return "Tables";
     case "views":
       return "Views";
+    case "routines":
+      return "Routines";
+    case "triggers":
+      return "Triggers";
     default:
       return "Sequences";
   }
@@ -433,6 +457,13 @@ function supportsSequences(
   return snapshot?.capabilities?.flags.sequences === true;
 }
 
+function supportsFlag(
+  snapshot: DatabaseConnectionSnapshot | undefined,
+  flag: "routines" | "triggers",
+): boolean {
+  return snapshot?.capabilities?.flags[flag] ?? true;
+}
+
 function pushObjectGroups(
   rows: DatabaseExplorerRow[],
   parent: DatabaseExplorerRow,
@@ -444,6 +475,12 @@ function pushObjectGroups(
   schema: string | null,
 ): void {
   const groups: DatabaseObjectGroupKind[] = ["tables", "views"];
+  if (supportsFlag(snapshot, "routines")) {
+    groups.push("routines");
+  }
+  if (supportsFlag(snapshot, "triggers")) {
+    groups.push("triggers");
+  }
   if (supportsSequences(profile, snapshot)) {
     groups.push("sequences");
   }
@@ -532,14 +569,31 @@ function pushObjectGroups(
       rows.push(emptyRow(groupRow, `No ${objectGroupLabel(group).toLowerCase()} found.`));
     } else {
       page.items.forEach((item) => {
+        const routineArguments =
+          group === "routines"
+            ? (item as { arguments?: { status: string; value?: string } }).arguments
+            : undefined;
         const objectRow: DatabaseExplorerRow = {
           ...groupRow,
           id: objectRowId(profile.id, database, schema, group, item.name),
-          kind: group === "tables" ? "table" : group === "views" ? "view" : "sequence",
+          kind:
+            group === "tables"
+              ? "table"
+              : group === "views"
+                ? "view"
+                : group === "routines"
+                  ? "routine"
+                  : group === "triggers"
+                    ? "trigger"
+                    : "sequence",
           label: item.name,
           level: groupRow.level + 1,
           parentId: groupRow.id,
           objectName: item.name,
+          objectKind: objectKindFor(group, item),
+          objectTable: group === "triggers" ? ((item as { table?: string }).table ?? null) : null,
+          objectArguments:
+            routineArguments?.status === "available" ? (routineArguments.value ?? null) : null,
           discoveryNode: null,
           expandable: false,
           expanded: false,
@@ -569,12 +623,35 @@ function pushObjectGroups(
   });
 }
 
+function objectKindFor(
+  group: DatabaseObjectGroupKind,
+  item: DatabaseObjectSummary,
+): DatabaseExplorerObjectKind {
+  switch (group) {
+    case "views":
+      return (item as { kind?: string }).kind === "materialized_view"
+        ? "materialized_view"
+        : "view";
+    case "routines":
+      return "routine";
+    case "triggers":
+      return "trigger";
+    case "sequences":
+      return "sequence";
+    default:
+      return "view";
+  }
+}
+
 function objectDetail(
   group: DatabaseObjectGroupKind,
   item: {
     estimatedRows?: { status: "available"; value: number } | { status: "unavailable" };
     kind?: string;
     dataType?: { status: "available"; value: string } | { status: "unavailable" };
+    timing?: string;
+    events?: string[];
+    returnType?: { status: "available"; value: string } | { status: "unavailable" };
   },
 ): string | undefined {
   if (group === "tables") {
@@ -588,6 +665,13 @@ function objectDetail(
   }
   if (group === "views") {
     return item.kind === "materialized_view" ? "materialized" : "view";
+  }
+  if (group === "routines") {
+    return item.returnType?.status === "available" ? item.returnType.value : item.kind;
+  }
+  if (group === "triggers") {
+    const events = item.events?.map((event) => event.toUpperCase()).join(" OR ");
+    return [item.timing?.toUpperCase(), events].filter(Boolean).join(" ");
   }
   return item.dataType?.status === "available" ? item.dataType.value : undefined;
 }

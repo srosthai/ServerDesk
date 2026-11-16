@@ -130,6 +130,118 @@ pub const LIST_MATERIALIZED_VIEWS: &str = "SELECT schemaname AS schema_name, \
     matviewname AS name, pg_catalog.pg_get_userbyid(matviewowner) AS owner \
     FROM pg_catalog.pg_matviews ORDER BY schemaname, matviewname";
 
+pub const VIEW_DEFINITION: &str = r#"SELECT current_database() AS database_name,
+    n.nspname AS schema_name,
+    c.relname AS name,
+    CASE c.relkind WHEN 'm' THEN 'MATERIALIZED VIEW' ELSE 'VIEW' END AS view_type,
+    pg_catalog.pg_get_userbyid(c.relowner) AS owner,
+    pg_catalog.pg_get_viewdef(c.oid, true) AS view_query,
+    CASE WHEN c.relkind = 'm' THEN pg_catalog.pg_total_relation_size(c.oid) END AS size_bytes
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('v', 'm')
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname = COALESCE($1::text, current_schema())
+  AND c.relname = $2
+ORDER BY n.nspname
+LIMIT 1"#;
+
+pub const LIST_ROUTINES: &str = r#"SELECT current_database() AS database_name,
+    n.nspname AS schema_name,
+    p.proname AS name,
+    CASE COALESCE(row_to_json(p)->>'prokind', 'f') WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END AS routine_type,
+    pg_catalog.pg_get_userbyid(p.proowner) AS owner,
+    l.lanname AS language,
+    pg_catalog.pg_get_function_identity_arguments(p.oid) AS arguments,
+    pg_catalog.pg_get_function_result(p.oid) AS return_type
+FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+WHERE COALESCE(row_to_json(p)->>'prokind', 'f') IN ('f', 'p')
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND ($1::text IS NULL OR n.nspname = $1)
+ORDER BY n.nspname, p.proname, p.oid
+LIMIT $2 OFFSET $3"#;
+
+pub const ROUTINE_DEFINITION: &str = r#"SELECT current_database() AS database_name,
+    n.nspname AS schema_name,
+    p.proname AS name,
+    CASE COALESCE(row_to_json(p)->>'prokind', 'f') WHEN 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END AS routine_type,
+    pg_catalog.pg_get_userbyid(p.proowner) AS owner,
+    l.lanname AS language,
+    pg_catalog.pg_get_function_identity_arguments(p.oid) AS arguments,
+    pg_catalog.pg_get_function_result(p.oid) AS return_type,
+    p.prosrc AS routine_body,
+    pg_catalog.pg_get_functiondef(p.oid) AS definition
+FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+WHERE COALESCE(row_to_json(p)->>'prokind', 'f') IN ('f', 'p')
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname = COALESCE($1::text, current_schema())
+  AND p.proname = $2
+  AND ($3::text IS NULL OR COALESCE(row_to_json(p)->>'prokind', 'f') = $3)
+  AND ($4::text IS NULL OR pg_catalog.pg_get_function_identity_arguments(p.oid) = $4)
+ORDER BY p.oid
+LIMIT 1"#;
+
+pub const LIST_TRIGGERS: &str = r#"SELECT current_database() AS database_name,
+    n.nspname AS schema_name,
+    t.tgname AS name,
+    c.relname AS table_name,
+    t.tgtype::int AS trigger_type,
+    pg_catalog.pg_get_userbyid(c.relowner) AS owner,
+    pg_catalog.pg_get_triggerdef(t.oid, true) AS definition,
+    p.proname AS function_name
+FROM pg_catalog.pg_trigger t
+JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
+WHERE NOT t.tgisinternal
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND ($1::text IS NULL OR n.nspname = $1)
+ORDER BY n.nspname, c.relname, t.tgname
+LIMIT $2 OFFSET $3"#;
+
+pub const TRIGGER_DEFINITION: &str = r#"SELECT current_database() AS database_name,
+    n.nspname AS schema_name,
+    t.tgname AS name,
+    c.relname AS table_name,
+    t.tgtype::int AS trigger_type,
+    pg_catalog.pg_get_userbyid(c.relowner) AS owner,
+    pg_catalog.pg_get_triggerdef(t.oid, true) AS definition,
+    p.proname AS function_name,
+    pg_catalog.pg_get_functiondef(p.oid) AS function_definition
+FROM pg_catalog.pg_trigger t
+JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
+WHERE NOT t.tgisinternal
+  AND n.nspname = COALESCE($1::text, current_schema())
+  AND t.tgname = $2
+  AND ($3::text IS NULL OR c.relname = $3)
+ORDER BY t.oid
+LIMIT 1"#;
+
+pub const SEQUENCE_DEFINITION: &str = r#"SELECT current_database() AS database_name,
+    s.sequence_schema AS schema_name,
+    s.sequence_name AS name,
+    pg_catalog.pg_get_userbyid(c.relowner) AS owner,
+    s.data_type,
+    s.start_value::text AS start_value,
+    s.minimum_value::text AS minimum,
+    s.maximum_value::text AS maximum,
+    s.increment::text AS increment_by,
+    s.cycle_option AS cycle
+FROM information_schema.sequences s
+JOIN pg_catalog.pg_namespace n ON n.nspname = s.sequence_schema
+JOIN pg_catalog.pg_class c
+  ON c.relnamespace = n.oid AND c.relname = s.sequence_name AND c.relkind = 'S'
+WHERE s.sequence_schema = COALESCE($1::text, current_schema())
+  AND s.sequence_name = $2
+ORDER BY s.sequence_schema
+LIMIT 1"#;
+
 pub const LIST_SEQUENCES: &str = r#"SELECT current_database() AS database_name,
     s.sequence_schema AS schema_name,
     s.sequence_name AS name,
@@ -172,7 +284,20 @@ pub const OBJECT_COUNTS: &str = r#"SELECT
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
      WHERE c.relkind = 'S'
        AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-       AND ($1::text IS NULL OR n.nspname = $1)) AS sequence_count"#;
+       AND ($1::text IS NULL OR n.nspname = $1)) AS sequence_count,
+    (SELECT count(*)
+     FROM pg_catalog.pg_proc p
+     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+     WHERE COALESCE(row_to_json(p)->>'prokind', 'f') IN ('f', 'p')
+       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+       AND ($1::text IS NULL OR n.nspname = $1)) AS routine_count,
+    (SELECT count(*)
+     FROM pg_catalog.pg_trigger t
+     JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE NOT t.tgisinternal
+       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+       AND ($1::text IS NULL OR n.nspname = $1)) AS trigger_count"#;
 
 pub const LIST_COLUMNS: &str = r#"SELECT a.attname AS name,
     pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
@@ -459,19 +584,6 @@ WHERE NOT tr.tgisinternal
   AND t.relname = $2
 ORDER BY tr.tgname
 LIMIT $3"#;
-
-pub const LIST_ROUTINES: &str = "SELECT routine_schema AS schema_name, routine_name AS name, \
-    routine_type AS routine_type \
-    FROM information_schema.routines \
-    WHERE ($1::text IS NULL OR routine_schema = $1) \
-    AND routine_schema NOT IN ('pg_catalog', 'information_schema') \
-    ORDER BY routine_schema, routine_name";
-
-pub const LIST_TRIGGERS: &str = "SELECT trigger_schema AS schema_name, trigger_name AS name, \
-    event_object_table AS table_name, event_manipulation AS event, action_timing AS timing \
-    FROM information_schema.triggers \
-    WHERE ($1::text IS NULL OR trigger_schema = $1) \
-    ORDER BY trigger_schema, trigger_name";
 
 pub const LIST_ROLES: &str = "SELECT rolname AS name, rolsuper AS superuser, \
     rolcanlogin AS can_login, rolcreatedb AS create_database, rolcreaterole AS create_role \

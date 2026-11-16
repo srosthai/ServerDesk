@@ -114,7 +114,10 @@ pub struct CapabilityFlags {
     pub sequences: bool,
     pub materialized_views: bool,
     pub routines: bool,
+    pub routine_edit: bool,
     pub triggers: bool,
+    pub trigger_edit: bool,
+    pub view_management: bool,
     pub roles: bool,
     pub sessions: bool,
     pub transactions: bool,
@@ -176,8 +179,18 @@ pub enum DatabaseAction {
     DropIndex,
     CreateCheckConstraint,
     CreateView,
+    ReplaceView,
+    DropView,
     CreateRoutine,
+    EditRoutine,
+    DropRoutine,
     CreateTrigger,
+    EditTrigger,
+    DropTrigger,
+    CreateSequence,
+    AlterSequence,
+    DropSequence,
+    DropMaterializedView,
     ManageRoles,
     KillSession,
     CancelQuery,
@@ -231,8 +244,18 @@ impl DatabaseAction {
         Self::DropIndex,
         Self::CreateCheckConstraint,
         Self::CreateView,
+        Self::ReplaceView,
+        Self::DropView,
         Self::CreateRoutine,
+        Self::EditRoutine,
+        Self::DropRoutine,
         Self::CreateTrigger,
+        Self::EditTrigger,
+        Self::DropTrigger,
+        Self::CreateSequence,
+        Self::AlterSequence,
+        Self::DropSequence,
+        Self::DropMaterializedView,
         Self::ManageRoles,
         Self::KillSession,
         Self::CancelQuery,
@@ -286,8 +309,18 @@ impl DatabaseAction {
             Self::DropIndex => "drop_index",
             Self::CreateCheckConstraint => "create_check_constraint",
             Self::CreateView => "create_view",
+            Self::ReplaceView => "replace_view",
+            Self::DropView => "drop_view",
             Self::CreateRoutine => "create_routine",
+            Self::EditRoutine => "edit_routine",
+            Self::DropRoutine => "drop_routine",
             Self::CreateTrigger => "create_trigger",
+            Self::EditTrigger => "edit_trigger",
+            Self::DropTrigger => "drop_trigger",
+            Self::CreateSequence => "create_sequence",
+            Self::AlterSequence => "alter_sequence",
+            Self::DropSequence => "drop_sequence",
+            Self::DropMaterializedView => "drop_materialized_view",
             Self::ManageRoles => "manage_roles",
             Self::KillSession => "kill_session",
             Self::CancelQuery => "cancel_query",
@@ -354,12 +387,24 @@ impl DatabaseCapabilities {
             DatabaseAction::BrowseSchemas
             | DatabaseAction::CreateSchema
             | DatabaseAction::DropSchema => self.flags.schemas,
-            DatabaseAction::BrowseSequences => self.flags.sequences,
-            DatabaseAction::BrowseMaterializedViews | DatabaseAction::RefreshMaterializedView => {
-                self.flags.materialized_views
+            DatabaseAction::BrowseSequences
+            | DatabaseAction::CreateSequence
+            | DatabaseAction::AlterSequence
+            | DatabaseAction::DropSequence => self.flags.sequences,
+            DatabaseAction::BrowseMaterializedViews
+            | DatabaseAction::RefreshMaterializedView
+            | DatabaseAction::DropMaterializedView => self.flags.materialized_views,
+            DatabaseAction::BrowseRoutines
+            | DatabaseAction::CreateRoutine
+            | DatabaseAction::DropRoutine => self.flags.routines,
+            DatabaseAction::EditRoutine => self.flags.routine_edit,
+            DatabaseAction::BrowseTriggers
+            | DatabaseAction::CreateTrigger
+            | DatabaseAction::DropTrigger => self.flags.triggers,
+            DatabaseAction::EditTrigger => self.flags.trigger_edit,
+            DatabaseAction::CreateView | DatabaseAction::ReplaceView | DatabaseAction::DropView => {
+                self.flags.view_management
             }
-            DatabaseAction::BrowseRoutines | DatabaseAction::CreateRoutine => self.flags.routines,
-            DatabaseAction::BrowseTriggers | DatabaseAction::CreateTrigger => self.flags.triggers,
             DatabaseAction::BrowseRoles | DatabaseAction::ManageRoles => self.flags.roles,
             DatabaseAction::BrowseSessions | DatabaseAction::KillSession => self.flags.sessions,
             DatabaseAction::CancelQuery => self.flags.cancel_query,
