@@ -1,10 +1,11 @@
-//! SQL dump and restore commands.
+//! SQL dump, backup, and restore commands.
 //!
-//! The command layer owns profile lookup, credential loading, cancellation
-//! ids, progress events, and audit history. The database layer owns tool
-//! detection, command construction, execution, verification, and cleanup.
-//! History records only the engine, scope, format, counts, and outcome. Paths,
-//! tool stderr, and credentials are never stored.
+//! The command layer owns profile and server lookup, credential loading,
+//! confirmation validation, cancellation ids, progress events, and audit
+//! history. The database layer owns tool detection, command construction,
+//! execution, verification, and cleanup. History records only the engine,
+//! server, scope, format, counts, and outcome. Paths, tool stderr, and
+//! credentials are never stored.
 
 use std::{
     sync::Arc,
@@ -25,12 +26,14 @@ use crate::{
     database::{
         DATABASE_DUMP_EVENT, DatabaseConnectionRegistry, DatabaseDumpService,
         DumpCancellationResult, DumpConnection, DumpControl, DumpEventSink, DumpExportRequest,
-        DumpExportResult, DumpLocationKind, DumpProgress, DumpRestoreRequest, DumpRestoreResult,
-        DumpServerContext, DumpToolReport, DumpTransferRegistry, SshDumpRemote, dump_timeout,
+        DumpExportResult, DumpLocationKind, DumpProgress, DumpRestorePreview,
+        DumpRestorePreviewRequest, DumpRestoreRequest, DumpRestoreResult, DumpServerContext,
+        DumpToolReport, DumpTransferRegistry, SshDumpRemote, dump_timeout, restore_replaced_data,
         validate_dump_request_id,
     },
     storage::{
         Database, DatabaseConnection, NewOperationRecord, OperationCategory, OperationResult,
+        Server,
     },
 };
 
@@ -86,6 +89,7 @@ pub async fn export_database_dump(
     timeout_ms: Option<u64>,
 ) -> Result<DumpExportResult, AppError> {
     let profile = load_profile(database.inner(), &profile_id)?;
+    let server = load_server(database.inner(), &profile.server_id)?;
     let info = connections.info(&profile.id).await?;
     let password = saved_password(
         credentials.inner().as_ref(),
@@ -118,6 +122,7 @@ pub async fn export_database_dump(
     record_export_history(
         database.inner(),
         &profile,
+        &server,
         &request,
         &outcome,
         started_at,
@@ -127,7 +132,8 @@ pub async fn export_database_dump(
 }
 
 /// Restores one SQL dump into a target database. The request must carry an
-/// explicit confirmation flag; without it no tool is detected or run.
+/// explicit confirmation naming the server, target database, and replaced
+/// data; without it no connection or tool is touched.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn import_database_dump(
@@ -144,6 +150,8 @@ pub async fn import_database_dump(
     timeout_ms: Option<u64>,
 ) -> Result<DumpRestoreResult, AppError> {
     let profile = load_profile(database.inner(), &profile_id)?;
+    let server = load_server(database.inner(), &profile.server_id)?;
+    validate_restore_command_confirmation(&server, &request)?;
     let info = connections.info(&profile.id).await?;
     let password = saved_password(
         credentials.inner().as_ref(),
@@ -176,12 +184,126 @@ pub async fn import_database_dump(
     record_restore_history(
         database.inner(),
         &profile,
+        &server,
         &request,
         &outcome,
         started_at,
         i64::try_from(duration_ms).unwrap_or(i64::MAX),
     );
     outcome
+}
+
+/// Builds the read-only restore confirmation document. It names the server,
+/// target database, tool, and exact data a restore may replace. No data is
+/// changed and no credential is loaded.
+#[tauri::command]
+pub async fn preview_database_restore(
+    database: State<'_, Database>,
+    connections: State<'_, DatabaseConnectionRegistry>,
+    manager: State<'_, Arc<ConnectionManager>>,
+    profile_id: String,
+    request: DumpRestorePreviewRequest,
+) -> Result<DumpRestorePreview, AppError> {
+    let profile = load_profile(database.inner(), &profile_id)?;
+    let server = load_server(database.inner(), &profile.server_id)?;
+    let info = connections.info(&profile.id).await?;
+    let context = DumpServerContext::from_info(&info);
+    let remote = SshDumpRemote::new(Arc::clone(manager.inner()));
+    DatabaseDumpService::new(&remote)
+        .preview_restore(
+            &profile.server_id,
+            &server.name,
+            &profile.id,
+            &profile.name,
+            &context,
+            &request,
+        )
+        .await
+}
+
+/// Backup workflow alias for [`export_database_dump`].
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn create_database_backup(
+    app: AppHandle,
+    database: State<'_, Database>,
+    credentials: State<'_, Arc<dyn CredentialStore>>,
+    credential_index: State<'_, CredentialIndex>,
+    connections: State<'_, DatabaseConnectionRegistry>,
+    manager: State<'_, Arc<ConnectionManager>>,
+    transfers: State<'_, DumpTransferRegistry>,
+    profile_id: String,
+    request_id: String,
+    request: DumpExportRequest,
+    timeout_ms: Option<u64>,
+) -> Result<DumpExportResult, AppError> {
+    export_database_dump(
+        app,
+        database,
+        credentials,
+        credential_index,
+        connections,
+        manager,
+        transfers,
+        profile_id,
+        request_id,
+        request,
+        timeout_ms,
+    )
+    .await
+}
+
+/// Backup workflow alias for [`import_database_dump`].
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn restore_database_backup(
+    app: AppHandle,
+    database: State<'_, Database>,
+    credentials: State<'_, Arc<dyn CredentialStore>>,
+    credential_index: State<'_, CredentialIndex>,
+    connections: State<'_, DatabaseConnectionRegistry>,
+    manager: State<'_, Arc<ConnectionManager>>,
+    transfers: State<'_, DumpTransferRegistry>,
+    profile_id: String,
+    request_id: String,
+    request: DumpRestoreRequest,
+    timeout_ms: Option<u64>,
+) -> Result<DumpRestoreResult, AppError> {
+    import_database_dump(
+        app,
+        database,
+        credentials,
+        credential_index,
+        connections,
+        manager,
+        transfers,
+        profile_id,
+        request_id,
+        request,
+        timeout_ms,
+    )
+    .await
+}
+
+/// Detects backup tools. This is the backup workflow name for the same
+/// read-only tool inventory.
+#[tauri::command]
+pub async fn get_database_backup_tools(
+    database: State<'_, Database>,
+    connections: State<'_, DatabaseConnectionRegistry>,
+    manager: State<'_, Arc<ConnectionManager>>,
+    profile_id: String,
+) -> Result<DumpToolReport, AppError> {
+    get_database_dump_tools(database, connections, manager, profile_id).await
+}
+
+/// Cancels one in-flight backup or restore. Cancelling a finished id is safe.
+#[tauri::command]
+pub fn cancel_database_backup(
+    transfers: State<'_, DumpTransferRegistry>,
+    request_id: String,
+) -> Result<DumpCancellationResult, AppError> {
+    cancel_database_dump(transfers, request_id)
 }
 
 /// Cancels one in-flight dump or restore. Cancelling a finished id is safe.
@@ -203,6 +325,47 @@ fn load_profile(database: &Database, profile_id: &str) -> Result<DatabaseConnect
     database
         .get_database_connection(profile_id)?
         .ok_or_else(|| AppError::not_found("Database profile not found."))
+}
+
+fn load_server(database: &Database, server_id: &str) -> Result<Server, AppError> {
+    database
+        .get_server(server_id)?
+        .ok_or_else(|| AppError::not_found("Server not found."))
+}
+
+/// Verifies that the confirmation echoed by the caller names the stored
+/// server, the exact target database, and the exact replaced-data text.
+fn validate_restore_command_confirmation(
+    server: &Server,
+    request: &DumpRestoreRequest,
+) -> Result<(), AppError> {
+    let confirmation = request.confirmation.as_ref().ok_or_else(|| {
+        AppError::validation(
+            "The restore confirmation must name the server, target database, and replaced data.",
+        )
+    })?;
+    if !request.confirmed || !confirmation.acknowledged {
+        return Err(AppError::validation(
+            "Restoring a SQL dump requires explicit confirmation.",
+        ));
+    }
+    if confirmation.server_id != server.id || confirmation.server_name != server.name {
+        return Err(AppError::validation(
+            "The restore confirmation names a different server.",
+        ));
+    }
+    if confirmation.target_database != request.target_database.as_str() {
+        return Err(AppError::validation(
+            "The restore confirmation does not name the target database.",
+        ));
+    }
+    let replaced_data = restore_replaced_data(request.target_database.as_str(), request.clean);
+    if confirmation.replaced_data != replaced_data {
+        return Err(AppError::validation(
+            "The restore confirmation does not describe the data that will be replaced.",
+        ));
+    }
+    Ok(())
 }
 
 fn saved_password(
@@ -236,6 +399,7 @@ fn location_label(kind: DumpLocationKind) -> &'static str {
 fn record_export_history(
     database: &Database,
     profile: &DatabaseConnection,
+    server: &Server,
     request: &DumpExportRequest,
     outcome: &Result<DumpExportResult, AppError>,
     started_at: i64,
@@ -254,8 +418,8 @@ fn record_export_history(
         Ok(export) if export.status == crate::database::DumpStatus::Cancelled => (
             OperationResult::Cancelled,
             format!(
-                "Cancelled the {format} dump of {scope} on {engine} connection {}; temporary files were removed and the destination was not changed",
-                profile.name
+                "Cancelled the {format} dump of {scope} on {engine} connection {} for server {}; temporary files were removed and the destination was not changed",
+                profile.name, server.name
             ),
             export.failure_summary.clone(),
             export.exit_code.and_then(|code| i32::try_from(code).ok()),
@@ -269,8 +433,8 @@ fn record_export_history(
             (
                 OperationResult::Failure,
                 format!(
-                    "The {format} dump of {scope} on {engine} connection {} did not complete; the destination was not changed",
-                    profile.name
+                    "The {format} dump of {scope} on {engine} connection {} for server {} did not complete; the destination was not changed",
+                    profile.name, server.name
                 ),
                 export.failure_summary.clone(),
                 export.exit_code.and_then(|code| i32::try_from(code).ok()),
@@ -279,8 +443,8 @@ fn record_export_history(
         Ok(export) => (
             OperationResult::Success,
             format!(
-                "Exported a {format} dump of {scope} on {engine} connection {} to a {location} file",
-                profile.name
+                "Exported a {format} dump of {scope} on {engine} connection {} for server {} to a {location} file",
+                profile.name, server.name
             ),
             Some(format!(
                 "{} bytes, verified: {}, warnings: {}",
@@ -293,8 +457,8 @@ fn record_export_history(
         Err(error) if error.code == ErrorCode::Cancelled => (
             OperationResult::Cancelled,
             format!(
-                "Cancelled the {format} dump of {scope} on {engine} connection {}; the destination was not changed",
-                profile.name
+                "Cancelled the {format} dump of {scope} on {engine} connection {} for server {}; the destination was not changed",
+                profile.name, server.name
             ),
             summarize_error(error),
             None,
@@ -315,8 +479,8 @@ fn record_export_history(
                     OperationResult::Failure
                 },
                 format!(
-                    "The {format} dump of {scope} on {engine} connection {} did not complete; the destination was not changed",
-                    profile.name
+                    "The {format} dump of {scope} on {engine} connection {} for server {} did not complete; the destination was not changed",
+                    profile.name, server.name
                 ),
                 summarize_error(error),
                 None,
@@ -345,6 +509,7 @@ fn record_export_history(
 fn record_restore_history(
     database: &Database,
     profile: &DatabaseConnection,
+    server: &Server,
     request: &DumpRestoreRequest,
     outcome: &Result<DumpRestoreResult, AppError>,
     started_at: i64,
@@ -358,8 +523,8 @@ fn record_restore_history(
         Ok(restore) if restore.status == crate::database::DumpStatus::Cancelled => (
             OperationResult::Cancelled,
             format!(
-                "Cancelled the {format} restore into {target} on {engine} connection {}; the target database may contain partially restored objects",
-                profile.name
+                "Cancelled the {format} restore into {target} on {engine} connection {} for server {}; the target database may contain partially restored objects",
+                profile.name, server.name
             ),
             restore.failure_summary.clone(),
             restore.exit_code.and_then(|code| i32::try_from(code).ok()),
@@ -373,8 +538,8 @@ fn record_restore_history(
             (
                 OperationResult::Failure,
                 format!(
-                    "The {format} restore into {target} on {engine} connection {} did not complete; the target database may contain partially restored objects",
-                    profile.name
+                    "The {format} restore into {target} on {engine} connection {} for server {} did not complete; the target database may contain partially restored objects",
+                    profile.name, server.name
                 ),
                 restore.failure_summary.clone(),
                 restore.exit_code.and_then(|code| i32::try_from(code).ok()),
@@ -383,8 +548,8 @@ fn record_restore_history(
         Ok(restore) => (
             OperationResult::Success,
             format!(
-                "Restored a {format} dump into {target} on {engine} connection {}; the target database may have been replaced",
-                profile.name
+                "Restored a {format} dump into {target} on {engine} connection {} for server {}; the target database may have been replaced",
+                profile.name, server.name
             ),
             Some(format!(
                 "{} bytes, warnings: {}",
@@ -396,8 +561,8 @@ fn record_restore_history(
         Err(error) if error.code == ErrorCode::Cancelled => (
             OperationResult::Cancelled,
             format!(
-                "Cancelled the {format} restore into {target} on {engine} connection {}; the target database may contain partially restored objects",
-                profile.name
+                "Cancelled the {format} restore into {target} on {engine} connection {} for server {}; the target database may contain partially restored objects",
+                profile.name, server.name
             ),
             summarize_error(error),
             None,
@@ -418,8 +583,8 @@ fn record_restore_history(
                     OperationResult::Failure
                 },
                 format!(
-                    "The {format} restore into {target} on {engine} connection {} did not complete; the target database may contain partially restored objects",
-                    profile.name
+                    "The {format} restore into {target} on {engine} connection {} for server {} did not complete; the target database may contain partially restored objects",
+                    profile.name, server.name
                 ),
                 summarize_error(error),
                 None,
@@ -488,6 +653,7 @@ mod tests {
         DumpExportRequest {
             scope: DumpScope::Database { database: None },
             format: DumpFormat::PlainSql,
+            tool: None,
             destination: crate::database::DumpDestination::Remote {
                 path: "/home/deploy/backup.sql".to_string(),
                 overwrite: false,
@@ -502,14 +668,31 @@ mod tests {
                 path: "/home/deploy/backup.sql".to_string(),
             },
             format: DumpFormat::PlainSql,
+            tool: None,
             target_database: crate::database::Identifier::new("app").expect("database"),
             clean: false,
             no_owner: false,
             confirmed: true,
+            confirmation: Some(crate::database::DumpRestoreConfirmation {
+                server_id: "server-1".to_string(),
+                server_name: "Fixture".to_string(),
+                target_database: "app".to_string(),
+                replaced_data: crate::database::restore_replaced_data("app", false),
+                acknowledged: true,
+            }),
         }
     }
 
-    fn persisted(engine: DatabaseEngine) -> (Database, DatabaseConnection) {
+    fn restore_request_for(server: &Server) -> DumpRestoreRequest {
+        let mut request = restore_request();
+        if let Some(confirmation) = request.confirmation.as_mut() {
+            confirmation.server_id = server.id.clone();
+            confirmation.server_name = server.name.clone();
+        }
+        request
+    }
+
+    fn persisted(engine: DatabaseEngine) -> (Database, DatabaseConnection, Server) {
         let database = Database::in_memory().expect("in-memory storage");
         let server = database
             .create_server(&NewServer {
@@ -525,8 +708,8 @@ mod tests {
             })
             .expect("server");
         let mut profile = profile(engine);
-        profile.server_id = server.id;
-        (database, profile)
+        profile.server_id = server.id.clone();
+        (database, profile, server)
     }
 
     fn export_result(engine: DatabaseEngine) -> DumpExportResult {
@@ -573,11 +756,43 @@ mod tests {
     }
 
     #[test]
+    fn restore_confirmation_must_match_the_stored_server_database_and_replaced_data() {
+        let (_database, _profile, server) = persisted(DatabaseEngine::Postgresql);
+        let request = restore_request_for(&server);
+        assert!(validate_restore_command_confirmation(&server, &request).is_ok());
+
+        let mut wrong_name = request.clone();
+        if let Some(confirmation) = wrong_name.confirmation.as_mut() {
+            confirmation.server_name = "Another server".to_string();
+        }
+        assert!(validate_restore_command_confirmation(&server, &wrong_name).is_err());
+
+        let mut wrong_database = request.clone();
+        if let Some(confirmation) = wrong_database.confirmation.as_mut() {
+            confirmation.target_database = "other".to_string();
+        }
+        assert!(validate_restore_command_confirmation(&server, &wrong_database).is_err());
+
+        let mut wrong_replaced = request.clone();
+        if let Some(confirmation) = wrong_replaced.confirmation.as_mut() {
+            confirmation.replaced_data = "something else".to_string();
+        }
+        assert!(validate_restore_command_confirmation(&server, &wrong_replaced).is_err());
+
+        let mut unacknowledged = request;
+        if let Some(confirmation) = unacknowledged.confirmation.as_mut() {
+            confirmation.acknowledged = false;
+        }
+        assert!(validate_restore_command_confirmation(&server, &unacknowledged).is_err());
+    }
+
+    #[test]
     fn export_history_names_scope_and_size_without_paths_or_secrets() {
-        let (database, profile) = persisted(DatabaseEngine::Mysql);
+        let (database, profile, server) = persisted(DatabaseEngine::Mysql);
         record_export_history(
             &database,
             &profile,
+            &server,
             &export_request(),
             &Ok(export_result(DatabaseEngine::Mysql)),
             1,
@@ -601,11 +816,19 @@ mod tests {
 
     #[test]
     fn cancelled_export_history_is_not_success() {
-        let (database, profile) = persisted(DatabaseEngine::Postgresql);
+        let (database, profile, server) = persisted(DatabaseEngine::Postgresql);
         let mut result = export_result(DatabaseEngine::Postgresql);
         result.status = DumpStatus::Cancelled;
         result.verified = false;
-        record_export_history(&database, &profile, &export_request(), &Ok(result), 1, 5);
+        record_export_history(
+            &database,
+            &profile,
+            &server,
+            &export_request(),
+            &Ok(result),
+            1,
+            5,
+        );
         let rows = database.list_operations(10).expect("history");
         assert_eq!(rows[0].result, OperationResult::Cancelled);
         assert!(rows[0].safe_summary.contains("destination was not changed"));
@@ -613,12 +836,20 @@ mod tests {
 
     #[test]
     fn restore_history_warns_about_partial_database_state() {
-        let (database, profile) = persisted(DatabaseEngine::Postgresql);
+        let (database, profile, server) = persisted(DatabaseEngine::Postgresql);
         let mut result = restore_result(DatabaseEngine::Postgresql);
         result.status = DumpStatus::Failed;
         result.may_be_incomplete = true;
         result.failure_summary = Some("pg_restore exited with status 1.".to_string());
-        record_restore_history(&database, &profile, &restore_request(), &Ok(result), 1, 5);
+        record_restore_history(
+            &database,
+            &profile,
+            &server,
+            &restore_request(),
+            &Ok(result),
+            1,
+            5,
+        );
         let rows = database.list_operations(10).expect("history");
         assert_eq!(rows[0].operation, "database-sql-dump-restore");
         assert_eq!(rows[0].result, OperationResult::Failure);
@@ -628,10 +859,11 @@ mod tests {
 
     #[test]
     fn restore_history_does_not_store_source_path_or_credentials() {
-        let (database, profile) = persisted(DatabaseEngine::Mysql);
+        let (database, profile, server) = persisted(DatabaseEngine::Mysql);
         record_restore_history(
             &database,
             &profile,
+            &server,
             &restore_request(),
             &Ok(restore_result(DatabaseEngine::Mysql)),
             1,
