@@ -26,6 +26,7 @@ export type DatabaseBackupStoreStatus = "idle" | "running" | DatabaseDumpStatus 
 
 export type DatabaseBackupToolsState = {
   status: "idle" | "loading" | "ready" | "error";
+  profileId?: string;
   report?: DatabaseDumpToolReport;
   error?: CommandError;
   errorMessage?: string;
@@ -33,6 +34,7 @@ export type DatabaseBackupToolsState = {
 
 export type DatabaseBackupPreviewState = {
   status: "idle" | "loading" | "ready" | "error";
+  profileId?: string;
   preview?: DatabaseBackupRestorePreview;
   error?: CommandError;
   errorMessage?: string;
@@ -40,6 +42,8 @@ export type DatabaseBackupPreviewState = {
 
 export type DatabaseBackupTransferState = {
   transferId?: string;
+  /** Keeps an active transfer attached to the connection tab that started it. */
+  profileId?: string;
   direction: "backup" | "restore";
   status: DatabaseBackupStoreStatus;
   progress?: DatabaseDumpProgress;
@@ -48,6 +52,7 @@ export type DatabaseBackupTransferState = {
   error?: CommandError;
   errorMessage?: string;
   cancelling: boolean;
+  startedAt?: number;
 };
 
 type DatabaseBackupStore = {
@@ -87,15 +92,19 @@ function failureState(
   direction: "backup" | "restore",
   error: unknown,
   transferId?: string,
+  profileId?: string,
+  startedAt?: number,
 ): DatabaseBackupTransferState {
   const commandError = commandErrorFor(error);
   return {
     transferId,
+    profileId,
     direction,
     status: "error",
     error: commandError ?? undefined,
     errorMessage: getCommandErrorMessage(error),
     cancelling: false,
+    startedAt,
   };
 }
 
@@ -117,21 +126,23 @@ export const useDatabaseBackupStore = create<DatabaseBackupStore>((set, get) => 
       set({
         tools: {
           status: "error",
+          profileId,
           errorMessage: "Backup tools are available in the desktop application.",
         },
       });
       return null;
     }
-    set({ tools: { status: "loading" } });
+    set({ tools: { status: "loading", profileId } });
     try {
       const report = await getDatabaseBackupTools(profileId);
-      set({ tools: { status: "ready", report } });
+      set({ tools: { status: "ready", profileId, report } });
       return report;
     } catch (error) {
       const commandError = commandErrorFor(error);
       set({
         tools: {
           status: "error",
+          profileId,
           error: commandError ?? undefined,
           errorMessage: getCommandErrorMessage(error),
         },
@@ -145,21 +156,23 @@ export const useDatabaseBackupStore = create<DatabaseBackupStore>((set, get) => 
       set({
         preview: {
           status: "error",
+          profileId,
           errorMessage: "Backup restore previews are available in the desktop application.",
         },
       });
       return null;
     }
-    set({ preview: { status: "loading" } });
+    set({ preview: { status: "loading", profileId } });
     try {
       const preview = await previewDatabaseRestore(profileId, request);
-      set({ preview: { status: "ready", preview } });
+      set({ preview: { status: "ready", profileId, preview } });
       return preview;
     } catch (error) {
       const commandError = commandErrorFor(error);
       set({
         preview: {
           status: "error",
+          profileId,
           error: commandError ?? undefined,
           errorMessage: getCommandErrorMessage(error),
         },
@@ -177,17 +190,22 @@ export const useDatabaseBackupStore = create<DatabaseBackupStore>((set, get) => 
         transfer: failureState(
           "backup",
           new Error("Backup creation is available in the desktop application."),
+          undefined,
+          profileId,
         ),
       });
       return null;
     }
     const transferId = createDatabaseBackupRequestId();
+    const startedAt = Date.now();
     set({
       transfer: {
         transferId,
+        profileId,
         direction: "backup",
         status: "running",
         cancelling: false,
+        startedAt,
       },
     });
     try {
@@ -198,10 +216,12 @@ export const useDatabaseBackupStore = create<DatabaseBackupStore>((set, get) => 
       set({
         transfer: {
           transferId,
+          profileId,
           direction: "backup",
           status: result.status,
           backupResult: result,
           cancelling: false,
+          startedAt,
         },
       });
       return result;
@@ -209,7 +229,7 @@ export const useDatabaseBackupStore = create<DatabaseBackupStore>((set, get) => 
       if (get().transfer.transferId !== transferId) {
         return null;
       }
-      set({ transfer: failureState("backup", error, transferId) });
+      set({ transfer: failureState("backup", error, transferId, profileId, startedAt) });
       return null;
     }
   },
@@ -227,17 +247,22 @@ export const useDatabaseBackupStore = create<DatabaseBackupStore>((set, get) => 
         transfer: failureState(
           "restore",
           new Error("Backup restore is available in the desktop application."),
+          undefined,
+          profileId,
         ),
       });
       return null;
     }
     const transferId = createDatabaseBackupRequestId();
+    const startedAt = Date.now();
     set({
       transfer: {
         transferId,
+        profileId,
         direction: "restore",
         status: "running",
         cancelling: false,
+        startedAt,
       },
     });
     try {
@@ -248,10 +273,12 @@ export const useDatabaseBackupStore = create<DatabaseBackupStore>((set, get) => 
       set({
         transfer: {
           transferId,
+          profileId,
           direction: "restore",
           status: result.status,
           restoreResult: result,
           cancelling: false,
+          startedAt,
         },
       });
       return result;
@@ -259,7 +286,7 @@ export const useDatabaseBackupStore = create<DatabaseBackupStore>((set, get) => 
       if (get().transfer.transferId !== transferId) {
         return null;
       }
-      set({ transfer: failureState("restore", error, transferId) });
+      set({ transfer: failureState("restore", error, transferId, profileId, startedAt) });
       return null;
     }
   },
@@ -274,6 +301,11 @@ export const useDatabaseBackupStore = create<DatabaseBackupStore>((set, get) => 
     }));
     try {
       const result = await cancelDatabaseBackup(transferId);
+      if (!result.cancelled) {
+        set((state) => ({
+          transfer: { ...state.transfer, cancelling: false },
+        }));
+      }
       return result.cancelled;
     } catch {
       set((state) => ({
