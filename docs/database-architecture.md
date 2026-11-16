@@ -38,6 +38,7 @@ src-tauri/src/commands/database/
   queries.rs        SQL analysis, bounded execution, and cancellation commands
   rows.rs           bounded row reads and cancellation commands
   csv.rs            CSV preview, streaming export, transactional import, progress
+  dump.rs           SQL dump tool detection, export/restore commands, progress, audit
   structure.rs      structure preview and table lifecycle execution + audit
   tunnels.rs        loopback SSH tunnel inspection commands
 
@@ -49,6 +50,8 @@ src-tauri/src/database/
   discovery.rs      explorer-node request/response and metadata service
   queries.rs        SQL request model, destructive analysis, limits, and cancellation
   csv.rs            CSV codec, encoding, preview, transfer service, and cancellation
+  dump.rs           SQL dump scopes, tool detection, remote command construction, export/restore service
+  dump_remote.rs    SSH/SFTP dump session, temporary files, downloads, uploads
   row_service.rs    row-read service over the connection registry
   rows.rs           row request model, safe planning, cancellation, and page/result types
   capabilities.rs   action model, flags, version parsing
@@ -66,6 +69,7 @@ src-tauri/src/database/
     queries.rs      MySQL streaming SQL execution and result decoding
     rows.rs         MySQL row metadata, query builders, and bounded reads
     csv.rs          MySQL streaming CSV export and transactional import
+    dump.rs         MySQL mysqldump/mysql command construction
     sql.rs          MySQL-only metadata and row-browser SQL
   postgres/
     mod.rs          PostgreSQL dialect
@@ -76,6 +80,7 @@ src-tauri/src/database/
     queries.rs      PostgreSQL streaming SQL execution and result decoding
     rows.rs         PostgreSQL row metadata, query builders, and bounded reads
     csv.rs          PostgreSQL streaming CSV export and transactional import
+    dump.rs         PostgreSQL pg_dump/pg_dumpall/pg_restore/psql command construction
     sql.rs          PostgreSQL-only metadata and row-browser SQL
 ```
 
@@ -1265,6 +1270,97 @@ display bound; cancellation and malformed-input rollback; and a CSV round-trip
 through the fake MySQL and PostgreSQL adapters. Partial-file cleanup is tested
 without a live database.
 
+## SQL dump and restore
+
+`src-tauri/src/commands/database/dump.rs` owns the SQL dump command surface:
+
+| Command                   | Purpose                                                        |
+| ------------------------- | -------------------------------------------------------------- |
+| `get_database_dump_tools` | Detect remote tools and compare major versions with the server |
+| `export_database_dump`    | Dump one scope to a remote path or a controlled local path     |
+| `import_database_dump`    | Restore one SQL or archive dump into a target database         |
+| `cancel_database_dump`    | Cancel one in-flight export or restore by request id           |
+
+Dump tools run on the remote server over the authenticated SSH session, not on
+the desktop. MySQL exports use `mysqldump`; MySQL restores use `mysql`.
+PostgreSQL exports use `pg_dump`, or `pg_dumpall` for a cluster scope.
+PostgreSQL plain SQL restores use `psql`; custom and tar archives use
+`pg_restore`. The server version comes from the live database session, so the
+profile must be connected before tool detection or a transfer starts.
+
+A scope is one of:
+
+- `{ "kind": "cluster" }` — every PostgreSQL database and role (`pg_dumpall`).
+- `{ "kind": "database", "database": "app" }` — one database; `null` uses the
+  profile database. MySQL has no separate schema scope because a schema is a
+  database.
+- `{ "kind": "schema", "schema": "public" }` — one PostgreSQL schema.
+- `{ "kind": "tables", "schema": "public", "tables": ["users"] }` — up to 100
+  tables. A MySQL table scope must use the same schema and database name.
+
+Formats are `plain_sql`, `custom`, and `tar`. MySQL supports only `plain_sql`.
+A PostgreSQL cluster dump supports only `plain_sql`; database, schema, and table
+scopes support all three. Restore formats follow the same rule, with plain SQL
+using `psql` or `mysql` and archive formats using `pg_restore`.
+
+Tool detection runs `command -v` and `<tool> --version` for every tool belonging
+to the engine. A tool is compatible when its major version is at least the
+server major version. The report returns `available`, `path`, `version`,
+`versionMajor`, `vendor`, `compatible`, and a bounded `detail` per tool, plus
+`exportReady` and `restoreReady`. The export and restore services repeat the
+check and return a typed `capability` error before creating a temporary file
+when the required tool is missing or too old.
+
+### Paths, credentials, and cleanup
+
+Every transfer gets one remote temporary directory under
+`/tmp/serverdesk-dump-<uuid>` created with mode `0700`. The database password is
+written to `password` in that directory, protected with mode `0600`, and read by
+the tool through `MYSQL_PWD` or `PGPASSWORD`. It is never an argument, a result
+field, a progress event, a history field, or a log line. Every path and
+identifier is quoted as one POSIX shell argument; tool names and flags are
+closed literals. There is no generic shell command path.
+
+A remote destination is written to a sibling
+`<destination>.serverdesk-<id>.part` file and moved into place only after the
+tool exits with status 0 and the file is confirmed to be a regular, non-empty
+file with the expected size. A local destination is downloaded to a local
+sibling partial file, its byte count is compared with the remote size, and it is
+renamed only after verification. The tool writes its own PID to the temporary
+directory, so cancellation sends `TERM` and then `KILL` to that exact process;
+the temporary directory, remote partial file, and local partial file are
+removed on success, failure, cancellation, and timeout. A cancelled or failed
+dump therefore leaves the destination unchanged, and the result reports
+`partialRemoved` and `tempCleaned`.
+
+Progress is emitted as `database-dump-event` with the transfer id, direction,
+phase, status, byte counts, a bounded static message, and the incomplete marker.
+Tool stderr is not streamed to the UI. The terminal result includes the tool and
+version, exit code, verified size, warnings, redacted failure summary, cleanup
+flags, and duration. Restores require `confirmed: true`; a cancelled or failed
+restore returns `mayBeIncomplete: true` because the target database may contain
+partially restored objects. Audit history records the engine, scope label,
+format, destination kind, size, warnings, and result, but never a path, SQL,
+tool stderr, or credential.
+
+`src/services/databaseDump.ts` is the typed command boundary.
+`src/stores/databaseDumpStore.ts` owns tool detection, one active transfer,
+cancellation state, progress, and the terminal result. The full dump and restore
+wizard remains #184.
+
+### Tests
+
+`database::dump` unit tests use a fake remote session to cover tool detection,
+missing and incompatible tools, database/schema/table/cluster command
+construction, hostile identifiers, plain SQL and archive restore commands,
+successful remote and local exports, size verification, failure summaries,
+cancellation with process kill, partial-file cleanup, local download failure,
+restore confirmation, failed restore reporting, and credential redaction.
+Command builders additionally assert that `--password` never appears and that
+the password variable is read from the temporary file. Frontend store tests
+cover detection, export success, cancelled restore state, cancellation, errors,
+and stale progress events.
+
 ## Current limitations
 
 - One PostgreSQL connection browses only its connected database catalog.
@@ -1326,6 +1422,34 @@ without a live database.
 - Index column expressions are reported in the same ordered `columns` list as
   plain columns; the first version does not separately type expression versus
   column entries.
+- SQL dump tools must be installed on the remote server. ServerDesk does not
+  install packages or fall back to a desktop-side client, and a tool older than
+  the server major version is rejected before the transfer starts.
+- SQL dump formats are plain SQL for MySQL and plain SQL, custom, or tar for
+  PostgreSQL. PostgreSQL directory-format dumps are not exposed because they
+  produce multiple files, and `pg_dumpall` is always a full-cluster plain SQL
+  dump including roles.
+- A remote destination is written next to the destination and moved after
+  verification. A local destination is first written to the remote temporary
+  directory, so the remote server needs free space for the dump even when the
+  final file is local.
+- The password is passed to the remote tool through an environment variable
+  read from a mode-0600 temporary file. It is absent from process arguments and
+  logs, but a process running as the same SSH account could read its own
+  environment.
+- Restore verification is based on the tool exit status. A failed or cancelled
+  restore can leave partially restored objects, and the result sets
+  `mayBeIncomplete: true` instead of attempting a destructive rollback.
+- A `pg_dumpall` file contains `\connect` statements for every database, so a
+  restore follows those statements. The requested target database selects only
+  the initial connection.
+- A graceful application close requests cancellation for active dumps, but a
+  force-quit can leave the remote process and its temporary directory behind.
+  The next transfer uses a fresh random directory and never reuses the old one.
+- `mysqldump` 8 against an older MySQL server may require
+  `--column-statistics=0`; ServerDesk does not add that flag because MariaDB
+  clients reject it. Install a client matching the server major version when
+  the dump reports an unknown `COLUMN_STATISTICS` table.
 - Real SQL query execution, streaming result sets, and cancellation are
   follow-up work. The SQL tab owns a per-connection draft and result panel,
   but its Run action stays disabled until the query commands land.
