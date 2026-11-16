@@ -883,6 +883,140 @@ export type DatabaseCsvCancellationResult = {
   cancelled: boolean;
 };
 
+export type DatabaseDumpTool =
+  "mysqldump" | "mysql" | "pg_dump" | "pg_dumpall" | "pg_restore" | "psql";
+
+export type DatabaseDumpToolVendor = "unknown" | "mysql" | "mariadb" | "postgresql";
+
+export type DatabaseDumpFormat = "plain_sql" | "custom" | "tar";
+
+export type DatabaseDumpScope =
+  | { kind: "cluster" }
+  | { kind: "database"; database?: string | null }
+  | { kind: "schema"; database?: string | null; schema: string }
+  | {
+      kind: "tables";
+      database?: string | null;
+      schema?: string | null;
+      tables: string[];
+    };
+
+export type DatabaseDumpDestination =
+  | { kind: "remote"; path: string; overwrite: boolean }
+  | { kind: "local"; path: string; overwrite: boolean };
+
+export type DatabaseDumpSource = { kind: "remote"; path: string } | { kind: "local"; path: string };
+
+export type DatabaseDumpExportRequest = {
+  scope: DatabaseDumpScope;
+  format: DatabaseDumpFormat;
+  destination: DatabaseDumpDestination;
+  noOwner: boolean;
+};
+
+export type DatabaseDumpRestoreRequest = {
+  source: DatabaseDumpSource;
+  format: DatabaseDumpFormat;
+  targetDatabase: string;
+  clean: boolean;
+  noOwner: boolean;
+  confirmed: boolean;
+};
+
+export type DatabaseDumpStatus = "running" | "completed" | "cancelled" | "failed";
+
+export type DatabaseDumpDirection = "export" | "restore";
+
+export type DatabaseDumpPhase =
+  | "preparing"
+  | "dumping"
+  | "uploading"
+  | "transferring"
+  | "restoring"
+  | "verifying"
+  | "cleaning_up"
+  | "finalizing";
+
+export type DatabaseDumpProgress = {
+  transferId: string;
+  direction: DatabaseDumpDirection;
+  status: DatabaseDumpStatus;
+  phase: DatabaseDumpPhase;
+  bytesProcessed: number;
+  totalBytes: number | null;
+  percent: number | null;
+  message: string;
+  mayBeIncomplete: boolean;
+  emittedAt: number;
+};
+
+export type DatabaseDumpToolStatus = {
+  tool: DatabaseDumpTool;
+  binary: string;
+  available: boolean;
+  path?: string;
+  version?: string;
+  versionMajor?: number;
+  vendor: DatabaseDumpToolVendor;
+  compatible: boolean;
+  detail?: string;
+};
+
+export type DatabaseDumpToolReport = {
+  engine: DatabaseEngine;
+  serverVersion: string;
+  tools: DatabaseDumpToolStatus[];
+  exportReady: boolean;
+  restoreReady: boolean;
+  checkedAt: number;
+};
+
+export type DatabaseDumpLocationKind = "remote" | "local";
+
+export type DatabaseDumpExportResult = {
+  status: DatabaseDumpStatus;
+  engine: DatabaseEngine;
+  scope: DatabaseDumpScope;
+  format: DatabaseDumpFormat;
+  destinationKind: DatabaseDumpLocationKind;
+  destinationPath: string;
+  bytesWritten: number;
+  verified: boolean;
+  tool: DatabaseDumpTool;
+  toolVersion?: string;
+  exitCode?: number;
+  warnings: string[];
+  failureSummary?: string;
+  partialRemoved: boolean;
+  tempCleaned: boolean;
+  mayBeIncomplete: boolean;
+  durationMs: number;
+};
+
+export type DatabaseDumpRestoreResult = {
+  status: DatabaseDumpStatus;
+  engine: DatabaseEngine;
+  format: DatabaseDumpFormat;
+  sourceKind: DatabaseDumpLocationKind;
+  sourcePath: string;
+  targetDatabase: string;
+  bytesRead: number;
+  tool: DatabaseDumpTool;
+  toolVersion?: string;
+  exitCode?: number;
+  warnings: string[];
+  failureSummary?: string;
+  partialRemoved: boolean;
+  tempCleaned: boolean;
+  mayBeIncomplete: boolean;
+  durationMs: number;
+};
+
+export type DatabaseDumpCancellationResult = {
+  requestId: string;
+  cancelled: boolean;
+};
+
 export type DatabaseQueryWarningCode =
   | "drop"
   | "truncate"

@@ -10,6 +10,8 @@ pub mod capabilities;
 pub mod csv;
 pub mod dialect;
 pub mod discovery;
+pub mod dump;
+pub mod dump_remote;
 pub mod errors;
 pub mod fake;
 pub mod mysql;
@@ -51,6 +53,19 @@ pub use dialect::{
 pub use discovery::{
     DatabaseDiscoveryService, ExplorerNode, ExplorerNodeKind, ExplorerNodePayload,
 };
+pub use dump::{
+    DATABASE_DUMP_EVENT, DEFAULT_DUMP_TIMEOUT, DatabaseDumpService, DumpCancellationResult,
+    DumpConnection, DumpControl, DumpDestination, DumpDirection, DumpEventSink, DumpExportRequest,
+    DumpExportResult, DumpFormat, DumpLocationKind, DumpPhase, DumpProgress, DumpRemote,
+    DumpRemoteSession, DumpRestoreRequest, DumpRestoreResult, DumpScope, DumpServerContext,
+    DumpSource, DumpStatus, DumpTool, DumpToolReport, DumpToolStatus, DumpToolVendor,
+    DumpTransferGuard, DumpTransferRegistry, MAX_DUMP_ERROR_BYTES, MAX_DUMP_FAILURE_CHARS,
+    MAX_DUMP_REPORTED_WARNINGS, MAX_DUMP_REQUEST_ID_LENGTH, MAX_DUMP_TABLES, MAX_DUMP_TIMEOUT,
+    MAX_DUMP_WARNING_CHARS, RemoteCommandOutput, RemoteFileInfo, detect_tools, dump_timeout,
+    export_tool, require_tool, restore_tool, validate_dump_request_id, validate_export_request,
+    validate_restore_request,
+};
+pub use dump_remote::SshDumpRemote;
 pub use errors::{DatabaseError, DatabaseErrorKind};
 pub use fake::FakeDatabaseAdapter;
 pub use fake::FakeRowTable;
