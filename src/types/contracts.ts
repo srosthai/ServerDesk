@@ -910,17 +910,62 @@ export type DatabaseDumpSource = { kind: "remote"; path: string } | { kind: "loc
 export type DatabaseDumpExportRequest = {
   scope: DatabaseDumpScope;
   format: DatabaseDumpFormat;
+  /** Optional explicit vendor tool. Omit to let the backend select one. */
+  tool?: DatabaseDumpTool | null;
   destination: DatabaseDumpDestination;
   noOwner: boolean;
+};
+
+export type DatabaseDumpRestoreConfirmation = {
+  serverId: string;
+  serverName: string;
+  targetDatabase: string;
+  replacedData: string;
+  acknowledged: boolean;
 };
 
 export type DatabaseDumpRestoreRequest = {
   source: DatabaseDumpSource;
   format: DatabaseDumpFormat;
+  /** Optional explicit vendor tool. Omit to let the backend select one. */
+  tool?: DatabaseDumpTool | null;
   targetDatabase: string;
   clean: boolean;
   noOwner: boolean;
   confirmed: boolean;
+  confirmation?: DatabaseDumpRestoreConfirmation | null;
+};
+
+export type DatabaseDumpRestorePreviewRequest = {
+  source: DatabaseDumpSource;
+  format: DatabaseDumpFormat;
+  tool?: DatabaseDumpTool | null;
+  targetDatabase: string;
+  clean: boolean;
+  noOwner: boolean;
+};
+
+export type DatabaseDumpRestorePreview = {
+  serverId: string;
+  serverName: string;
+  profileId: string;
+  profileName: string;
+  engine: DatabaseEngine;
+  targetDatabase: string;
+  sourceKind: DatabaseDumpLocationKind;
+  sourcePath: string;
+  format: DatabaseDumpFormat;
+  tool: DatabaseDumpTool;
+  toolAvailable: boolean;
+  toolCompatible: boolean;
+  toolVersion?: string;
+  replacesExistingData: boolean;
+  replacedData: string;
+  clean: boolean;
+  noOwner: boolean;
+  canRestore: boolean;
+  warnings: string[];
+  confirmation: DatabaseDumpRestoreConfirmation;
 };
 
 export type DatabaseDumpStatus = "running" | "completed" | "cancelled" | "failed";
@@ -1016,6 +1061,16 @@ export type DatabaseDumpCancellationResult = {
   requestId: string;
   cancelled: boolean;
 };
+
+/** Backup workflow aliases over the verified SQL dump transfer types. */
+export type DatabaseBackupRequest = DatabaseDumpExportRequest;
+export type DatabaseBackupResult = DatabaseDumpExportResult;
+export type DatabaseBackupRestoreRequest = DatabaseDumpRestoreRequest;
+export type DatabaseBackupRestoreResult = DatabaseDumpRestoreResult;
+export type DatabaseBackupRestorePreviewRequest = DatabaseDumpRestorePreviewRequest;
+export type DatabaseBackupRestorePreview = DatabaseDumpRestorePreview;
+export type DatabaseBackupRestoreConfirmation = DatabaseDumpRestoreConfirmation;
+export type DatabaseBackupCancellationResult = DatabaseDumpCancellationResult;
 
 export type DatabaseQueryWarningCode =
   | "drop"
