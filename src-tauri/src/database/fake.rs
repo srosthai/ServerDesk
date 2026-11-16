@@ -35,6 +35,10 @@ use super::{
         QueryColumn, QueryControl, QueryExecutionResult, QueryRequest, QueryResultCollector,
         SqlToken, split_sql_statements,
     },
+    roles::{
+        PrivilegeGrant, PrivilegeTarget, RoleDdlPlan, RoleGrantData, RoleKind, RoleRef,
+        RoleSummary, ValidatedRoleAction,
+    },
     row_writes::{
         ResolvedWriteValue, RowDeleteRequest, RowInsertRequest, RowUpdateRequest,
         RowWriteOperation, RowWriteResult, resolve_delete, resolve_import_values, resolve_insert,
@@ -142,6 +146,11 @@ pub struct FakeDatabaseAdapter {
     object_execution_error: Option<DatabaseError>,
     skip_object_execution: bool,
     object_execution_count: AtomicUsize,
+    roles: Vec<RoleSummary>,
+    role_grants: HashMap<String, RoleGrantData>,
+    role_execution_error: Option<DatabaseError>,
+    skip_role_execution: bool,
+    role_execution_count: AtomicUsize,
     columns: Vec<ColumnSummary>,
     created_tables: HashMap<String, Vec<ColumnSummary>>,
     indexes: HashMap<String, Vec<IndexSummary>>,
@@ -213,6 +222,11 @@ impl FakeDatabaseAdapter {
             object_execution_error: None,
             skip_object_execution: false,
             object_execution_count: AtomicUsize::new(0),
+            roles: fixtures.roles,
+            role_grants: fixtures.role_grants,
+            role_execution_error: None,
+            skip_role_execution: false,
+            role_execution_count: AtomicUsize::new(0),
             columns: fixtures.columns,
             created_tables: HashMap::from([(detail_table.clone(), detail_columns)]),
             indexes: HashMap::from([(detail_table.clone(), detail_indexes)]),
@@ -256,6 +270,22 @@ impl FakeDatabaseAdapter {
 
     pub fn object_execution_count(&self) -> usize {
         self.object_execution_count.load(Ordering::SeqCst)
+    }
+
+    /// Makes the next role or privilege action fail after its preview succeeds.
+    pub fn with_role_execution_error(mut self, error: DatabaseError) -> Self {
+        self.role_execution_error = Some(error);
+        self
+    }
+
+    /// Simulates a server that accepts role DDL but does not apply it.
+    pub fn with_skipped_role_execution(mut self) -> Self {
+        self.skip_role_execution = true;
+        self
+    }
+
+    pub fn role_execution_count(&self) -> usize {
+        self.role_execution_count.load(Ordering::SeqCst)
     }
 
     pub fn query_execution_count(&self) -> usize {
@@ -1461,6 +1491,182 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
                 })
             }
         }
+    }
+
+    async fn list_roles(&self, page: PageRequest) -> Result<Page<RoleSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseRoles)?;
+        self.require_connection()?;
+        Ok(Self::paginate(&self.roles, page))
+    }
+
+    async fn role_summary(&self, role: &RoleRef) -> Result<Option<RoleSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseRoles)?;
+        self.require_connection()?;
+        Ok(self
+            .roles
+            .iter()
+            .find(|summary| summary.label() == role.label())
+            .cloned())
+    }
+
+    async fn role_grants(&self, role: &RoleRef) -> Result<RoleGrantData, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseRoles)?;
+        self.require_connection()?;
+        Ok(self
+            .role_grants
+            .get(&role.label())
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn preview_role_action(
+        &self,
+        action: &ValidatedRoleAction,
+    ) -> Result<RoleDdlPlan, DatabaseError> {
+        self.require_connection()?;
+        action.ensure_supported(&self.capabilities)?;
+        match self.engine {
+            DatabaseEngine::Mysql => mysql::roles::preview(action),
+            DatabaseEngine::Postgresql => postgres::roles::preview(action),
+        }
+    }
+
+    async fn execute_role_action(
+        &mut self,
+        action: &ValidatedRoleAction,
+    ) -> Result<(), DatabaseError> {
+        self.require_connection()?;
+        self.preview_role_action(action).await?;
+        self.role_execution_count.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = self.role_execution_error.take() {
+            return Err(error);
+        }
+        if self.skip_role_execution {
+            return Ok(());
+        }
+
+        match action {
+            ValidatedRoleAction::CreateRole(options) => {
+                if self
+                    .roles
+                    .iter()
+                    .any(|role| role.label() == options.role.label())
+                {
+                    return Err(DatabaseError::query(format!(
+                        "The role {} already exists.",
+                        options.role.label()
+                    )));
+                }
+                let can_login = match self.engine {
+                    DatabaseEngine::Mysql => false,
+                    DatabaseEngine::Postgresql => options
+                        .changes
+                        .can_login
+                        .unwrap_or(options.kind == RoleKind::User),
+                };
+                self.roles.push(RoleSummary {
+                    name: options.role.name.clone(),
+                    host: options.role.host.clone(),
+                    kind: options.kind,
+                    can_login: MetadataValue::available(can_login),
+                    superuser: match self.engine {
+                        DatabaseEngine::Mysql => MetadataValue::Unavailable,
+                        DatabaseEngine::Postgresql => {
+                            MetadataValue::available(options.changes.superuser.unwrap_or(false))
+                        }
+                    },
+                    create_database: match self.engine {
+                        DatabaseEngine::Mysql => MetadataValue::Unavailable,
+                        DatabaseEngine::Postgresql => MetadataValue::available(
+                            options.changes.create_database.unwrap_or(false),
+                        ),
+                    },
+                    create_role: match self.engine {
+                        DatabaseEngine::Mysql => MetadataValue::Unavailable,
+                        DatabaseEngine::Postgresql => {
+                            MetadataValue::available(options.changes.create_role.unwrap_or(false))
+                        }
+                    },
+                    inherit: match self.engine {
+                        DatabaseEngine::Mysql => MetadataValue::Unavailable,
+                        DatabaseEngine::Postgresql => {
+                            MetadataValue::available(options.changes.inherit.unwrap_or(true))
+                        }
+                    },
+                });
+                self.role_grants.entry(options.role.label()).or_default();
+            }
+            ValidatedRoleAction::AlterRole { role, changes } => {
+                let Some(summary) = self
+                    .roles
+                    .iter_mut()
+                    .find(|summary| summary.label() == role.label())
+                else {
+                    return Err(DatabaseError::query(format!(
+                        "The role {} does not exist.",
+                        role.label()
+                    )));
+                };
+                if let Some(value) = changes.can_login {
+                    summary.can_login = MetadataValue::available(value);
+                }
+                if let Some(value) = changes.superuser {
+                    summary.superuser = MetadataValue::available(value);
+                }
+                if let Some(value) = changes.create_database {
+                    summary.create_database = MetadataValue::available(value);
+                }
+                if let Some(value) = changes.create_role {
+                    summary.create_role = MetadataValue::available(value);
+                }
+                if let Some(value) = changes.inherit {
+                    summary.inherit = MetadataValue::available(value);
+                }
+            }
+            ValidatedRoleAction::GrantPrivileges(change) => {
+                let data = self.role_grants.entry(change.grantee.label()).or_default();
+                for privilege in &change.privileges {
+                    let grant = PrivilegeGrant {
+                        privilege: privilege.as_sql().to_string(),
+                        target: change.target.clone(),
+                        grantable: change.grant_option,
+                    };
+                    if !data.direct.contains(&grant) {
+                        data.direct.push(grant);
+                    }
+                }
+            }
+            ValidatedRoleAction::RevokePrivileges(change) => {
+                let data = self.role_grants.entry(change.grantee.label()).or_default();
+                let mut next = Vec::new();
+                for grant in std::mem::take(&mut data.direct) {
+                    let matches = change
+                        .privileges
+                        .iter()
+                        .any(|privilege| privilege.as_sql() == grant.privilege)
+                        && grant.target == change.target;
+                    if !matches {
+                        next.push(grant);
+                    } else if change.grant_option && grant.grantable {
+                        let mut downgraded = grant;
+                        downgraded.grantable = false;
+                        next.push(downgraded);
+                    }
+                }
+                data.direct = next;
+            }
+            ValidatedRoleAction::GrantRole { role, member } => {
+                let data = self.role_grants.entry(member.label()).or_default();
+                if !data.member_of.contains(role) {
+                    data.member_of.push(role.clone());
+                }
+            }
+            ValidatedRoleAction::RevokeRole { role, member } => {
+                let data = self.role_grants.entry(member.label()).or_default();
+                data.member_of.retain(|entry| entry != role);
+            }
+        }
+        Ok(())
     }
 
     async fn preview_object_action(
@@ -3316,11 +3522,97 @@ struct FakeFixtures {
     trigger_statements: HashMap<String, String>,
     trigger_functions: HashMap<String, String>,
     sequence_details: HashMap<String, SequenceDetails>,
+    roles: Vec<RoleSummary>,
+    role_grants: HashMap<String, RoleGrantData>,
     columns: Vec<ColumnSummary>,
     indexes: Vec<IndexSummary>,
     constraints: Vec<ConstraintSummary>,
     dependencies: TableDependencies,
     detail_table: String,
+}
+
+fn identifier(value: &str) -> Identifier {
+    Identifier::new(value).expect("fixture identifier")
+}
+
+fn mysql_table_target(database: &str, table: &str) -> PrivilegeTarget {
+    PrivilegeTarget {
+        kind: crate::database::PrivilegeTargetKind::Table,
+        database: Some(identifier(database)),
+        schema: None,
+        object: Some(identifier(table)),
+    }
+}
+
+fn postgres_table_target(schema: &str, table: &str) -> PrivilegeTarget {
+    PrivilegeTarget {
+        kind: crate::database::PrivilegeTargetKind::Table,
+        database: None,
+        schema: Some(identifier(schema)),
+        object: Some(identifier(table)),
+    }
+}
+
+fn postgres_schema_target(schema: &str) -> PrivilegeTarget {
+    PrivilegeTarget {
+        kind: crate::database::PrivilegeTargetKind::Schema,
+        database: None,
+        schema: Some(identifier(schema)),
+        object: None,
+    }
+}
+
+fn postgres_database_target(database: &str) -> PrivilegeTarget {
+    PrivilegeTarget {
+        kind: crate::database::PrivilegeTargetKind::Database,
+        database: Some(identifier(database)),
+        schema: None,
+        object: None,
+    }
+}
+
+fn grant(privilege: &str, target: PrivilegeTarget, grantable: bool) -> PrivilegeGrant {
+    PrivilegeGrant {
+        privilege: privilege.to_string(),
+        target,
+        grantable,
+    }
+}
+
+struct FakeRoleFixture {
+    name: &'static str,
+    host: Option<&'static str>,
+    kind: RoleKind,
+    can_login: bool,
+    superuser: bool,
+    create_database: bool,
+    create_role: bool,
+    inherit: bool,
+}
+
+fn role_summary(fixture: FakeRoleFixture, engine: DatabaseEngine) -> RoleSummary {
+    RoleSummary {
+        name: fixture.name.to_string(),
+        host: fixture.host.map(str::to_string),
+        kind: fixture.kind,
+        can_login: MetadataValue::available(fixture.can_login),
+        superuser: match engine {
+            DatabaseEngine::Mysql => MetadataValue::Unavailable,
+            DatabaseEngine::Postgresql => MetadataValue::available(fixture.superuser),
+        },
+        create_database: match engine {
+            DatabaseEngine::Mysql => MetadataValue::Unavailable,
+            DatabaseEngine::Postgresql => MetadataValue::available(fixture.create_database),
+        },
+        create_role: match engine {
+            DatabaseEngine::Mysql => MetadataValue::Unavailable,
+            DatabaseEngine::Postgresql => MetadataValue::available(fixture.create_role),
+        },
+        inherit: match engine {
+            DatabaseEngine::Mysql => MetadataValue::Unavailable,
+            DatabaseEngine::Postgresql => MetadataValue::available(fixture.inherit),
+        },
+    }
 }
 
 fn mysql_fixtures() -> FakeFixtures {
@@ -3538,6 +3830,102 @@ fn mysql_fixtures() -> FakeFixtures {
             owned_sequences: MetadataValue::Unavailable,
             triggers: MetadataValue::available(Bounded::new(Vec::new(), 100)),
         },
+        roles: vec![
+            role_summary(
+                FakeRoleFixture {
+                    name: "app",
+                    host: Some("%"),
+                    kind: RoleKind::User,
+                    can_login: true,
+                    superuser: false,
+                    create_database: true,
+                    create_role: false,
+                    inherit: true,
+                },
+                DatabaseEngine::Mysql,
+            ),
+            role_summary(
+                FakeRoleFixture {
+                    name: "reporting",
+                    host: Some("%"),
+                    kind: RoleKind::User,
+                    can_login: true,
+                    superuser: false,
+                    create_database: false,
+                    create_role: false,
+                    inherit: true,
+                },
+                DatabaseEngine::Mysql,
+            ),
+            role_summary(
+                FakeRoleFixture {
+                    name: "reporting_reader",
+                    host: Some("%"),
+                    kind: RoleKind::Role,
+                    can_login: false,
+                    superuser: false,
+                    create_database: false,
+                    create_role: false,
+                    inherit: true,
+                },
+                DatabaseEngine::Mysql,
+            ),
+            role_summary(
+                FakeRoleFixture {
+                    name: "auditor",
+                    host: Some("%"),
+                    kind: RoleKind::Role,
+                    can_login: false,
+                    superuser: false,
+                    create_database: false,
+                    create_role: false,
+                    inherit: true,
+                },
+                DatabaseEngine::Mysql,
+            ),
+        ],
+        role_grants: HashMap::from([
+            (
+                "app@%".to_string(),
+                RoleGrantData {
+                    direct: vec![grant(
+                        "SELECT",
+                        PrivilegeTarget {
+                            kind: crate::database::PrivilegeTargetKind::Global,
+                            database: None,
+                            schema: None,
+                            object: None,
+                        },
+                        false,
+                    )],
+                    member_of: Vec::new(),
+                },
+            ),
+            (
+                "reporting@%".to_string(),
+                RoleGrantData {
+                    direct: vec![grant("SELECT", mysql_table_target("app", "orders"), false)],
+                    member_of: vec![RoleRef {
+                        name: "reporting_reader".to_string(),
+                        host: Some("%".to_string()),
+                    }],
+                },
+            ),
+            (
+                "reporting_reader@%".to_string(),
+                RoleGrantData {
+                    direct: vec![grant("SELECT", mysql_table_target("app", "users"), false)],
+                    member_of: Vec::new(),
+                },
+            ),
+            (
+                "auditor@%".to_string(),
+                RoleGrantData {
+                    direct: vec![grant("SELECT", mysql_table_target("app", "orders"), true)],
+                    member_of: Vec::new(),
+                },
+            ),
+        ]),
         detail_table: "users".to_string(),
     }
 }
@@ -3809,6 +4197,109 @@ fn postgres_fixtures() -> FakeFixtures {
             )),
             triggers: MetadataValue::available(Bounded::new(Vec::new(), 100)),
         },
+        roles: vec![
+            role_summary(
+                FakeRoleFixture {
+                    name: "app",
+                    host: None,
+                    kind: RoleKind::User,
+                    can_login: true,
+                    superuser: false,
+                    create_database: true,
+                    create_role: false,
+                    inherit: true,
+                },
+                DatabaseEngine::Postgresql,
+            ),
+            role_summary(
+                FakeRoleFixture {
+                    name: "reporting",
+                    host: None,
+                    kind: RoleKind::User,
+                    can_login: true,
+                    superuser: false,
+                    create_database: false,
+                    create_role: false,
+                    inherit: true,
+                },
+                DatabaseEngine::Postgresql,
+            ),
+            role_summary(
+                FakeRoleFixture {
+                    name: "reporting_reader",
+                    host: None,
+                    kind: RoleKind::Role,
+                    can_login: false,
+                    superuser: false,
+                    create_database: false,
+                    create_role: false,
+                    inherit: true,
+                },
+                DatabaseEngine::Postgresql,
+            ),
+            role_summary(
+                FakeRoleFixture {
+                    name: "auditor",
+                    host: None,
+                    kind: RoleKind::Role,
+                    can_login: false,
+                    superuser: false,
+                    create_database: false,
+                    create_role: true,
+                    inherit: true,
+                },
+                DatabaseEngine::Postgresql,
+            ),
+        ],
+        role_grants: HashMap::from([
+            (
+                "app".to_string(),
+                RoleGrantData {
+                    direct: vec![
+                        grant("CONNECT", postgres_database_target("app"), false),
+                        grant("USAGE", postgres_schema_target("public"), false),
+                        grant("SELECT", postgres_table_target("public", "orders"), false),
+                    ],
+                    member_of: Vec::new(),
+                },
+            ),
+            (
+                "reporting".to_string(),
+                RoleGrantData {
+                    direct: vec![grant(
+                        "SELECT",
+                        postgres_table_target("public", "orders"),
+                        false,
+                    )],
+                    member_of: vec![RoleRef {
+                        name: "reporting_reader".to_string(),
+                        host: None,
+                    }],
+                },
+            ),
+            (
+                "reporting_reader".to_string(),
+                RoleGrantData {
+                    direct: vec![grant(
+                        "SELECT",
+                        postgres_table_target("public", "users"),
+                        false,
+                    )],
+                    member_of: Vec::new(),
+                },
+            ),
+            (
+                "auditor".to_string(),
+                RoleGrantData {
+                    direct: vec![grant(
+                        "SELECT",
+                        postgres_table_target("public", "orders"),
+                        true,
+                    )],
+                    member_of: Vec::new(),
+                },
+            ),
+        ]),
         detail_table: "users".to_string(),
     }
 }

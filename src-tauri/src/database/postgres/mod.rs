@@ -20,6 +20,7 @@ pub mod ddl;
 pub mod dump;
 pub mod objects;
 pub mod queries;
+pub mod roles;
 pub mod rows;
 pub mod sql;
 

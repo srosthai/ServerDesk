@@ -19,6 +19,7 @@ pub mod objects;
 pub mod pagination;
 pub mod postgres;
 pub mod queries;
+pub mod roles;
 pub mod row_service;
 pub mod row_writes;
 pub mod rows;
@@ -95,6 +96,15 @@ pub use queries::{
     QueryControl, QueryExecutionResult, QueryGuard, QueryRegistry, QueryRequest, QueryResultSet,
     SqlAnalysis, SqlWarning, SqlWarningCode, analyze_sql, execute_query_with_adapter,
     query_timeout, validate_query_request_id,
+};
+pub use roles::{
+    DatabaseRoleService, EffectivePrivilege, MAX_PRIVILEGES_PER_CHANGE, MAX_ROLE_GRAPH,
+    MAX_ROLE_HOST_LENGTH, MAX_ROLE_NAME_LENGTH, Privilege, PrivilegeDiff, PrivilegeGrant,
+    PrivilegeTarget, PrivilegeTargetKind, PrivilegeTargetRequest, RoleActionKind,
+    RoleActionRequest, RoleActionResult, RoleAttributeChange, RoleDdlPlan, RoleDdlPreview,
+    RoleGrantData, RoleKind, RolePrivilegeSnapshot, RoleRef, RoleRefRequest, RoleSummary,
+    ValidatedCreateRole, ValidatedPrivilegeChange, ValidatedRoleAction, execute_role_with_adapter,
+    inspect_role_with_adapter, preview_role_with_adapter,
 };
 pub use row_service::DatabaseRowService;
 pub use row_writes::{

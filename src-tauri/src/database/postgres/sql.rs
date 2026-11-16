@@ -585,9 +585,75 @@ WHERE NOT tr.tgisinternal
 ORDER BY tr.tgname
 LIMIT $3"#;
 
+/// Role metadata from `pg_roles`. The password column in `pg_authid` is never
+/// selected, so no password hash can reach the command boundary.
 pub const LIST_ROLES: &str = "SELECT rolname AS name, rolsuper AS superuser, \
-    rolcanlogin AS can_login, rolcreatedb AS create_database, rolcreaterole AS create_role \
-    FROM pg_catalog.pg_roles ORDER BY rolname";
+    rolcanlogin AS can_login, rolcreatedb AS create_database, \
+    rolcreaterole AS create_role, rolinherit AS inherit \
+    FROM pg_catalog.pg_roles ORDER BY rolname LIMIT $1 OFFSET $2";
+
+pub const ROLE_SUMMARY: &str = "SELECT rolname AS name, rolsuper AS superuser, \
+    rolcanlogin AS can_login, rolcreatedb AS create_database, \
+    rolcreaterole AS create_role, rolinherit AS inherit \
+    FROM pg_catalog.pg_roles WHERE rolname = $1 LIMIT 1";
+
+/// Table and view privileges granted directly to one role. Membership-based
+/// effective privileges are expanded by the shared role service.
+pub const ROLE_TABLE_GRANTS: &str = r#"SELECT
+    table_schema AS schema_name,
+    table_name AS object_name,
+    privilege_type AS privilege,
+    is_grantable = 'YES' AS grantable
+FROM information_schema.role_table_grants
+WHERE grantee = $1
+ORDER BY table_schema, table_name, privilege_type"#;
+
+/// Schema USAGE and CREATE privileges from the schema ACL.
+pub const ROLE_SCHEMA_GRANTS: &str = r#"SELECT
+    n.nspname AS schema_name,
+    a.privilege_type AS privilege,
+    a.is_grantable AS grantable
+FROM pg_catalog.pg_namespace n
+CROSS JOIN LATERAL pg_catalog.aclexplode(
+    COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))
+) a
+JOIN pg_catalog.pg_roles r ON r.oid = a.grantee
+WHERE r.rolname = $1
+ORDER BY n.nspname, a.privilege_type"#;
+
+/// Sequence USAGE, SELECT, and UPDATE privileges from the sequence ACL.
+pub const ROLE_SEQUENCE_GRANTS: &str = r#"SELECT
+    n.nspname AS schema_name,
+    c.relname AS object_name,
+    a.privilege_type AS privilege,
+    a.is_grantable AS grantable
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+CROSS JOIN LATERAL pg_catalog.aclexplode(
+    COALESCE(c.relacl, pg_catalog.acldefault('S', c.relowner))
+) a
+JOIN pg_catalog.pg_roles r ON r.oid = a.grantee
+WHERE c.relkind = 'S' AND r.rolname = $1
+ORDER BY n.nspname, c.relname, a.privilege_type"#;
+
+/// Database CONNECT, CREATE, and TEMPORARY privileges from the database ACL.
+pub const ROLE_DATABASE_GRANTS: &str = r#"SELECT
+    d.datname AS database_name,
+    a.privilege_type AS privilege,
+    a.is_grantable AS grantable
+FROM pg_catalog.pg_database d
+CROSS JOIN LATERAL pg_catalog.aclexplode(
+    COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba))
+) a
+JOIN pg_catalog.pg_roles r ON r.oid = a.grantee
+WHERE r.rolname = $1
+ORDER BY d.datname, a.privilege_type"#;
+
+pub const ROLE_MEMBERSHIPS: &str = "SELECT r.rolname AS role_name \
+    FROM pg_catalog.pg_auth_members m \
+    JOIN pg_catalog.pg_roles r ON r.oid = m.roleid \
+    JOIN pg_catalog.pg_roles member ON member.oid = m.member \
+    WHERE member.rolname = $1 ORDER BY r.rolname";
 
 pub const LIST_SESSIONS: &str = "SELECT pid AS session_id, usename AS user, \
     client_addr::text AS host, datname AS database_name, state AS state, \
