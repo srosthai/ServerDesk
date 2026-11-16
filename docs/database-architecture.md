@@ -488,24 +488,55 @@ confirmation argument. The structure workspace in
 `DatabaseStructureDialogs.tsx` consumes these helpers; it generates no SQL of
 its own.
 
+## Object command contract
+
+`src-tauri/src/commands/database/objects.rs` owns view, routine, trigger,
+sequence, and materialized-view management:
+
+| Command                          | Purpose                                                     |
+| -------------------------------- | ----------------------------------------------------------- |
+| `inspect_database_object`        | Read one bounded definition and typed trigger/sequence data |
+| `preview_database_object_action` | Validate and generate engine-specific DDL, no execution     |
+| `run_database_object_action`     | Execute one action, re-read metadata, and verify it         |
+
+`src-tauri/src/database/objects.rs` validates untrusted requests into
+`ValidatedObjectAction`. View queries must be one SELECT/WITH/VALUES/TABLE
+statement; routine and trigger bodies are bounded to 32 KiB and definitions
+returned to React to 64 KiB. Identifiers use the shared `Identifier` rules, and
+trigger events/timing, routine kind, sequence bounds, and materialized-view
+kind are typed. `mysql::objects` and `postgres::objects` are pure planners.
+Every execution regenerates the same preview, rejects an unconfirmed drop or
+replace, rejects read-only profiles, and re-reads the object before reporting
+success. Definitions never enter operation history; audit rows contain only the
+action, engine, object name, connection profile, and verification outcome.
+
+The explorer lists routines and triggers where the engine exposes them, and
+views include PostgreSQL materialized views with their kind. The object panel
+and `src/services/databaseObjects.ts` consume only typed definitions and
+previews. MySQL rejects sequences and materialized views with a capability
+error; PostgreSQL trigger editing and MySQL routine/trigger editing use an
+explicit drop-and-create preview with confirmation.
+
 ## Discovery command contract
 
 `src-tauri/src/commands/database/discovery.rs` owns metadata browsing:
 
-| Command                           | Purpose                                           |
-| --------------------------------- | ------------------------------------------------- |
-| `list_database_databases`         | Bounded database list                             |
-| `list_database_schemas`           | Bounded schema list                               |
-| `list_database_tables`            | Bounded base-table list for one scope             |
-| `list_database_views`             | Bounded view/materialized-view list for one scope |
-| `list_database_sequences`         | Bounded sequence list; MySQL returns `capability` |
-| `list_database_columns`           | Bounded column metadata for one table             |
-| `list_database_indexes`           | Bounded index metadata for one table              |
-| `list_database_constraints`       | Bounded constraint metadata for one table         |
-| `get_database_table_dependencies` | Bounded dependency inventory for one table        |
-| `get_database_object_counts`      | One-row table/view/sequence counts for one scope  |
-| `load_database_explorer_node`     | Lazy load one typed explorer node                 |
-| `refresh_database_explorer_node`  | Refresh exactly that node and no siblings         |
+| Command                           | Purpose                                            |
+| --------------------------------- | -------------------------------------------------- |
+| `list_database_databases`         | Bounded database list                              |
+| `list_database_schemas`           | Bounded schema list                                |
+| `list_database_tables`            | Bounded base-table list for one scope              |
+| `list_database_views`             | Bounded view/materialized-view list for one scope  |
+| `list_database_sequences`         | Bounded sequence list; MySQL returns `capability`  |
+| `list_database_routines`          | Bounded function/procedure list for one scope      |
+| `list_database_triggers`          | Bounded trigger list for one scope                 |
+| `list_database_columns`           | Bounded column metadata for one table              |
+| `list_database_indexes`           | Bounded index metadata for one table               |
+| `list_database_constraints`       | Bounded constraint metadata for one table          |
+| `get_database_table_dependencies` | Bounded dependency inventory for one table         |
+| `get_database_object_counts`      | One-row table/view/sequence/routine/trigger counts |
+| `load_database_explorer_node`     | Lazy load one typed explorer node                  |
+| `refresh_database_explorer_node`  | Refresh exactly that node and no siblings          |
 
 Explorer requests are tagged by kind:
 
@@ -582,9 +613,10 @@ tree.
 - the selected `DatabaseEngine`;
 - an optional parsed `DatabaseVersion`;
 - `CapabilityFlags` for schemas, sequences, materialized views, routines,
-  triggers, roles, sessions, transactions, savepoints, cancellation, explain,
-  check constraints, generated columns, identity columns, column reordering,
-  table duplicate, database rename, index rename, and query timeouts;
+  routine editing, triggers, trigger editing, view management, roles, sessions,
+  transactions, savepoints, cancellation, explain, check constraints, generated
+  columns, identity columns, column reordering, table duplicate, database
+  rename, index rename, and query timeouts;
 - the `DatabaseAction` list derived from those flags.
 
 `CapabilitySnapshot` is the only document sent to React. It contains the
@@ -642,9 +674,19 @@ the engine's baseline and every newer supported version.
 | `drop_index`                | Both                               | Both                            |
 | `create_check_constraint`   | 8.0.16+                            | Both                            |
 | `create_view`               | Both                               | Both                            |
+| `replace_view`              | Both                               | Both                            |
+| `drop_view`                 | Both                               | Both                            |
 | `create_routine`            | Both                               | Both                            |
+| `edit_routine`              | Both (drop-and-create preview)     | Both                            |
+| `drop_routine`              | Both                               | Both                            |
 | `create_trigger`            | Both                               | Both                            |
+| `edit_trigger`              | Both (drop-and-create preview)     | Both (drop-and-create preview)  |
+| `drop_trigger`              | Both                               | Both                            |
+| `create_sequence`           | Not supported                      | Both                            |
+| `alter_sequence`            | Not supported                      | Both                            |
+| `drop_sequence`             | Not supported                      | Both                            |
 | `refresh_materialized_view` | Not supported                      | 9.3+                            |
+| `drop_materialized_view`    | Not supported                      | 9.3+                            |
 | `manage_roles`              | 8.0+                               | Both                            |
 | `kill_session`              | Both                               | 9.2+                            |
 | `cancel_query`              | Both                               | Both                            |

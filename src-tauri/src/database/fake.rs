@@ -24,6 +24,11 @@ use super::{
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
     mysql,
+    objects::{
+        DatabaseObjectKind, ObjectDdlPreview, ObjectDefinition, ObjectRef, RoutineKind,
+        RoutineSummary, SequenceDetails, TriggerDetails, TriggerEvent, TriggerSummary,
+        TriggerTiming, ValidatedObjectAction, ValidatedTriggerBody,
+    },
     pagination::{Bounded, Page, PageRequest},
     postgres,
     queries::{
@@ -127,6 +132,16 @@ pub struct FakeDatabaseAdapter {
     tables: Vec<TableSummary>,
     views: Vec<ViewSummary>,
     sequences: Vec<SequenceSummary>,
+    routines: Vec<RoutineSummary>,
+    triggers: Vec<TriggerSummary>,
+    view_queries: HashMap<String, String>,
+    routine_bodies: HashMap<String, String>,
+    trigger_statements: HashMap<String, String>,
+    trigger_functions: HashMap<String, String>,
+    sequence_details: HashMap<String, SequenceDetails>,
+    object_execution_error: Option<DatabaseError>,
+    skip_object_execution: bool,
+    object_execution_count: AtomicUsize,
     columns: Vec<ColumnSummary>,
     created_tables: HashMap<String, Vec<ColumnSummary>>,
     indexes: HashMap<String, Vec<IndexSummary>>,
@@ -188,6 +203,16 @@ impl FakeDatabaseAdapter {
             tables: fixtures.tables,
             views: fixtures.views,
             sequences: fixtures.sequences,
+            routines: fixtures.routines,
+            triggers: fixtures.triggers,
+            view_queries: fixtures.view_queries,
+            routine_bodies: fixtures.routine_bodies,
+            trigger_statements: fixtures.trigger_statements,
+            trigger_functions: fixtures.trigger_functions,
+            sequence_details: fixtures.sequence_details,
+            object_execution_error: None,
+            skip_object_execution: false,
+            object_execution_count: AtomicUsize::new(0),
             columns: fixtures.columns,
             created_tables: HashMap::from([(detail_table.clone(), detail_columns)]),
             indexes: HashMap::from([(detail_table.clone(), detail_indexes)]),
@@ -214,6 +239,23 @@ impl FakeDatabaseAdapter {
     pub fn with_query_error(mut self, error: DatabaseError) -> Self {
         self.query_error = Some(error);
         self
+    }
+
+    /// Makes the next object action fail after its preview succeeds.
+    pub fn with_object_execution_error(mut self, error: DatabaseError) -> Self {
+        self.object_execution_error = Some(error);
+        self
+    }
+
+    /// Simulates a server that accepts the DDL but does not apply it, so
+    /// metadata verification reports an unverified outcome.
+    pub fn with_skipped_object_execution(mut self) -> Self {
+        self.skip_object_execution = true;
+        self
+    }
+
+    pub fn object_execution_count(&self) -> usize {
+        self.object_execution_count.load(Ordering::SeqCst)
     }
 
     pub fn query_execution_count(&self) -> usize {
@@ -321,6 +363,37 @@ impl FakeDatabaseAdapter {
         table.name == reference.name.as_str()
             && database.is_none_or(|value| table.database.as_deref() == Some(value))
             && schema.is_none_or(|value| table.schema.as_deref() == Some(value))
+    }
+
+    fn object_key(object: &ObjectRef) -> String {
+        format!(
+            "{}::{}::{}::{}",
+            object.kind.as_str(),
+            object
+                .database
+                .as_ref()
+                .map(Identifier::as_str)
+                .unwrap_or(""),
+            object.schema.as_ref().map(Identifier::as_str).unwrap_or(""),
+            object.name.as_str()
+        )
+    }
+
+    fn object_matches(
+        object: &ObjectRef,
+        database: Option<&str>,
+        schema: Option<&str>,
+        name: &str,
+    ) -> bool {
+        name == object.name.as_str()
+            && object
+                .database
+                .as_ref()
+                .is_none_or(|value| database == Some(value.as_str()))
+            && object
+                .schema
+                .as_ref()
+                .is_none_or(|value| schema == Some(value.as_str()))
     }
 
     fn structure_scope(&self, table: &TableRef) -> (String, String) {
@@ -1078,6 +1151,676 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
         Ok(Self::paginate(&sequences, page))
     }
 
+    async fn list_routines(
+        &self,
+        scope: &MetadataScope,
+        page: PageRequest,
+    ) -> Result<Page<RoutineSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseRoutines)?;
+        self.require_connection()?;
+        let database = scope.database.as_ref().map(|value| value.as_str());
+        let schema = scope.schema.as_ref().map(|value| value.as_str());
+        let routines = self
+            .routines
+            .iter()
+            .filter(|routine| {
+                database.is_none_or(|value| routine.database.as_deref() == Some(value))
+                    && schema.is_none_or(|value| routine.schema.as_deref() == Some(value))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(Self::paginate(&routines, page))
+    }
+
+    async fn list_triggers(
+        &self,
+        scope: &MetadataScope,
+        page: PageRequest,
+    ) -> Result<Page<TriggerSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseTriggers)?;
+        self.require_connection()?;
+        let database = scope.database.as_ref().map(|value| value.as_str());
+        let schema = scope.schema.as_ref().map(|value| value.as_str());
+        let triggers = self
+            .triggers
+            .iter()
+            .filter(|trigger| {
+                database.is_none_or(|value| trigger.database.as_deref() == Some(value))
+                    && schema.is_none_or(|value| trigger.schema.as_deref() == Some(value))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(Self::paginate(&triggers, page))
+    }
+
+    async fn object_definition(
+        &self,
+        object: &ObjectRef,
+    ) -> Result<ObjectDefinition, DatabaseError> {
+        self.require_connection()?;
+        match object.kind {
+            DatabaseObjectKind::View | DatabaseObjectKind::MaterializedView => {
+                self.require_capability(DatabaseAction::BrowseViews)?;
+                if object.kind == DatabaseObjectKind::MaterializedView {
+                    self.require_capability(DatabaseAction::BrowseMaterializedViews)?;
+                }
+                let view = self
+                    .views
+                    .iter()
+                    .find(|view| {
+                        Self::object_matches(
+                            object,
+                            view.database.as_deref(),
+                            view.schema.as_deref(),
+                            &view.name,
+                        )
+                    })
+                    .ok_or_else(|| DatabaseError::query("The view does not exist."))?;
+                if object.kind == DatabaseObjectKind::MaterializedView
+                    && view.kind != ViewKind::MaterializedView
+                {
+                    return Err(DatabaseError::validation(
+                        "The selected object is a view, not a materialized view.",
+                    ));
+                }
+                if object.kind == DatabaseObjectKind::View
+                    && view.kind == ViewKind::MaterializedView
+                {
+                    return Err(DatabaseError::validation(
+                        "The selected object is a materialized view, not a view.",
+                    ));
+                }
+                let key = Self::object_key(object);
+                let query = self
+                    .view_queries
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| format!("SELECT * FROM {}", object.qualified_table()));
+                let definition = format!(
+                    "CREATE {}VIEW {}.{} AS\n{}",
+                    if view.kind == ViewKind::MaterializedView {
+                        "MATERIALIZED "
+                    } else {
+                        ""
+                    },
+                    object
+                        .schema
+                        .as_ref()
+                        .map(Identifier::as_str)
+                        .unwrap_or("public"),
+                    object.name.as_str(),
+                    query
+                );
+                Ok(ObjectDefinition {
+                    kind: if view.kind == ViewKind::MaterializedView {
+                        DatabaseObjectKind::MaterializedView
+                    } else {
+                        DatabaseObjectKind::View
+                    },
+                    database: view.database.clone(),
+                    schema: view.schema.clone(),
+                    name: view.name.clone(),
+                    owner: view.metadata.owner.clone(),
+                    language: MetadataValue::Unavailable,
+                    routine_kind: MetadataValue::Unavailable,
+                    arguments: MetadataValue::Unavailable,
+                    return_type: MetadataValue::Unavailable,
+                    view_query: MetadataValue::available(query),
+                    routine_body: MetadataValue::Unavailable,
+                    definition: MetadataValue::available(definition),
+                    trigger: None,
+                    sequence: None,
+                    truncated: false,
+                })
+            }
+            DatabaseObjectKind::Routine => {
+                self.require_capability(DatabaseAction::BrowseRoutines)?;
+                let routine = self
+                    .routines
+                    .iter()
+                    .find(|routine| {
+                        Self::object_matches(
+                            object,
+                            routine.database.as_deref(),
+                            routine.schema.as_deref(),
+                            &routine.name,
+                        ) && object.routine_kind.is_none_or(|kind| kind == routine.kind)
+                    })
+                    .ok_or_else(|| DatabaseError::query("The routine does not exist."))?;
+                let key = Self::object_key(object);
+                let body = self
+                    .routine_bodies
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| "BEGIN\n  -- fixture body\nEND".to_string());
+                let definition = format!(
+                    "CREATE {} {}({})\n{}",
+                    match routine.kind {
+                        RoutineKind::Function => "FUNCTION",
+                        RoutineKind::Procedure => "PROCEDURE",
+                    },
+                    routine.name,
+                    routine.arguments.value().cloned().unwrap_or_default(),
+                    body
+                );
+                Ok(ObjectDefinition {
+                    kind: DatabaseObjectKind::Routine,
+                    database: routine.database.clone(),
+                    schema: routine.schema.clone(),
+                    name: routine.name.clone(),
+                    owner: routine.owner.clone(),
+                    language: routine.language.clone(),
+                    routine_kind: MetadataValue::available(routine.kind),
+                    arguments: routine.arguments.clone(),
+                    return_type: routine.return_type.clone(),
+                    view_query: MetadataValue::Unavailable,
+                    routine_body: MetadataValue::available(body.clone()),
+                    definition: MetadataValue::available(definition),
+                    trigger: None,
+                    sequence: None,
+                    truncated: false,
+                })
+            }
+            DatabaseObjectKind::Trigger => {
+                self.require_capability(DatabaseAction::BrowseTriggers)?;
+                let trigger = self
+                    .triggers
+                    .iter()
+                    .find(|trigger| {
+                        Self::object_matches(
+                            object,
+                            trigger.database.as_deref(),
+                            trigger.schema.as_deref(),
+                            &trigger.name,
+                        ) && object
+                            .table
+                            .as_ref()
+                            .is_none_or(|table| table.as_str() == trigger.table)
+                    })
+                    .ok_or_else(|| DatabaseError::query("The trigger does not exist."))?;
+                let key = Self::object_key(object);
+                let statement = self
+                    .trigger_statements
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| "BEGIN\n  -- fixture trigger body\nEND".to_string());
+                let function = self.trigger_functions.get(&key).cloned();
+                let definition = function.clone().unwrap_or_else(|| {
+                    format!(
+                        "CREATE TRIGGER {} {} {} ON {}.{} FOR EACH ROW\n{}",
+                        trigger.name,
+                        trigger.timing.as_sql(),
+                        trigger
+                            .events
+                            .iter()
+                            .map(|event| event.as_sql())
+                            .collect::<Vec<_>>()
+                            .join(" OR "),
+                        trigger.schema.as_deref().unwrap_or("public"),
+                        trigger.table,
+                        statement
+                    )
+                });
+                Ok(ObjectDefinition {
+                    kind: DatabaseObjectKind::Trigger,
+                    database: trigger.database.clone(),
+                    schema: trigger.schema.clone(),
+                    name: trigger.name.clone(),
+                    owner: trigger.owner.clone(),
+                    language: MetadataValue::Unavailable,
+                    routine_kind: MetadataValue::Unavailable,
+                    arguments: MetadataValue::Unavailable,
+                    return_type: MetadataValue::Unavailable,
+                    view_query: MetadataValue::Unavailable,
+                    routine_body: MetadataValue::Unavailable,
+                    definition: MetadataValue::available(definition),
+                    trigger: Some(TriggerDetails {
+                        table: trigger.table.clone(),
+                        timing: trigger.timing,
+                        events: trigger.events.clone(),
+                        statement: MetadataValue::available(statement),
+                        function_name: function
+                            .as_ref()
+                            .and_then(|definition| {
+                                definition
+                                    .split("FUNCTION ")
+                                    .nth(1)
+                                    .and_then(|rest| rest.split('(').next())
+                                    .map(|name| {
+                                        MetadataValue::available(
+                                            name.rsplit('.').next().unwrap_or(name).to_string(),
+                                        )
+                                    })
+                            })
+                            .unwrap_or(MetadataValue::Unavailable),
+                        function: function.into(),
+                    }),
+                    sequence: None,
+                    truncated: false,
+                })
+            }
+            DatabaseObjectKind::Sequence => {
+                self.require_capability(DatabaseAction::BrowseSequences)?;
+                let sequence = self
+                    .sequences
+                    .iter()
+                    .find(|sequence| {
+                        Self::object_matches(
+                            object,
+                            sequence.database.as_deref(),
+                            sequence.schema.as_deref(),
+                            &sequence.name,
+                        )
+                    })
+                    .ok_or_else(|| DatabaseError::query("The sequence does not exist."))?;
+                let details = self
+                    .sequence_details
+                    .get(&Self::object_key(object))
+                    .cloned()
+                    .unwrap_or_else(|| SequenceDetails {
+                        data_type: sequence.data_type.clone(),
+                        start_value: sequence.start_value.clone(),
+                        increment: sequence.increment.clone(),
+                        minimum: MetadataValue::Unavailable,
+                        maximum: MetadataValue::Unavailable,
+                        current_value: MetadataValue::available("1".to_string()),
+                        cache: MetadataValue::Unavailable,
+                        cycle: MetadataValue::available(false),
+                    });
+                let definition = format!(
+                    "CREATE SEQUENCE {}.{} AS {} INCREMENT BY {}",
+                    sequence.schema.as_deref().unwrap_or("public"),
+                    sequence.name,
+                    sequence
+                        .data_type
+                        .value()
+                        .cloned()
+                        .unwrap_or_else(|| "bigint".to_string()),
+                    sequence
+                        .increment
+                        .value()
+                        .cloned()
+                        .unwrap_or_else(|| "1".to_string())
+                );
+                Ok(ObjectDefinition {
+                    kind: DatabaseObjectKind::Sequence,
+                    database: sequence.database.clone(),
+                    schema: sequence.schema.clone(),
+                    name: sequence.name.clone(),
+                    owner: sequence.metadata.owner.clone(),
+                    language: MetadataValue::Unavailable,
+                    routine_kind: MetadataValue::Unavailable,
+                    arguments: MetadataValue::Unavailable,
+                    return_type: MetadataValue::Unavailable,
+                    view_query: MetadataValue::Unavailable,
+                    routine_body: MetadataValue::Unavailable,
+                    definition: MetadataValue::available(definition),
+                    trigger: None,
+                    sequence: Some(details),
+                    truncated: false,
+                })
+            }
+        }
+    }
+
+    async fn preview_object_action(
+        &self,
+        action: &ValidatedObjectAction,
+    ) -> Result<ObjectDdlPreview, DatabaseError> {
+        self.require_connection()?;
+        action.ensure_supported(&self.capabilities)?;
+        match self.engine {
+            DatabaseEngine::Mysql => mysql::objects::preview(action),
+            DatabaseEngine::Postgresql => postgres::objects::preview(action),
+        }
+    }
+
+    async fn execute_object_action(
+        &mut self,
+        action: &ValidatedObjectAction,
+    ) -> Result<(), DatabaseError> {
+        self.require_connection()?;
+        self.preview_object_action(action).await?;
+        self.object_execution_count.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = self.object_execution_error.take() {
+            return Err(error);
+        }
+        if self.skip_object_execution {
+            return Ok(());
+        }
+
+        match action {
+            ValidatedObjectAction::CreateView {
+                object,
+                query,
+                or_replace,
+            } => {
+                let key = Self::object_key(object);
+                if !*or_replace
+                    && self.views.iter().any(|view| {
+                        Self::object_matches(
+                            object,
+                            view.database.as_deref(),
+                            view.schema.as_deref(),
+                            &view.name,
+                        )
+                    })
+                {
+                    return Err(DatabaseError::query("The view already exists."));
+                }
+                self.views.retain(|view| {
+                    !Self::object_matches(
+                        object,
+                        view.database.as_deref(),
+                        view.schema.as_deref(),
+                        &view.name,
+                    )
+                });
+                self.views.push(ViewSummary {
+                    database: object.database.as_ref().map(ToString::to_string),
+                    schema: object.schema.as_ref().map(ToString::to_string),
+                    name: object.name.as_str().to_string(),
+                    kind: ViewKind::View,
+                    metadata: ObjectMetadata {
+                        owner: MetadataValue::available("app".to_string()),
+                        ..ObjectMetadata::default()
+                    },
+                });
+                self.view_queries.insert(key, query.clone());
+            }
+            ValidatedObjectAction::DropView { object } => {
+                self.views.retain(|view| {
+                    !Self::object_matches(
+                        object,
+                        view.database.as_deref(),
+                        view.schema.as_deref(),
+                        &view.name,
+                    )
+                });
+                self.view_queries.remove(&Self::object_key(object));
+            }
+            ValidatedObjectAction::CreateRoutine {
+                object,
+                routine_kind,
+                arguments,
+                return_type,
+                language,
+                body,
+                or_replace,
+            } => {
+                if !*or_replace
+                    && self.routines.iter().any(|routine| {
+                        Self::object_matches(
+                            object,
+                            routine.database.as_deref(),
+                            routine.schema.as_deref(),
+                            &routine.name,
+                        ) && routine.kind == *routine_kind
+                    })
+                {
+                    return Err(DatabaseError::query("The routine already exists."));
+                }
+                self.routines.retain(|routine| {
+                    !(Self::object_matches(
+                        object,
+                        routine.database.as_deref(),
+                        routine.schema.as_deref(),
+                        &routine.name,
+                    ) && routine.kind == *routine_kind)
+                });
+                self.routines.push(RoutineSummary {
+                    database: object.database.as_ref().map(ToString::to_string),
+                    schema: object.schema.as_ref().map(ToString::to_string),
+                    name: object.name.as_str().to_string(),
+                    kind: *routine_kind,
+                    language: language
+                        .as_ref()
+                        .map(|value| MetadataValue::available(value.as_str().to_string()))
+                        .unwrap_or(MetadataValue::Unavailable),
+                    return_type: return_type
+                        .clone()
+                        .map_or(MetadataValue::Unavailable, MetadataValue::available),
+                    arguments: arguments
+                        .clone()
+                        .map_or(MetadataValue::Unavailable, MetadataValue::available),
+                    owner: MetadataValue::available("app".to_string()),
+                });
+                self.routine_bodies
+                    .insert(Self::object_key(object), body.clone());
+            }
+            ValidatedObjectAction::DropRoutine {
+                object,
+                routine_kind,
+                ..
+            } => {
+                self.routines.retain(|routine| {
+                    !(Self::object_matches(
+                        object,
+                        routine.database.as_deref(),
+                        routine.schema.as_deref(),
+                        &routine.name,
+                    ) && routine.kind == *routine_kind)
+                });
+                self.routine_bodies.remove(&Self::object_key(object));
+            }
+            ValidatedObjectAction::CreateTrigger {
+                object,
+                table,
+                timing,
+                events,
+                body,
+                or_replace,
+            } => {
+                if !*or_replace
+                    && self.triggers.iter().any(|trigger| {
+                        Self::object_matches(
+                            object,
+                            trigger.database.as_deref(),
+                            trigger.schema.as_deref(),
+                            &trigger.name,
+                        ) && trigger.table == table.as_str()
+                    })
+                {
+                    return Err(DatabaseError::query("The trigger already exists."));
+                }
+                self.triggers.retain(|trigger| {
+                    !(Self::object_matches(
+                        object,
+                        trigger.database.as_deref(),
+                        trigger.schema.as_deref(),
+                        &trigger.name,
+                    ) && trigger.table == table.as_str())
+                });
+                self.triggers.push(TriggerSummary {
+                    database: object.database.as_ref().map(ToString::to_string),
+                    schema: object.schema.as_ref().map(ToString::to_string),
+                    name: object.name.as_str().to_string(),
+                    table: table.as_str().to_string(),
+                    timing: *timing,
+                    events: events.clone(),
+                    owner: MetadataValue::available("app".to_string()),
+                });
+                let key = Self::object_key(object);
+                match body {
+                    ValidatedTriggerBody::Statement(statement) => {
+                        self.trigger_statements.insert(key, statement.clone());
+                    }
+                    ValidatedTriggerBody::Function { name, .. } => {
+                        self.trigger_functions.insert(
+                            key,
+                            format!(
+                                "CREATE FUNCTION {name}() RETURNS trigger AS 'BEGIN RETURN NEW; END' \
+                                 LANGUAGE plpgsql"
+                            ),
+                        );
+                    }
+                }
+            }
+            ValidatedObjectAction::DropTrigger { object, .. } => {
+                self.triggers.retain(|trigger| {
+                    !Self::object_matches(
+                        object,
+                        trigger.database.as_deref(),
+                        trigger.schema.as_deref(),
+                        &trigger.name,
+                    )
+                });
+                let key = Self::object_key(object);
+                self.trigger_statements.remove(&key);
+                self.trigger_functions.remove(&key);
+            }
+            ValidatedObjectAction::CreateSequence {
+                object,
+                data_type,
+                start,
+                increment,
+                minimum,
+                maximum,
+                cache,
+                cycle,
+            } => {
+                let key = Self::object_key(object);
+                self.sequences.retain(|sequence| {
+                    !Self::object_matches(
+                        object,
+                        sequence.database.as_deref(),
+                        sequence.schema.as_deref(),
+                        &sequence.name,
+                    )
+                });
+                let data_type_text = data_type
+                    .map(|value| value.as_sql().to_string())
+                    .unwrap_or_else(|| "bigint".to_string());
+                self.sequences.push(SequenceSummary {
+                    database: object.database.as_ref().map(ToString::to_string),
+                    schema: object.schema.as_ref().map(ToString::to_string),
+                    name: object.name.as_str().to_string(),
+                    data_type: MetadataValue::available(data_type_text.clone()),
+                    start_value: MetadataValue::available(start.unwrap_or(1).to_string()),
+                    increment: MetadataValue::available(increment.unwrap_or(1).to_string()),
+                    metadata: ObjectMetadata {
+                        owner: MetadataValue::available("app".to_string()),
+                        ..ObjectMetadata::default()
+                    },
+                });
+                self.sequence_details.insert(
+                    key,
+                    SequenceDetails {
+                        data_type: MetadataValue::available(data_type_text),
+                        start_value: MetadataValue::available(start.unwrap_or(1).to_string()),
+                        increment: MetadataValue::available(increment.unwrap_or(1).to_string()),
+                        minimum: minimum.map_or(MetadataValue::Unavailable, |value| {
+                            MetadataValue::available(value.to_string())
+                        }),
+                        maximum: maximum.map_or(MetadataValue::Unavailable, |value| {
+                            MetadataValue::available(value.to_string())
+                        }),
+                        current_value: MetadataValue::available(start.unwrap_or(1).to_string()),
+                        cache: cache.map_or(MetadataValue::Unavailable, |value| {
+                            MetadataValue::available(value.to_string())
+                        }),
+                        cycle: MetadataValue::available(*cycle),
+                    },
+                );
+            }
+            ValidatedObjectAction::AlterSequence {
+                object,
+                increment,
+                minimum,
+                maximum,
+                restart,
+                cache,
+                cycle,
+            } => {
+                let key = Self::object_key(object);
+                let Some(sequence) = self.sequences.iter_mut().find(|sequence| {
+                    Self::object_matches(
+                        object,
+                        sequence.database.as_deref(),
+                        sequence.schema.as_deref(),
+                        &sequence.name,
+                    )
+                }) else {
+                    return Err(DatabaseError::query("The sequence does not exist."));
+                };
+                if let Some(increment) = increment {
+                    sequence.increment = MetadataValue::available(increment.to_string());
+                }
+                let details = self
+                    .sequence_details
+                    .entry(key)
+                    .or_insert_with(|| SequenceDetails {
+                        data_type: sequence.data_type.clone(),
+                        start_value: sequence.start_value.clone(),
+                        increment: sequence.increment.clone(),
+                        minimum: MetadataValue::Unavailable,
+                        maximum: MetadataValue::Unavailable,
+                        current_value: MetadataValue::available("1".to_string()),
+                        cache: MetadataValue::Unavailable,
+                        cycle: MetadataValue::available(false),
+                    });
+                if let Some(increment) = increment {
+                    details.increment = MetadataValue::available(increment.to_string());
+                }
+                if let Some(minimum) = minimum {
+                    details.minimum = MetadataValue::available(minimum.to_string());
+                }
+                if let Some(maximum) = maximum {
+                    details.maximum = MetadataValue::available(maximum.to_string());
+                }
+                if let Some(restart) = restart {
+                    details.current_value = MetadataValue::available(restart.to_string());
+                }
+                if let Some(cache) = cache {
+                    details.cache = MetadataValue::available(cache.to_string());
+                }
+                if let Some(cycle) = cycle {
+                    details.cycle = MetadataValue::available(*cycle);
+                }
+            }
+            ValidatedObjectAction::DropSequence { object } => {
+                self.sequences.retain(|sequence| {
+                    !Self::object_matches(
+                        object,
+                        sequence.database.as_deref(),
+                        sequence.schema.as_deref(),
+                        &sequence.name,
+                    )
+                });
+                self.sequence_details.remove(&Self::object_key(object));
+            }
+            ValidatedObjectAction::RefreshMaterializedView { object } => {
+                let exists = self.views.iter().any(|view| {
+                    view.kind == ViewKind::MaterializedView
+                        && Self::object_matches(
+                            object,
+                            view.database.as_deref(),
+                            view.schema.as_deref(),
+                            &view.name,
+                        )
+                });
+                if !exists {
+                    return Err(DatabaseError::query(
+                        "The materialized view does not exist.",
+                    ));
+                }
+            }
+            ValidatedObjectAction::DropMaterializedView { object } => {
+                self.views.retain(|view| {
+                    !(view.kind == ViewKind::MaterializedView
+                        && Self::object_matches(
+                            object,
+                            view.database.as_deref(),
+                            view.schema.as_deref(),
+                            &view.name,
+                        ))
+                });
+                self.view_queries.remove(&Self::object_key(object));
+            }
+        }
+        Ok(())
+    }
+
     async fn object_counts(&self, scope: &MetadataScope) -> Result<ObjectCounts, DatabaseError> {
         self.require_connection()?;
         let database = scope.database.as_ref().map(|value| value.as_str());
@@ -1125,11 +1868,38 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
             MetadataValue::Unavailable
         };
 
+        let routines = if self.capabilities.supports(DatabaseAction::BrowseRoutines) {
+            MetadataValue::available(
+                self.routines
+                    .iter()
+                    .filter(|routine| {
+                        matches(routine.database.as_deref(), routine.schema.as_deref())
+                    })
+                    .count() as u64,
+            )
+        } else {
+            MetadataValue::Unavailable
+        };
+        let triggers = if self.capabilities.supports(DatabaseAction::BrowseTriggers) {
+            MetadataValue::available(
+                self.triggers
+                    .iter()
+                    .filter(|trigger| {
+                        matches(trigger.database.as_deref(), trigger.schema.as_deref())
+                    })
+                    .count() as u64,
+            )
+        } else {
+            MetadataValue::Unavailable
+        };
+
         Ok(ObjectCounts {
             tables: MetadataValue::available(tables),
             views: MetadataValue::available(views),
             materialized_views,
             sequences,
+            routines,
+            triggers,
         })
     }
 
@@ -2539,6 +3309,13 @@ struct FakeFixtures {
     tables: Vec<TableSummary>,
     views: Vec<ViewSummary>,
     sequences: Vec<SequenceSummary>,
+    routines: Vec<RoutineSummary>,
+    triggers: Vec<TriggerSummary>,
+    view_queries: HashMap<String, String>,
+    routine_bodies: HashMap<String, String>,
+    trigger_statements: HashMap<String, String>,
+    trigger_functions: HashMap<String, String>,
+    sequence_details: HashMap<String, SequenceDetails>,
     columns: Vec<ColumnSummary>,
     indexes: Vec<IndexSummary>,
     constraints: Vec<ConstraintSummary>,
@@ -2631,6 +3408,39 @@ fn mysql_fixtures() -> FakeFixtures {
             },
         }],
         sequences: Vec::new(),
+        routines: vec![RoutineSummary {
+            database: Some("app".to_string()),
+            schema: Some("app".to_string()),
+            name: "user_email".to_string(),
+            kind: RoutineKind::Function,
+            language: MetadataValue::available("SQL".to_string()),
+            return_type: MetadataValue::available("varchar(255)".to_string()),
+            arguments: MetadataValue::available("user_id bigint".to_string()),
+            owner: MetadataValue::available("app@%".to_string()),
+        }],
+        triggers: vec![TriggerSummary {
+            database: Some("app".to_string()),
+            schema: Some("app".to_string()),
+            name: "users_audit".to_string(),
+            table: "users".to_string(),
+            timing: TriggerTiming::After,
+            events: vec![TriggerEvent::Insert],
+            owner: MetadataValue::available("app@%".to_string()),
+        }],
+        view_queries: HashMap::from([(
+            "view::app::app::active_users".to_string(),
+            "SELECT id, email FROM users WHERE active = 1".to_string(),
+        )]),
+        routine_bodies: HashMap::from([(
+            "routine::app::app::user_email".to_string(),
+            "RETURN (SELECT email FROM users WHERE id = user_id)".to_string(),
+        )]),
+        trigger_statements: HashMap::from([(
+            "trigger::app::app::users_audit".to_string(),
+            "INSERT INTO audit (user_id) VALUES (NEW.id)".to_string(),
+        )]),
+        trigger_functions: HashMap::new(),
+        sequence_details: HashMap::new(),
         columns: vec![
             ColumnSummary {
                 name: "id".to_string(),
@@ -2843,6 +3653,59 @@ fn postgres_fixtures() -> FakeFixtures {
                 ..ObjectMetadata::default()
             },
         }],
+        routines: vec![RoutineSummary {
+            database: Some("app".to_string()),
+            schema: Some("public".to_string()),
+            name: "user_email".to_string(),
+            kind: RoutineKind::Function,
+            language: MetadataValue::available("sql".to_string()),
+            return_type: MetadataValue::available("text".to_string()),
+            arguments: MetadataValue::available("user_id bigint".to_string()),
+            owner: MetadataValue::available("app".to_string()),
+        }],
+        triggers: vec![TriggerSummary {
+            database: Some("app".to_string()),
+            schema: Some("public".to_string()),
+            name: "users_audit".to_string(),
+            table: "users".to_string(),
+            timing: TriggerTiming::After,
+            events: vec![TriggerEvent::Insert],
+            owner: MetadataValue::available("app".to_string()),
+        }],
+        view_queries: HashMap::from([
+            (
+                "view::app::public::active_users".to_string(),
+                "SELECT id, email FROM public.users WHERE active".to_string(),
+            ),
+            (
+                "materialized_view::app::public::daily_totals".to_string(),
+                "SELECT date_trunc('day', created_at) AS day, count(*) FROM public.orders GROUP BY 1"
+                    .to_string(),
+            ),
+        ]),
+        routine_bodies: HashMap::from([(
+            "routine::app::public::user_email".to_string(),
+            "SELECT email FROM public.users WHERE id = user_id".to_string(),
+        )]),
+        trigger_statements: HashMap::new(),
+        trigger_functions: HashMap::from([(
+            "trigger::app::public::users_audit".to_string(),
+            "CREATE FUNCTION public.audit_users() RETURNS trigger AS $$ BEGIN RETURN NEW; END $$ LANGUAGE plpgsql"
+                .to_string(),
+        )]),
+        sequence_details: HashMap::from([(
+            "sequence::app::public::users_id_seq".to_string(),
+            SequenceDetails {
+                data_type: MetadataValue::available("bigint".to_string()),
+                start_value: MetadataValue::available("1".to_string()),
+                increment: MetadataValue::available("1".to_string()),
+                minimum: MetadataValue::available("1".to_string()),
+                maximum: MetadataValue::available("9223372036854775807".to_string()),
+                current_value: MetadataValue::available("42".to_string()),
+                cache: MetadataValue::available("1".to_string()),
+                cycle: MetadataValue::available(false),
+            },
+        )]),
         columns: vec![
             ColumnSummary {
                 name: "id".to_string(),
