@@ -23,6 +23,7 @@ export type DatabaseDumpStoreStatus = "idle" | "running" | DatabaseDumpStatus | 
 
 export type DatabaseDumpToolsState = {
   status: "idle" | "loading" | "ready" | "error";
+  profileId?: string;
   report?: DatabaseDumpToolReport;
   error?: CommandError;
   errorMessage?: string;
@@ -30,6 +31,8 @@ export type DatabaseDumpToolsState = {
 
 export type DatabaseDumpTransferState = {
   transferId?: string;
+  /** Keeps an active transfer attached to the connection tab that started it. */
+  profileId?: string;
   direction: "export" | "restore";
   status: DatabaseDumpStoreStatus;
   progress?: DatabaseDumpProgress;
@@ -38,6 +41,7 @@ export type DatabaseDumpTransferState = {
   error?: CommandError;
   errorMessage?: string;
   cancelling: boolean;
+  startedAt?: number;
 };
 
 type DatabaseDumpStore = {
@@ -72,15 +76,19 @@ function failureState(
   direction: "export" | "restore",
   error: unknown,
   transferId?: string,
+  profileId?: string,
+  startedAt?: number,
 ): DatabaseDumpTransferState {
   const commandError = commandErrorFor(error);
   return {
     transferId,
+    profileId,
     direction,
     status: "error",
     error: commandError ?? undefined,
     errorMessage: getCommandErrorMessage(error),
     cancelling: false,
+    startedAt,
   };
 }
 
@@ -93,21 +101,23 @@ export const useDatabaseDumpStore = create<DatabaseDumpStore>((set, get) => ({
       set({
         tools: {
           status: "error",
+          profileId,
           errorMessage: "SQL dump tools are available in the desktop application.",
         },
       });
       return null;
     }
-    set({ tools: { status: "loading" } });
+    set({ tools: { status: "loading", profileId } });
     try {
       const report = await getDatabaseDumpTools(profileId);
-      set({ tools: { status: "ready", report } });
+      set({ tools: { status: "ready", profileId, report } });
       return report;
     } catch (error) {
       const commandError = commandErrorFor(error);
       set({
         tools: {
           status: "error",
+          profileId,
           error: commandError ?? undefined,
           errorMessage: getCommandErrorMessage(error),
         },
@@ -125,17 +135,22 @@ export const useDatabaseDumpStore = create<DatabaseDumpStore>((set, get) => ({
         transfer: failureState(
           "export",
           new Error("SQL dump export is available in the desktop application."),
+          undefined,
+          profileId,
         ),
       });
       return null;
     }
     const transferId = createDatabaseDumpRequestId();
+    const startedAt = Date.now();
     set({
       transfer: {
         transferId,
+        profileId,
         direction: "export",
         status: "running",
         cancelling: false,
+        startedAt,
       },
     });
     try {
@@ -146,10 +161,12 @@ export const useDatabaseDumpStore = create<DatabaseDumpStore>((set, get) => ({
       set({
         transfer: {
           transferId,
+          profileId,
           direction: "export",
           status: result.status,
           exportResult: result,
           cancelling: false,
+          startedAt,
         },
       });
       return result;
@@ -157,7 +174,7 @@ export const useDatabaseDumpStore = create<DatabaseDumpStore>((set, get) => ({
       if (get().transfer.transferId !== transferId) {
         return null;
       }
-      set({ transfer: failureState("export", error, transferId) });
+      set({ transfer: failureState("export", error, transferId, profileId, startedAt) });
       return null;
     }
   },
@@ -171,17 +188,22 @@ export const useDatabaseDumpStore = create<DatabaseDumpStore>((set, get) => ({
         transfer: failureState(
           "restore",
           new Error("SQL dump restore is available in the desktop application."),
+          undefined,
+          profileId,
         ),
       });
       return null;
     }
     const transferId = createDatabaseDumpRequestId();
+    const startedAt = Date.now();
     set({
       transfer: {
         transferId,
+        profileId,
         direction: "restore",
         status: "running",
         cancelling: false,
+        startedAt,
       },
     });
     try {
@@ -192,10 +214,12 @@ export const useDatabaseDumpStore = create<DatabaseDumpStore>((set, get) => ({
       set({
         transfer: {
           transferId,
+          profileId,
           direction: "restore",
           status: result.status,
           restoreResult: result,
           cancelling: false,
+          startedAt,
         },
       });
       return result;
@@ -203,7 +227,7 @@ export const useDatabaseDumpStore = create<DatabaseDumpStore>((set, get) => ({
       if (get().transfer.transferId !== transferId) {
         return null;
       }
-      set({ transfer: failureState("restore", error, transferId) });
+      set({ transfer: failureState("restore", error, transferId, profileId, startedAt) });
       return null;
     }
   },
@@ -218,6 +242,11 @@ export const useDatabaseDumpStore = create<DatabaseDumpStore>((set, get) => ({
     }));
     try {
       const result = await cancelDatabaseDump(transferId);
+      if (!result.cancelled) {
+        set((state) => ({
+          transfer: { ...state.transfer, cancelling: false },
+        }));
+      }
       return result.cancelled;
     } catch {
       set((state) => ({

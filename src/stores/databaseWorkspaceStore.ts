@@ -51,6 +51,8 @@ export type DatabaseWorkspaceTask = {
   label: string;
   status: DatabaseWorkspaceTaskStatus;
   detail?: string | null;
+  /** True when the backend result says the target may be incomplete. */
+  partial?: boolean;
   startedAt: number;
 };
 

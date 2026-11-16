@@ -9,7 +9,6 @@ import {
   HardDrivesIcon,
   InfoIcon,
   KeyIcon,
-  ListChecksIcon,
   PlugsIcon,
   PlusIcon,
   RowsIcon,
@@ -31,6 +30,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { DatabaseConnectionList, EngineBadge } from "@/features/databases/DatabaseConnectionList";
 import { DatabaseActionDialog } from "@/features/databases/DatabaseActionDialog";
 import { DatabaseDataGrid } from "@/features/databases/DatabaseDataGrid";
+import { DatabaseOperationsWorkspace } from "@/features/databases/DatabaseOperationsWorkspace";
 import { DatabaseSqlWorkspace } from "@/features/databases/DatabaseSqlWorkspace";
 import { DatabaseExplorerTree } from "@/features/databases/DatabaseExplorerTree";
 import {
@@ -60,6 +60,7 @@ import {
   formatLatency,
 } from "@/features/databases/databaseProfileForm";
 import { useActiveServer } from "@/hooks/useActiveServer";
+import { useDatabaseOperationTaskSync } from "@/hooks/useDatabaseOperationTaskSync";
 import { useDatabaseTableStructure } from "@/hooks/useDatabaseTableStructure";
 import { getCommandErrorMessage } from "@/lib/errors";
 import { isTauriRuntime } from "@/lib/tauri";
@@ -74,7 +75,6 @@ import { useDatabaseRowWriteStore } from "@/stores/databaseRowWriteStore";
 import {
   useDatabaseWorkspaceStore,
   type DatabaseWorkspaceTab,
-  type DatabaseWorkspaceTaskStatus,
   type DatabaseWorkspaceView,
 } from "@/stores/databaseWorkspaceStore";
 import { useServerStore } from "@/stores/serverStore";
@@ -792,68 +792,8 @@ function DatabaseWorkspaceTabHeader({
   );
 }
 
-function DatabaseOperationsWorkspace({ tab }: { tab: DatabaseWorkspaceTab }) {
-  const taskTone: Record<DatabaseWorkspaceTaskStatus, string> = {
-    running: "text-warning",
-    succeeded: "text-success",
-    failed: "text-destructive",
-    cancelled: "text-muted-foreground",
-  };
-  const TaskIcon = ListChecksIcon;
-
-  return (
-    <div className="space-y-3">
-      <div className="rounded-md border border-border bg-card">
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2">
-          <div className="flex items-center gap-2">
-            <TaskIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
-            <h3 className="text-[12px] font-semibold text-foreground">Background tasks</h3>
-          </div>
-          <span className="text-[10px] text-muted-foreground">
-            Scoped to {tab.name} · cleared when this tab closes
-          </span>
-        </div>
-        {tab.tasks.length === 0 ? (
-          <p className="px-3 py-3 text-[11px] leading-5 text-muted-foreground">
-            No imports, exports, backups, or restores are running for this connection. Imports and
-            backups attach here and are released with the tab.
-          </p>
-        ) : (
-          <ul className="divide-y divide-border">
-            {tab.tasks.map((task) => (
-              <li
-                key={task.id}
-                className="flex flex-wrap items-center justify-between gap-2 px-3 py-2"
-              >
-                <span className="min-w-0">
-                  <span className="block truncate text-[11px] font-medium text-foreground">
-                    {task.label}
-                  </span>
-                  {task.detail ? (
-                    <span className="block truncate text-[10px] text-muted-foreground">
-                      {task.detail}
-                    </span>
-                  ) : null}
-                </span>
-                <span className={cn("text-[10px] font-medium capitalize", taskTone[task.status])}>
-                  {task.status}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-
-      <EmptyState
-        icon={<WrenchIcon className="size-4" aria-hidden="true" />}
-        title="No operations queued"
-        description="Imports, exports, backups, and restores will report progress and cancellation from this connection tab."
-      />
-    </div>
-  );
-}
-
 function DatabaseManagerPage() {
+  useDatabaseOperationTaskSync();
   const servers = useServerStore((state) => state.servers);
   const serverStatus = useServerStore((state) => state.status);
   const serverError = useServerStore((state) => state.error);
@@ -1817,7 +1757,24 @@ function DatabaseManagerPage() {
                             }
                           />
                         ) : tab.value === "operations" ? (
-                          <DatabaseOperationsWorkspace tab={activeTab} />
+                          structureProfile ? (
+                            <DatabaseOperationsWorkspace
+                              tab={activeTab}
+                              profile={structureProfile}
+                              server={
+                                servers.find((server) => server.id === activeTab.serverId) ?? null
+                              }
+                              snapshot={selectedSnapshot}
+                              connected={structureConnected}
+                              onConnect={() => void handleConnect(structureProfile)}
+                            />
+                          ) : (
+                            <EmptyState
+                              icon={<WrenchIcon className="size-4" aria-hidden="true" />}
+                              title="No connection selected"
+                              description="Open a saved connection before starting imports, exports, backups, or restores."
+                            />
+                          )
                         ) : (
                           <EmptyState
                             icon={<TabIcon className="size-4" aria-hidden="true" />}

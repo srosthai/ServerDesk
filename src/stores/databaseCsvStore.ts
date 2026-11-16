@@ -26,6 +26,7 @@ export type DatabaseCsvTransferStoreStatus =
 
 export type DatabaseCsvPreviewState = {
   status: "idle" | "loading" | "ready" | "error";
+  profileId?: string;
   preview?: DatabaseCsvImportPreview;
   error?: CommandError;
   errorMessage?: string;
@@ -33,6 +34,8 @@ export type DatabaseCsvPreviewState = {
 
 export type DatabaseCsvTransferState = {
   transferId?: string;
+  /** Keeps an active transfer attached to the connection tab that started it. */
+  profileId?: string;
   direction: DatabaseCsvTransferDirection;
   status: DatabaseCsvTransferStoreStatus;
   progress?: DatabaseCsvTransferProgress;
@@ -41,6 +44,7 @@ export type DatabaseCsvTransferState = {
   error?: CommandError;
   errorMessage?: string;
   cancelling: boolean;
+  startedAt?: number;
 };
 
 type DatabaseCsvStore = {
@@ -50,6 +54,7 @@ type DatabaseCsvStore = {
     sourcePath: string,
     options: DatabaseCsvImportOptions,
     limit?: number,
+    profileId?: string,
   ) => Promise<DatabaseCsvImportPreview | null>;
   startExport: (
     profileId: string,
@@ -79,15 +84,19 @@ function failureState(
   direction: DatabaseCsvTransferDirection,
   error: unknown,
   transferId?: string,
+  profileId?: string,
+  startedAt?: number,
 ): DatabaseCsvTransferState {
   const commandError = commandErrorFor(error);
   return {
     transferId,
+    profileId,
     direction,
     status: "error",
     error: commandError ?? undefined,
     errorMessage: getCommandErrorMessage(error),
     cancelling: false,
+    startedAt,
   };
 }
 
@@ -95,26 +104,28 @@ export const useDatabaseCsvStore = create<DatabaseCsvStore>((set, get) => ({
   preview: { status: "idle" },
   transfer: idleTransfer(),
 
-  previewImport: async (sourcePath, options, limit) => {
+  previewImport: async (sourcePath, options, limit, profileId) => {
     if (!isTauriRuntime()) {
       set({
         preview: {
           status: "error",
+          profileId,
           errorMessage: "CSV preview is available in the desktop application.",
         },
       });
       return null;
     }
-    set({ preview: { status: "loading" } });
+    set({ preview: { status: "loading", profileId } });
     try {
       const preview = await previewDatabaseCsvImport(sourcePath, options, limit);
-      set({ preview: { status: "ready", preview } });
+      set({ preview: { status: "ready", profileId, preview } });
       return preview;
     } catch (error) {
       const commandError = commandErrorFor(error);
       set({
         preview: {
           status: "error",
+          profileId,
           error: commandError ?? undefined,
           errorMessage: getCommandErrorMessage(error),
         },
@@ -133,17 +144,22 @@ export const useDatabaseCsvStore = create<DatabaseCsvStore>((set, get) => ({
         transfer: failureState(
           "export",
           new Error("CSV export is available in the desktop application."),
+          undefined,
+          profileId,
         ),
       });
       return null;
     }
     const transferId = createDatabaseCsvRequestId();
+    const startedAt = Date.now();
     set({
       transfer: {
         transferId,
+        profileId,
         direction: "export",
         status: "running",
         cancelling: false,
+        startedAt,
       },
     });
     try {
@@ -154,10 +170,12 @@ export const useDatabaseCsvStore = create<DatabaseCsvStore>((set, get) => ({
       set({
         transfer: {
           transferId,
+          profileId,
           direction: "export",
           status: result.status,
           exportResult: result,
           cancelling: false,
+          startedAt,
         },
       });
       return result;
@@ -165,7 +183,7 @@ export const useDatabaseCsvStore = create<DatabaseCsvStore>((set, get) => ({
       if (get().transfer.transferId !== transferId) {
         return null;
       }
-      set({ transfer: failureState("export", error, transferId) });
+      set({ transfer: failureState("export", error, transferId, profileId, startedAt) });
       return null;
     }
   },
@@ -180,17 +198,22 @@ export const useDatabaseCsvStore = create<DatabaseCsvStore>((set, get) => ({
         transfer: failureState(
           "import",
           new Error("CSV import is available in the desktop application."),
+          undefined,
+          profileId,
         ),
       });
       return null;
     }
     const transferId = createDatabaseCsvRequestId();
+    const startedAt = Date.now();
     set({
       transfer: {
         transferId,
+        profileId,
         direction: "import",
         status: "running",
         cancelling: false,
+        startedAt,
       },
     });
     try {
@@ -201,10 +224,12 @@ export const useDatabaseCsvStore = create<DatabaseCsvStore>((set, get) => ({
       set({
         transfer: {
           transferId,
+          profileId,
           direction: "import",
           status: result.status,
           importResult: result,
           cancelling: false,
+          startedAt,
         },
       });
       return result;
@@ -212,7 +237,7 @@ export const useDatabaseCsvStore = create<DatabaseCsvStore>((set, get) => ({
       if (get().transfer.transferId !== transferId) {
         return null;
       }
-      set({ transfer: failureState("import", error, transferId) });
+      set({ transfer: failureState("import", error, transferId, profileId, startedAt) });
       return null;
     }
   },
@@ -227,6 +252,11 @@ export const useDatabaseCsvStore = create<DatabaseCsvStore>((set, get) => ({
     }));
     try {
       const result = await cancelDatabaseCsvTransfer(transferId);
+      if (!result.cancelled) {
+        set((state) => ({
+          transfer: { ...state.transfer, cancelling: false },
+        }));
+      }
       return result.cancelled;
     } catch {
       set((state) => ({

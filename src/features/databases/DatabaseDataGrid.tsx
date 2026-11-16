@@ -1,6 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import {
+  ArchiveBoxIcon,
   ArrowClockwiseIcon,
   ArrowsDownUpIcon,
   BinaryIcon,
@@ -546,6 +547,7 @@ export function DatabaseDataGrid({
     (state) => state.tabs[profileId]?.dataGrid?.[tableKey],
   );
   const setDataGridState = useDatabaseWorkspaceStore((state) => state.setDataGridState);
+  const setWorkspaceView = useDatabaseWorkspaceStore((state) => state.setActiveView);
   const grid = storedGrid ?? DEFAULT_DATA_GRID_STATE;
   const entry = useDatabaseRowStore((state) => state.entries[rowKey]);
   const loadRows = useDatabaseRowStore((state) => state.loadRows);
@@ -1125,6 +1127,16 @@ export function DatabaseDataGrid({
           >
             <FileCsvIcon className="size-3.5" aria-hidden="true" />
             Import CSV
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => setWorkspaceView(profileId, "operations")}
+            aria-label="Open backup and restore operations"
+            title="Open backup and restore operations for this connection"
+          >
+            <ArchiveBoxIcon className="size-3.5" aria-hidden="true" />
+            Backup
           </Button>
           <Button
             variant="secondary"
@@ -1977,6 +1989,7 @@ export function DatabaseDataGrid({
             }
           }}
           profileId={profileId}
+          profileName={profileName}
           table={{ database, schema, name: table }}
           columns={allColumns}
           readOnly={readOnly}
