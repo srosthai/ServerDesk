@@ -16,5 +16,6 @@ pub mod queries;
 pub mod roles;
 pub mod row_writes;
 pub mod rows;
+pub mod sessions;
 pub mod structure;
 pub mod tunnels;

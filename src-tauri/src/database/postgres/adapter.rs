@@ -51,6 +51,7 @@ use crate::database::{
     },
     row_writes::{RowDeleteRequest, RowInsertRequest, RowUpdateRequest, RowWriteResult},
     rows::{RowQueryControl, RowReadRequest, RowReadResult},
+    sessions::{SessionQuery, SessionSummary, ValidatedSessionAction},
     structure::{StructureDdlPreview, ValidatedStructureAction},
     traits::{
         ColumnIdentity, ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter,
@@ -1377,6 +1378,78 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
         Ok(())
     }
 
+    async fn list_sessions(
+        &self,
+        page: PageRequest,
+        running_only: bool,
+    ) -> Result<Page<SessionSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseSessions)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::LIST_SESSIONS)
+                .bind(running_only)
+                .bind(i64::from(page.limit) + 1)
+                .bind(i64::try_from(page.offset).unwrap_or(i64::MAX))
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+
+        let sessions = rows
+            .iter()
+            .map(postgres_session_summary)
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+        Ok(Page::from_items(sessions, page, None))
+    }
+
+    async fn session_summary(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<SessionSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseSessions)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let row = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::SESSION_SUMMARY)
+                .bind(session_id)
+                .fetch_optional(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+        row.as_ref().map(postgres_session_summary).transpose()
+    }
+
+    async fn execute_session_action(
+        &mut self,
+        action: &ValidatedSessionAction,
+    ) -> Result<bool, DatabaseError> {
+        self.require_capability(action.action.capability())?;
+        self.require_connection()?;
+        let statement = match action.action {
+            crate::database::SessionActionKind::CancelQuery => sql::CANCEL_QUERY,
+            crate::database::SessionActionKind::TerminateSession => sql::KILL_SESSION,
+        };
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let accepted: bool = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(statement)
+                .bind(action.session_id)
+                .fetch_one(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?
+        .try_get(0)
+        .map_err(map_sqlx_error)?;
+        Ok(accepted)
+    }
+
     async fn object_counts(&self, scope: &MetadataScope) -> Result<ObjectCounts, DatabaseError> {
         self.require_capability(DatabaseAction::BrowseTables)?;
         let schema = self.schema_filter(scope)?;
@@ -2176,6 +2249,52 @@ fn constraint_kind(kind: &str) -> ConstraintKind {
         "CHECK" => ConstraintKind::Check,
         _ => ConstraintKind::Other,
     }
+}
+
+fn postgres_session_summary(row: &PgRow) -> Result<SessionSummary, DatabaseError> {
+    let pid: i32 = decode(row, "session_id")?;
+    let user: String = decode(row, "user_name")?;
+    let host: Option<String> = decode(row, "host")?;
+    let database: Option<String> = decode(row, "database_name")?;
+    let application_name: Option<String> = decode(row, "application_name")?;
+    let state: Option<String> = decode(row, "state")?;
+    let query_text: Option<String> = decode(row, "query")?;
+    let query_started_at: Option<String> = decode(row, "query_started_at")?;
+    let elapsed_ms: Option<i64> = decode(row, "elapsed_ms")?;
+    let connected_at: Option<String> = decode(row, "connected_at")?;
+    let is_current: bool = decode(row, "is_current")?;
+
+    let is_active = state.as_deref() == Some("active");
+    let query_text = query_text.filter(|text| {
+        !text.trim().is_empty() && !text.eq_ignore_ascii_case("<insufficient privilege>")
+    });
+    let query = match query_text {
+        Some(text) if is_active => MetadataValue::available(SessionQuery::from_raw(
+            &text,
+            query_started_at.map_or(MetadataValue::Unavailable, MetadataValue::available),
+            elapsed_ms
+                .and_then(|milliseconds| u64::try_from(milliseconds).ok())
+                .map_or(MetadataValue::Unavailable, MetadataValue::available),
+        )),
+        _ => MetadataValue::unavailable(),
+    };
+
+    Ok(SessionSummary {
+        id: i64::from(pid),
+        user,
+        host: host.map_or(MetadataValue::Unavailable, MetadataValue::available),
+        database: database.map_or(MetadataValue::Unavailable, MetadataValue::available),
+        application_name: application_name
+            .filter(|name| !name.trim().is_empty())
+            .map_or(MetadataValue::Unavailable, MetadataValue::available),
+        command: MetadataValue::unavailable(),
+        state: state.map_or(MetadataValue::Unavailable, MetadataValue::available),
+        wait_event: MetadataValue::unavailable(),
+        backend_type: MetadataValue::unavailable(),
+        connected_at: connected_at.map_or(MetadataValue::Unavailable, MetadataValue::available),
+        is_current,
+        query,
+    })
 }
 
 fn postgres_role_summary(row: &PgRow) -> Result<RoleSummary, DatabaseError> {
