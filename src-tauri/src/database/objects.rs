@@ -565,7 +565,7 @@ impl ObjectActionRequest {
                 }
                 let language = language
                     .as_deref()
-                    .map(|value| validate_identifier("routine language", value))
+                    .map(validate_routine_language)
                     .transpose()?;
                 let body = validate_definition("routine body", body, MAX_OBJECT_BODY_LENGTH)?;
                 Ok(ValidatedObjectAction::CreateRoutine {
@@ -1444,6 +1444,32 @@ fn validate_identifier(label: &str, value: &str) -> Result<Identifier, DatabaseE
     }
     Identifier::new(value).map_err(|error| {
         DatabaseError::validation(format!("The {label} is not valid.")).with_details(error.message)
+    })
+}
+
+/// Routine language names are rendered beside `LANGUAGE`. They must therefore
+/// be a plain identifier, not arbitrary text that could start a new statement.
+fn validate_routine_language(value: &str) -> Result<Identifier, DatabaseError> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > crate::database::dialect::MAX_IDENTIFIER_LENGTH {
+        return Err(DatabaseError::validation(
+            "The routine language must be between 1 and 63 bytes.",
+        ));
+    }
+    let mut characters = value.chars();
+    let first = characters.next().unwrap_or(' ');
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return Err(DatabaseError::validation(
+            "The routine language must be a plain identifier.",
+        )
+        .with_details(
+            "Use letters, digits, and '_', starting with a letter or '_'. Statement separators, quotes, dashes, and spaces are rejected.",
+        ));
+    }
+    Identifier::new(value).map_err(|error| {
+        DatabaseError::validation("The routine language is not valid.").with_details(error.message)
     })
 }
 

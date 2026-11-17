@@ -615,6 +615,12 @@ fn first_top_level_write(tokens: &[SqlToken]) -> Option<(usize, &'static str)> {
             && let SqlToken::Word(word) = token
             && let Some(keyword) = write_keyword(word)
         {
+            // `ALTER TABLE ... DROP COLUMN` and similar statements are
+            // destructive even though the leading write keyword is ALTER. The
+            // DROP may also be inside parentheses, so require top level.
+            if keyword == "alter" && find_top_level_word(tokens, "drop", position + 1).is_some() {
+                return Some((position, "drop"));
+            }
             return Some((position, keyword));
         }
         if matches!(token, SqlToken::Symbol('(')) {
@@ -654,13 +660,53 @@ fn find_top_level_word(tokens: &[SqlToken], needle: &str, start: usize) -> Optio
 }
 
 fn write_keyword(word: &str) -> Option<&'static str> {
-    const WRITE_KEYWORDS: [&str; 30] = [
-        "insert", "update", "delete", "merge", "create", "alter", "drop", "truncate", "grant",
-        "revoke", "call", "do", "copy", "vacuum", "analyze", "reindex", "cluster", "refresh",
-        "lock", "comment", "import", "security", "load", "rename", "set", "reset", "discard",
-        "begin", "start", "commit",
+    const WRITE_KEYWORDS: &[&str] = &[
+        "insert",
+        "update",
+        "delete",
+        "merge",
+        "create",
+        "alter",
+        "drop",
+        "truncate",
+        "grant",
+        "revoke",
+        "call",
+        "do",
+        "copy",
+        "vacuum",
+        "analyze",
+        "reindex",
+        "cluster",
+        "refresh",
+        "lock",
+        "comment",
+        "import",
+        "security",
+        "load",
+        "rename",
+        "set",
+        "reset",
+        "discard",
+        "begin",
+        "start",
+        "commit",
+        // Session- and sequence-mutating functions. `set_config` can change a
+        // session default such as `default_transaction_read_only`, so a plain
+        // SELECT must not be treated as read-only when it calls these.
+        "set_config",
+        "setval",
+        "nextval",
+        "pg_terminate_backend",
+        "pg_cancel_backend",
+        "lo_import",
+        "lo_export",
+        "dblink_exec",
     ];
-    WRITE_KEYWORDS.into_iter().find(|keyword| *keyword == word)
+    WRITE_KEYWORDS
+        .iter()
+        .copied()
+        .find(|keyword| *keyword == word)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1222,6 +1268,54 @@ mod tests {
         )
         .expect("lock");
         assert!(lock.has_writes);
+    }
+
+    #[test]
+    fn session_configuration_calls_are_not_treated_as_read_only() {
+        for sql in [
+            "SELECT set_config('default_transaction_read_only', 'off', false);",
+            "SELECT pg_catalog.set_config('transaction_read_only', 'off', false);",
+            "SELECT setval('users_id_seq', 100);",
+            "SELECT nextval('users_id_seq');",
+            "SELECT pg_terminate_backend(42);",
+            "SELECT lo_import('/tmp/payload');",
+        ] {
+            let analysis = analyze_sql(DatabaseEngine::Postgresql, sql).expect("analysis");
+            assert!(
+                analysis.has_writes,
+                "session-mutating statement must be a write: {sql}"
+            );
+        }
+
+        let plain = analyze_sql(
+            DatabaseEngine::Postgresql,
+            "SELECT current_setting('server_version'), id FROM users;",
+        )
+        .expect("plain read");
+        assert!(!plain.has_writes);
+    }
+
+    #[test]
+    fn alter_table_drop_is_destructive_and_requires_confirmation() {
+        for sql in [
+            "ALTER TABLE users DROP COLUMN note;",
+            "ALTER TABLE users DROP CONSTRAINT users_name_key;",
+            "ALTER TABLE measurements DROP PARTITION measurements_2024;",
+        ] {
+            let analysis = analyze_sql(DatabaseEngine::Postgresql, sql).expect("analysis");
+            assert!(analysis.has_writes, "{sql} writes");
+            assert!(analysis.destructive, "{sql} is destructive");
+            assert!(analysis.requires_confirmation, "{sql} needs confirmation");
+            assert_eq!(analysis.warnings[0].code, SqlWarningCode::Drop);
+        }
+
+        let additive = analyze_sql(
+            DatabaseEngine::Postgresql,
+            "ALTER TABLE users ADD COLUMN note text;",
+        )
+        .expect("additive alter");
+        assert!(additive.has_writes);
+        assert!(!additive.destructive);
     }
 
     #[test]

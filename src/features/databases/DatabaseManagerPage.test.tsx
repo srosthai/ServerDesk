@@ -1201,7 +1201,7 @@ describe("DatabaseManagerPage", () => {
     await user.click(within(dialog).getByRole("button", { name: "Delete connection" }));
 
     await waitFor(() => {
-      expect(deleteDatabaseProfile).toHaveBeenCalledWith(profile.id);
+      expect(deleteDatabaseProfile).toHaveBeenCalledWith(profile.id, true);
     });
     await waitFor(() => {
       expect(screen.queryByRole("dialog", { name: "Delete Primary?" })).not.toBeInTheDocument();

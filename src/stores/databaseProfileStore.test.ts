@@ -207,8 +207,10 @@ describe("database profile store", () => {
     expect(useDatabaseProfileStore.getState().profiles["server-1"]).toBeUndefined();
     expect(useDatabaseProfileStore.getState().profiles["server-2"]).toEqual([updated]);
 
-    await expect(useDatabaseProfileStore.getState().deleteProfile(profile.id)).resolves.toBe(true);
-    expect(deleteDatabaseProfile).toHaveBeenCalledWith(profile.id);
+    await expect(useDatabaseProfileStore.getState().deleteProfile(profile.id, true)).resolves.toBe(
+      true,
+    );
+    expect(deleteDatabaseProfile).toHaveBeenCalledWith(profile.id, true);
     expect(useDatabaseProfileStore.getState().profiles["server-2"]).toBeUndefined();
   });
 
