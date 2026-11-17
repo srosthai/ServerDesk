@@ -36,17 +36,25 @@ pub fn sanitize_text_bounded(input: &str, max_chars: usize) -> String {
     truncate_chars(redacted.text.trim_end(), max_chars)
 }
 
-/// Redacts text and SQL password literals, then bounds it to `max_chars`.
+/// Redacts generic secrets and SQL password literals.
 ///
-/// SQL history and snippets need the generic secret redaction plus literals
-/// that are only secret because of SQL syntax, such as
+/// SQL history, snippets, and live query text need the generic secret
+/// redaction plus literals that are only secret because of SQL syntax, such as
 /// `CREATE USER ... IDENTIFIED BY 'secret'` and
 /// `ALTER ROLE ... PASSWORD 'secret'`. Those literals are not assignments and
 /// would otherwise survive the generic line-oriented redactor.
-pub fn sanitize_sql_bounded(input: &str, max_chars: usize) -> String {
+pub fn redact_sql(input: &str) -> RedactedText {
     let redacted = redact_text(input);
     let sql_redacted = redact_sql_secret_literals(&redacted.text);
-    truncate_chars(sql_redacted.trim_end(), max_chars)
+    RedactedText {
+        redacted: redacted.redacted || sql_redacted != redacted.text,
+        text: sql_redacted,
+    }
+}
+
+/// Redacts text and SQL password literals, then bounds it to `max_chars`.
+pub fn sanitize_sql_bounded(input: &str, max_chars: usize) -> String {
+    truncate_chars(redact_sql(input).text.trim_end(), max_chars)
 }
 
 fn redact_sql_secret_literals(input: &str) -> String {

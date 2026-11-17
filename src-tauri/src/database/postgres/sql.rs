@@ -655,11 +655,45 @@ pub const ROLE_MEMBERSHIPS: &str = "SELECT r.rolname AS role_name \
     JOIN pg_catalog.pg_roles member ON member.oid = m.member \
     WHERE member.rolname = $1 ORDER BY r.rolname";
 
-pub const LIST_SESSIONS: &str = "SELECT pid AS session_id, usename AS user, \
-    client_addr::text AS host, datname AS database_name, state AS state, \
-    EXTRACT(EPOCH FROM (now() - query_start))::bigint AS elapsed_seconds, \
-    query AS query_text FROM pg_catalog.pg_stat_activity \
-    WHERE pid <> pg_backend_pid() ORDER BY pid";
+/// Active client sessions from `pg_stat_activity`. Only columns available on
+/// PostgreSQL 9.2 are selected; `backend_type` and wait-event columns were
+/// added later, so the typed response marks them unavailable. Query text is
+/// only returned for an active query and is redacted by the adapter.
+pub const LIST_SESSIONS: &str = r#"SELECT pid AS session_id,
+    usename AS user_name,
+    client_addr::text AS host,
+    datname AS database_name,
+    application_name,
+    state,
+    query,
+    to_char(query_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+        AS query_started_at,
+    CAST(EXTRACT(EPOCH FROM (now() - query_start)) * 1000 AS BIGINT) AS elapsed_ms,
+    to_char(backend_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+        AS connected_at,
+    (pid = pg_backend_pid()) AS is_current
+FROM pg_catalog.pg_stat_activity
+WHERE usename IS NOT NULL
+  AND ($1::boolean IS FALSE OR (state = 'active' AND query IS NOT NULL AND query <> ''))
+ORDER BY pid
+LIMIT $2 OFFSET $3"#;
+
+pub const SESSION_SUMMARY: &str = r#"SELECT pid AS session_id,
+    usename AS user_name,
+    client_addr::text AS host,
+    datname AS database_name,
+    application_name,
+    state,
+    query,
+    to_char(query_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+        AS query_started_at,
+    CAST(EXTRACT(EPOCH FROM (now() - query_start)) * 1000 AS BIGINT) AS elapsed_ms,
+    to_char(backend_start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+        AS connected_at,
+    (pid = pg_backend_pid()) AS is_current
+FROM pg_catalog.pg_stat_activity
+WHERE pid = $1 AND usename IS NOT NULL
+LIMIT 1"#;
 
 pub const CANCEL_QUERY: &str = "SELECT pg_catalog.pg_cancel_backend($1)";
 pub const KILL_SESSION: &str = "SELECT pg_catalog.pg_terminate_backend($1)";

@@ -187,6 +187,8 @@ pub fn run() {
             commands::database::roles::get_database_role_privileges,
             commands::database::roles::preview_database_role_action,
             commands::database::roles::run_database_role_action,
+            commands::database::sessions::list_database_sessions,
+            commands::database::sessions::run_database_session_action,
             commands::database::discovery::list_database_databases,
             commands::database::discovery::list_database_schemas,
             commands::database::discovery::list_database_tables,

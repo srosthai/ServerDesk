@@ -14,6 +14,7 @@ export const DATABASE_WORKSPACE_VIEWS = [
   "indexes",
   "operations",
   "access",
+  "sessions",
 ] as const;
 
 export type DatabaseWorkspaceView = (typeof DATABASE_WORKSPACE_VIEWS)[number];

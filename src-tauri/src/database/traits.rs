@@ -28,6 +28,7 @@ use super::{
     roles::{RoleDdlPlan, RoleGrantData, RoleRef, RoleSummary, ValidatedRoleAction},
     row_writes::{RowDeleteRequest, RowInsertRequest, RowUpdateRequest, RowWriteResult},
     rows::{RowQueryControl, RowReadRequest, RowReadResult},
+    sessions::{SessionSummary, ValidatedSessionAction},
     structure::{StructureDdlPreview, ValidatedStructureAction},
 };
 
@@ -661,6 +662,30 @@ pub trait DatabaseAdapter: Send + Sync {
         &mut self,
         action: &ValidatedRoleAction,
     ) -> Result<(), DatabaseError>;
+
+    /// Lists active database sessions. Query text is redacted by the adapter
+    /// before it enters the typed response. `running_only` excludes idle
+    /// sessions on engines that expose a command state.
+    async fn list_sessions(
+        &self,
+        page: PageRequest,
+        running_only: bool,
+    ) -> Result<Page<SessionSummary>, DatabaseError>;
+
+    /// Re-reads one session by engine process id. `None` means the session is
+    /// no longer present or is not visible to this account.
+    async fn session_summary(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<SessionSummary>, DatabaseError>;
+
+    /// Sends one cancellation or termination request. Returns true when the
+    /// server accepted the request. The caller re-reads the session to verify
+    /// the outcome; a true return value is not proof of termination.
+    async fn execute_session_action(
+        &mut self,
+        action: &ValidatedSessionAction,
+    ) -> Result<bool, DatabaseError>;
 
     /// Returns a bounded dependency inventory for one table. Callers use it
     /// before destructive structure changes so the UI can name the foreign
