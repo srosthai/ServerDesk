@@ -9,6 +9,7 @@ import type { DatabaseEngine, DatabaseProfile } from "@/types/contracts";
 export const DATABASE_WORKSPACE_VIEWS = [
   "overview",
   "structure",
+  "diagram",
   "data",
   "sql",
   "indexes",

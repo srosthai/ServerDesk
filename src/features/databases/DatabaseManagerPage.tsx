@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import type { Icon } from "@phosphor-icons/react";
 import {
@@ -13,6 +13,7 @@ import {
   PlusIcon,
   PulseIcon,
   RowsIcon,
+  ShareNetworkIcon,
   ShieldCheckIcon,
   TableIcon,
   TreeStructureIcon,
@@ -110,6 +111,8 @@ import type {
   ServerProfile,
 } from "@/types/contracts";
 
+const DatabaseErDiagramView = lazy(() => import("@/features/databases/DatabaseErDiagramView"));
+
 type WorkspaceState = "loading" | "error" | "empty" | "no-server" | "ready";
 
 type DatabaseTab = {
@@ -136,6 +139,14 @@ const databaseTabs: DatabaseTab[] = [
     emptyTitle: "No table selected",
     emptyDescription:
       "Select a table from the explorer to inspect its columns, types, defaults, and constraints.",
+  },
+  {
+    value: "diagram",
+    label: "Diagram",
+    icon: ShareNetworkIcon,
+    emptyTitle: "No diagram selected",
+    emptyDescription:
+      "Choose a database or schema to draw its tables and foreign-key relationships in a read-only diagram.",
   },
   {
     value: "data",
@@ -1902,6 +1913,33 @@ function DatabaseManagerPage() {
                                 }
                               }}
                               onCreateTable={() => setStructureIntent({ type: "create_table" })}
+                            />
+                          )
+                        ) : tab.value === "diagram" ? (
+                          structureProfile ? (
+                            <Suspense fallback={<LoadingState rows={5} />}>
+                              <DatabaseErDiagramView
+                                profile={structureProfile}
+                                profileName={structureProfile.name}
+                                engine={selectedEngineForStructure}
+                                connected={structureConnected}
+                                database={selectedDatabase}
+                                schema={
+                                  selectedEngineForStructure === "mysql" ? null : selectedSchema
+                                }
+                                selectedTable={selectedTableScope}
+                                onSelectTable={(selection) => {
+                                  handleWorkspaceSelectionChange(selection);
+                                  setWorkspaceView(structureProfile.id, "structure");
+                                }}
+                                onConnect={() => void handleConnect(structureProfile)}
+                              />
+                            </Suspense>
+                          ) : (
+                            <EmptyState
+                              icon={<ShareNetworkIcon className="size-4" aria-hidden="true" />}
+                              title="No connection selected"
+                              description="Open a saved connection before drawing tables and foreign-key relationships."
                             />
                           )
                         ) : tab.value === "data" ? (
