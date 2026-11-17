@@ -37,7 +37,11 @@ use crate::database::{
         CsvImportSource, CsvImportSummary,
     },
     dialect::{Identifier, IdentifierQuoter, SqlDialect},
-    errors::DatabaseError,
+    errors::{DatabaseError, DatabaseErrorKind},
+    health::{
+        DatabaseHealthMetrics, MAX_HEALTH_TABLE_LIMIT, table_size_from_parts,
+        unavailable_on_permission,
+    },
     objects::{
         DatabaseObjectKind, ObjectDdlPreview, ObjectDefinition, ObjectRef, RoutineKind,
         RoutineSummary, SequenceDetails, TriggerDetails, TriggerEvent, TriggerSummary,
@@ -697,6 +701,65 @@ impl DatabaseAdapter for PostgresDatabaseAdapter {
         self.version
             .clone()
             .ok_or_else(|| DatabaseError::internal("The database version was not recorded."))
+    }
+
+    async fn health_metrics(&self, limit: u32) -> Result<DatabaseHealthMetrics, DatabaseError> {
+        self.require_connection()?;
+        let limit = limit.clamp(1, MAX_HEALTH_TABLE_LIMIT);
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+
+        let size_result = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::HEALTH_DATABASE_SIZE).fetch_one(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error);
+
+        let database_size_bytes = match size_result {
+            Ok(row) => decode::<Option<i64>>(&row, "size_bytes")?
+                .and_then(|value| u64::try_from(value).ok())
+                .into(),
+            // Some managed servers deny database-size functions even when the
+            // account can browse objects. Report unavailable instead of zero.
+            Err(error) if error.kind == DatabaseErrorKind::Permission => MetadataValue::Unavailable,
+            Err(error) => return Err(error),
+        };
+
+        let tables_result = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::HEALTH_TABLE_SIZES)
+                .bind(i64::from(limit) + 1)
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error);
+
+        let table_sizes = unavailable_on_permission(tables_result.and_then(|rows| {
+            let tables = rows
+                .iter()
+                .map(|row| {
+                    let table_type: String = decode(row, "table_type")?;
+                    Ok(table_size_from_parts(
+                        Some(decode(row, "database_name")?),
+                        Some(decode(row, "schema_name")?),
+                        decode(row, "name")?,
+                        table_kind(&table_type),
+                        decode(row, "size_bytes")?,
+                        decode(row, "estimated_rows")?,
+                        decode::<Option<String>>(row, "metadata_refreshed_at")?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, DatabaseError>>()?;
+            Ok(Bounded::new(tables, limit as usize))
+        }))?;
+
+        Ok(DatabaseHealthMetrics {
+            database_size_bytes,
+            table_sizes,
+        })
     }
 
     async fn close(&mut self) -> Result<(), DatabaseError> {

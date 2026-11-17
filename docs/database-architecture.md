@@ -40,6 +40,7 @@ src-tauri/src/commands/database/
   sessions.rs       session listing and confirmed cancel/terminate commands
   csv.rs            CSV preview, streaming export, transactional import, progress
   dump.rs           SQL dump tool detection, export/restore commands, progress, audit
+  health.rs         manual catalog health sample command
   structure.rs      structure preview and table lifecycle execution + audit
   tunnels.rs        loopback SSH tunnel inspection commands
 
@@ -53,6 +54,7 @@ src-tauri/src/database/
   csv.rs            CSV codec, encoding, preview, transfer service, and cancellation
   dump.rs           SQL dump scopes, tool detection, remote command construction, export/restore service
   dump_remote.rs    SSH/SFTP dump session, temporary files, downloads, uploads
+  health.rs         catalog-only size, version, latency, and health samples
   row_service.rs    row-read service over the connection registry
   rows.rs           row request model, safe planning, cancellation, and page/result types
   sessions.rs       session model, query redaction, confirmation, and verified actions
@@ -1180,6 +1182,58 @@ current-session protection, verified termination, unverified termination, and
 verified cancellation. Unit tests in `database/sessions.rs` cover request
 validation and capability gating; command tests prove history contains no query
 text or secrets.
+
+## Health samples
+
+The Overview tab shows one manual health sample for the selected database. It
+combines the engine and server version recorded at connect time, one bounded
+round-trip ping, and catalog-only size metadata. Nothing is polled or cached by
+the backend, and taking a sample never mutates server state.
+
+| Command               | Purpose                                                       |
+| --------------------- | ------------------------------------------------------------- |
+| `get_database_health` | One catalog-only size, version, latency, and sample timestamp |
+
+`DatabaseHealthSnapshot` contains `engine`, `version`, `database`,
+`sampledAt`, `latencyMs`, `databaseSizeBytes`, and a bounded `tableSizes` list.
+Every optional measurement is a `MetadataValue`; an engine or account that
+cannot report a size receives `unavailable`, never `0`.
+
+- MySQL sums `information_schema.TABLES` data and index lengths for the active
+  schema and reads the largest base tables from the same catalog. Statistics
+  refresh times stay unavailable because reading `mysql.innodb_table_stats`
+  requires privileges most application accounts do not have. No extra
+  restricted read is made for a routine sample.
+- PostgreSQL uses `pg_database_size(current_database())` and
+  `pg_total_relation_size` behind `has_table_privilege`, joined to
+  `pg_stat_user_tables` for the last analyze time. Restricted accounts see an
+  unavailable size instead of a guessed one.
+- Neither engine counts table rows, reads table data, runs `ANALYZE`, or
+  materializes an unbounded table list. Table samples ask for one extra row so
+  truncation is disclosed and are capped at 50 entries.
+
+The React model labels latency as measured and catalog sizes and row counts as
+estimates. It derives five basic indicators: connection latency, database size,
+sampled table footprint, largest table, and statistics freshness. A sample is
+stale after five minutes; an old sample remains visible with its original
+timestamp, and a failed refresh keeps the previous values while showing the
+error. Selecting a different database does not switch the live PostgreSQL
+session, so the panel names the active database and explains the mismatch
+instead of sampling a database the connection cannot read.
+
+`src/services/databaseHealth.ts` is the only React module that invokes the
+command. `src/stores/databaseHealthStore.ts` keeps one sample per profile,
+rejects stale responses with request sequence numbers, and never clears a good
+sample on a refresh failure. `src/features/databases/DatabaseHealthPanel.tsx`
+is the Overview panel; it offers explicit refresh, a stale warning, and honest
+unavailable text for sizes and statistics.
+
+`src-tauri/tests/database_health.rs` covers fixture sizes and versions for both
+engines, bounded table lists, unavailable values, timeout propagation, secret
+redaction, and catalog-only SQL. Frontend tests in
+`databaseHealthModel.test.ts`, `databaseHealthStore.test.ts`, and
+`DatabaseHealthPanel.test.tsx` cover byte and row formatting, estimate labels,
+unavailable values, stale samples, and manual refresh.
 
 ## Fake adapter
 

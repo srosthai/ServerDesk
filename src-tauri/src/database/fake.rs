@@ -23,6 +23,7 @@ use super::{
     },
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
+    health::{DatabaseHealthMetrics, DatabaseTableSize, MAX_HEALTH_TABLE_LIMIT},
     mysql,
     objects::{
         DatabaseObjectKind, ObjectDdlPreview, ObjectDefinition, ObjectRef, RoutineKind,
@@ -157,6 +158,8 @@ pub struct FakeDatabaseAdapter {
     session_execution_error: Option<DatabaseError>,
     skip_session_execution: bool,
     session_execution_count: AtomicUsize,
+    health_metrics_override: Option<DatabaseHealthMetrics>,
+    health_metrics_error: Option<DatabaseError>,
     columns: Vec<ColumnSummary>,
     created_tables: HashMap<String, Vec<ColumnSummary>>,
     indexes: HashMap<String, Vec<IndexSummary>>,
@@ -238,6 +241,8 @@ impl FakeDatabaseAdapter {
             session_execution_error: None,
             skip_session_execution: false,
             session_execution_count: AtomicUsize::new(0),
+            health_metrics_override: None,
+            health_metrics_error: None,
             columns: fixtures.columns,
             created_tables: HashMap::from([(detail_table.clone(), detail_columns)]),
             indexes: HashMap::from([(detail_table.clone(), detail_indexes)]),
@@ -321,6 +326,19 @@ impl FakeDatabaseAdapter {
 
     pub fn session_execution_count(&self) -> usize {
         self.session_execution_count.load(Ordering::SeqCst)
+    }
+
+    /// Overrides catalog health metrics for tests that need explicit
+    /// unavailable values or a deterministic sample.
+    pub fn with_health_metrics(mut self, metrics: DatabaseHealthMetrics) -> Self {
+        self.health_metrics_override = Some(metrics);
+        self
+    }
+
+    /// Makes catalog health sampling fail with a typed database error.
+    pub fn with_health_metrics_error(mut self, error: DatabaseError) -> Self {
+        self.health_metrics_error = Some(error);
+        self
     }
 
     #[cfg(test)]
@@ -980,6 +998,52 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
     async fn version(&self) -> Result<DatabaseVersionInfo, DatabaseError> {
         self.require_connection()?;
         Ok(self.version.clone())
+    }
+
+    async fn health_metrics(&self, limit: u32) -> Result<DatabaseHealthMetrics, DatabaseError> {
+        self.require_connection()?;
+        if let Some(error) = self.health_metrics_error.clone() {
+            return Err(error);
+        }
+        if let Some(metrics) = self.health_metrics_override.clone() {
+            return Ok(metrics);
+        }
+
+        let limit = limit.clamp(1, MAX_HEALTH_TABLE_LIMIT) as usize;
+        let active = self.active_database.as_deref();
+        let database_size_bytes = active
+            .and_then(|name| self.databases.iter().find(|database| database.name == name))
+            .map(|database| database.metadata.size_bytes.clone())
+            .unwrap_or(MetadataValue::Unavailable);
+
+        let mut tables = self
+            .tables
+            .iter()
+            .filter(|table| active.is_none_or(|name| table.database.as_deref() == Some(name)))
+            .map(|table| DatabaseTableSize {
+                database: table.database.clone(),
+                schema: table.schema.clone(),
+                name: table.name.clone(),
+                kind: table.kind,
+                size_bytes: table.metadata.size_bytes.clone(),
+                estimated_rows: table.estimated_rows.clone(),
+                metadata_refreshed_at: table.metadata_refreshed_at.clone(),
+            })
+            .collect::<Vec<_>>();
+        tables.sort_by(|left, right| {
+            right
+                .size_bytes
+                .value()
+                .copied()
+                .unwrap_or(0)
+                .cmp(&left.size_bytes.value().copied().unwrap_or(0))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+
+        Ok(DatabaseHealthMetrics {
+            database_size_bytes,
+            table_sizes: MetadataValue::available(Bounded::from_iter(tables, limit)),
+        })
     }
 
     async fn close(&mut self) -> Result<(), DatabaseError> {

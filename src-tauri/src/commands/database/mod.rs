@@ -9,6 +9,7 @@ pub mod capabilities;
 pub mod csv;
 pub mod discovery;
 pub mod dump;
+pub mod health;
 pub mod history;
 pub mod objects;
 pub mod profiles;

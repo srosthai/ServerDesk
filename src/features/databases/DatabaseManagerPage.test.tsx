@@ -27,10 +27,12 @@ import {
   reconnectDatabaseProfile,
   testDatabaseProfile,
 } from "@/services/databaseProfiles";
-import { objectRowId } from "@/features/databases/databaseExplorerTreeModel";
+import { getDatabaseHealth } from "@/services/databaseHealth";
+import { databaseRowId, objectRowId } from "@/features/databases/databaseExplorerTreeModel";
 import type { DatabaseWorkspaceView } from "@/stores/databaseWorkspaceStore";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { databaseExplorerNodeKey, useDatabaseExplorerStore } from "@/stores/databaseExplorerStore";
+import { useDatabaseHealthStore } from "@/stores/databaseHealthStore";
 import { useDatabaseProfileStore } from "@/stores/databaseProfileStore";
 import { useDatabaseQueryStore } from "@/stores/databaseQueryStore";
 import { useDatabaseRowStore } from "@/stores/databaseRowStore";
@@ -45,6 +47,7 @@ import type {
   DatabaseConnectionSnapshot,
   DatabaseConstraintSummary,
   DatabaseExplorerNodePayload,
+  DatabaseHealthSnapshot,
   DatabaseIndexSummary,
   DatabaseProfile,
   DatabaseQueryExecutionResult,
@@ -126,6 +129,10 @@ vi.mock("@/services/databaseRows", () => ({
   readTableRows: vi.fn(),
   cancelTableRows: vi.fn(),
   createDatabaseRowRequestId: vi.fn(),
+}));
+
+vi.mock("@/services/databaseHealth", () => ({
+  getDatabaseHealth: vi.fn(),
 }));
 
 const server: ServerProfile = {
@@ -280,6 +287,34 @@ const disconnectedSnapshot: DatabaseConnectionSnapshot = {
   readOnly: true,
   databaseName: "app",
   changedAt: 12,
+};
+
+const healthSnapshot: DatabaseHealthSnapshot = {
+  profileId: profile.id,
+  engine: profile.engine,
+  database: "app",
+  version: { version: "16.2.0", raw: "PostgreSQL 16.2" },
+  sampledAt: 1_700_000_000_000,
+  latencyMs: { status: "available", value: 14 },
+  databaseSizeBytes: { status: "available", value: 1_048_576 },
+  tableSizes: {
+    status: "available",
+    value: {
+      items: [
+        {
+          database: "app",
+          schema: "public",
+          name: "users",
+          kind: "table",
+          sizeBytes: { status: "available", value: 16_384 },
+          estimatedRows: { status: "available", value: 42 },
+          metadataRefreshedAt: { status: "available", value: "2026-01-02T03:04:05Z" },
+        },
+      ],
+      limit: 12,
+      truncated: false,
+    },
+  },
 };
 
 const analyticsCapabilities: DatabaseCapabilities = {
@@ -901,6 +936,8 @@ describe("DatabaseManagerPage", () => {
     useDatabaseRoleStore.setState({ entries: {} });
     useDatabaseQueryStore.setState({ entries: {} });
     useDatabaseRowStore.setState({ entries: {} });
+    useDatabaseHealthStore.setState({ entries: {} });
+    vi.mocked(getDatabaseHealth).mockResolvedValue(healthSnapshot);
     vi.mocked(createDatabaseRowRequestId).mockReturnValue("row-request-page");
     vi.mocked(readTableRows).mockResolvedValue(rowGridResult);
     usePreferencesStore.setState({
@@ -1248,6 +1285,29 @@ describe("DatabaseManagerPage", () => {
     const context = screen.getByLabelText("Selected database and schema");
     expect(within(context).getByText("app")).toBeInTheDocument();
     expect(within(context).getByText("public")).toBeInTheDocument();
+  });
+
+  it("shows the database health overview when a database is selected", async () => {
+    useConnectedServer();
+    useProfileStore();
+    useDatabaseWorkspaceStore.getState().openTab(profile);
+    useDatabaseWorkspaceStore.getState().setSelection(profile.id, {
+      id: databaseRowId(profile.id, "app"),
+      profileId: profile.id,
+      kind: "database",
+      label: "app",
+      engine: "postgresql",
+      database: "app",
+      schema: null,
+      objectName: null,
+    });
+    renderPage();
+
+    expect(await screen.findByRole("region", { name: "Health indicators" })).toBeInTheDocument();
+    const summary = screen.getByRole("region", { name: "Health sample summary" });
+    expect(within(summary).getByText("16.2.0")).toBeInTheDocument();
+    expect(within(summary).getByText("14 ms")).toBeInTheDocument();
+    expect(getDatabaseHealth).toHaveBeenCalledWith(profile.id, 12);
   });
 
   it("sets the active database and refreshes the explorer context", async () => {

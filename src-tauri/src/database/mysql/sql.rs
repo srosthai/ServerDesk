@@ -8,6 +8,26 @@
 pub const PING: &str = "SELECT 1";
 pub const SERVER_VERSION: &str = "SELECT VERSION()";
 
+/// Catalog-only size for the active schema. It never reads table rows or runs
+/// statistics maintenance.
+pub const HEALTH_DATABASE_SIZE: &str = "SELECT \
+    CAST(COALESCE(SUM(COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0)), 0) AS SIGNED) \
+        AS size_bytes \
+    FROM information_schema.TABLES \
+    WHERE TABLE_SCHEMA = COALESCE(?, DATABASE())";
+
+/// Largest tables in the active schema, read from catalog metadata only. The
+/// caller asks for one extra row to disclose truncation.
+pub const HEALTH_TABLE_SIZES: &str = "SELECT TABLE_SCHEMA AS database_name, \
+    TABLE_NAME AS name, TABLE_TYPE AS table_type, \
+    CAST(DATA_LENGTH + INDEX_LENGTH AS SIGNED) AS size_bytes, \
+    CAST(TABLE_ROWS AS SIGNED) AS estimated_rows \
+    FROM information_schema.TABLES \
+    WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) \
+    AND TABLE_TYPE = 'BASE TABLE' \
+    ORDER BY COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0) DESC, TABLE_NAME \
+    LIMIT ?";
+
 pub const LIST_DATABASES: &str = "SELECT s.SCHEMA_NAME AS name, \
     s.DEFAULT_CHARACTER_SET_NAME AS encoding, s.DEFAULT_COLLATION_NAME AS collation, \
     COALESCE(t.size_bytes, 0) AS size_bytes \
