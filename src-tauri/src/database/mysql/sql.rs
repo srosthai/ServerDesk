@@ -320,9 +320,25 @@ pub const ROLE_MEMBERSHIPS: &str = "SELECT FROM_USER AS role_name, \
     FROM_HOST AS role_host FROM mysql.role_edges \
     WHERE TO_USER = ? AND TO_HOST = ? ORDER BY FROM_USER, FROM_HOST";
 
-pub const LIST_SESSIONS: &str = "SELECT ID AS session_id, USER AS user, HOST AS host, \
-    DB AS database_name, COMMAND AS command, TIME AS elapsed_seconds, STATE AS state, \
-    INFO AS query_text FROM information_schema.PROCESSLIST ORDER BY ID";
+/// Active connections from the process list. `TIME` is the number of seconds
+/// in the current command state; it is only used as query elapsed time when a
+/// query is running. `INFO` can be NULL when the account lacks PROCESS or the
+/// session is idle.
+pub const LIST_SESSIONS: &str = "SELECT p.ID AS session_id, p.USER AS user_name, \
+    p.HOST AS host, p.DB AS database_name, p.COMMAND AS command, \
+    p.TIME AS elapsed_seconds, p.STATE AS state, p.INFO AS query_text, \
+    (p.ID = CONNECTION_ID()) AS is_current \
+    FROM information_schema.PROCESSLIST p \
+    WHERE (? = 0 OR (p.COMMAND <> 'Sleep' AND p.INFO IS NOT NULL AND p.INFO <> '')) \
+    ORDER BY p.ID LIMIT ? OFFSET ?";
 
-pub const CANCEL_QUERY: &str = "KILL QUERY ?";
-pub const KILL_SESSION: &str = "KILL ?";
+pub const SESSION_SUMMARY: &str = "SELECT p.ID AS session_id, p.USER AS user_name, \
+    p.HOST AS host, p.DB AS database_name, p.COMMAND AS command, \
+    p.TIME AS elapsed_seconds, p.STATE AS state, p.INFO AS query_text, \
+    (p.ID = CONNECTION_ID()) AS is_current \
+    FROM information_schema.PROCESSLIST p WHERE p.ID = ? LIMIT 1";
+
+/// MySQL does not accept a placeholder for the process id in KILL, so the
+/// adapter appends a validated integer to this fixed prefix.
+pub const CANCEL_QUERY: &str = "KILL QUERY";
+pub const KILL_SESSION: &str = "KILL CONNECTION";

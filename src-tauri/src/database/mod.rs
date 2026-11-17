@@ -24,6 +24,7 @@ pub mod row_service;
 pub mod row_writes;
 pub mod rows;
 pub mod service;
+pub mod sessions;
 pub mod structure;
 pub mod traits;
 pub mod validation;
@@ -124,6 +125,12 @@ pub use rows::{
     row_query_timeout, validate_row_query_id,
 };
 pub use service::{DEFAULT_DATABASE_CONNECT_TIMEOUT, DatabaseConnectionRegistry};
+pub use sessions::{
+    DatabaseSessionService, MAX_SESSION_CONFIRMATION_CHARACTERS, MAX_SESSION_IDENTITY_CHARACTERS,
+    MAX_SESSION_QUERY_CHARACTERS, SessionActionKind, SessionActionRequest, SessionActionResult,
+    SessionQuery, SessionSummary, ValidatedSessionAction, execute_session_action_with_adapter,
+    session_capabilities,
+};
 pub use structure::{
     AffectedObject, ColumnDefault, ColumnDefaultRequest, ColumnDefinitionRequest, ColumnPosition,
     ColumnPositionRequest, ConstraintRequest, DatabaseStructureService, GeneratedColumnRequest,

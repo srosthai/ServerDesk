@@ -37,6 +37,7 @@ src-tauri/src/commands/database/
   profiles.rs       saved profile CRUD, test, connect, reconnect, disconnect
   queries.rs        SQL analysis, bounded execution, and cancellation commands
   rows.rs           bounded row reads and cancellation commands
+  sessions.rs       session listing and confirmed cancel/terminate commands
   csv.rs            CSV preview, streaming export, transactional import, progress
   dump.rs           SQL dump tool detection, export/restore commands, progress, audit
   structure.rs      structure preview and table lifecycle execution + audit
@@ -54,6 +55,7 @@ src-tauri/src/database/
   dump_remote.rs    SSH/SFTP dump session, temporary files, downloads, uploads
   row_service.rs    row-read service over the connection registry
   rows.rs           row request model, safe planning, cancellation, and page/result types
+  sessions.rs       session model, query redaction, confirmation, and verified actions
   capabilities.rs   action model, flags, version parsing
   dialect.rs        identifier validation/quoting and value binding
   errors.rs         shared database error taxonomy
@@ -593,10 +595,11 @@ copies fields into another connection.
 
 The Database Manager renders the open connections as a tab strip above the
 workspace. Every connection tab shows the profile name and engine, and the
-workspace header for the Overview, Structure, Data, SQL, Indexes, and
-Operations views repeats the connection name, engine, endpoint, connection
-state, and selected database/schema. A tab opens from the connection list, the
-explorer, or Connect; connecting another profile leaves existing tabs open.
+workspace header for the Overview, Structure, Data, SQL, Indexes, Operations,
+Access, and Sessions views repeats the connection name, engine, endpoint,
+connection state, and selected database/schema. A tab opens from the connection
+list, the explorer, or Connect; connecting another profile leaves existing tabs
+open.
 
 Closing a tab removes only that profile's tab state and explorer cache, then
 disconnects the profile. The disconnect command closes the adapter and its
@@ -1111,6 +1114,72 @@ injection attempts in identifiers and values. `src-tauri/tests/database_mysql.rs
 and `src-tauri/tests/database_postgres.rs` add opt-in live row-browser tests
 that exercise pagination, filtering, sorting, temporal casts, exact counts,
 cancellation, injection attempts, and tables without a stable identity.
+
+## Session and running-query commands
+
+The Sessions tab lists active database sessions and running queries. Listing is
+a bounded metadata read; it never changes server state.
+
+| Command                       | Purpose                                                      |
+| ----------------------------- | ------------------------------------------------------------ |
+| `list_database_sessions`      | Bounded page of visible sessions, optionally running only    |
+| `run_database_session_action` | Cancel one query or terminate one session after confirmation |
+
+`SessionSummary` carries only typed values. Fields the selected engine or
+account cannot expose are `Unavailable`, never guessed:
+
+- MySQL reads `information_schema.PROCESSLIST`: id, account, client host,
+  database, command, state, elapsed seconds, and query text. Query start time,
+  application name, wait event, backend type, and connection start time are
+  unavailable.
+- PostgreSQL reads `pg_stat_activity` with columns available on PostgreSQL 9.2:
+  pid, account, client address, database, application name, state, query text,
+  query start time, query elapsed milliseconds, and backend start time. Command
+  and wait-event fields are unavailable in this baseline query.
+- The current ServerDesk connection is marked `isCurrent` and cannot be
+  targeted.
+
+Query text is redacted before it enters `SessionSummary`: generic secret
+patterns, bearer tokens, credentialed URLs, dotenv lines, private-key blocks,
+and SQL password literals such as `IDENTIFIED BY '...'`, `PASSWORD '...'`, and
+`SET PASSWORD = '...'` are replaced. The preview is bounded to 4,096 characters
+and reports `redacted` and `truncated` separately. Query text is never written
+to operation history or logs.
+
+Cancellation and termination are administrative actions:
+
+1. The request must carry the exact phrase `cancel query <id>` or
+   `terminate session <id>`, the expected account, and the expected database
+   when one was shown. A bare boolean is not accepted.
+2. The backend re-reads the target. A missing session, a changed account or
+   database, the current connection, or an idle session for a cancellation
+   request is rejected before any engine statement runs.
+3. Read-only profiles reject both actions with a typed `permission` error.
+   Capability flags are checked again even though the UI disables the action.
+4. MySQL runs `KILL QUERY <id>` or `KILL CONNECTION <id>` with a validated
+   integer id. PostgreSQL calls `pg_cancel_backend` or `pg_terminate_backend`.
+5. Success is reported only after re-reading the target. Termination is
+   verified when the session is absent. Cancellation is verified when the
+   session is absent, has no running query, or reports a different query.
+   A request the server accepted but the re-read still shows running is
+   returned as `verified: false` with a verification error.
+
+`src/services/databaseSessions.ts` is the only React module that invokes the
+session commands. `src/stores/databaseSessionStore.ts` owns one bounded page
+per connection, the running-only filter, refresh sequence numbers that reject
+stale responses, and action state. `src/features/databases/DatabaseSessionsPanel.tsx`
+is the Sessions tab. The UI refreshes on demand and can poll every five seconds
+for a bounded 60 refreshes. Polling pauses while the document is hidden, does
+not replace the visible table during a refresh, and is stopped when the tab
+unmounts.
+
+`src-tauri/tests/database_sessions.rs` covers fixture listing for both engines,
+running-only filtering, elapsed time, unsupported fields, redaction,
+confirmation mismatch, read-only permission denial, server permission denial,
+current-session protection, verified termination, unverified termination, and
+verified cancellation. Unit tests in `database/sessions.rs` cover request
+validation and capability gating; command tests prove history contains no query
+text or secrets.
 
 ## Fake adapter
 

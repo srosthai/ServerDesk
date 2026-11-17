@@ -1801,6 +1801,52 @@ export type DatabaseRoleActionResult = {
   durationMs: number;
 };
 
+export type DatabaseSessionQuery = {
+  text: string;
+  redacted: boolean;
+  truncated: boolean;
+  startedAt: DatabaseMetadataValue<string>;
+  elapsedMs: DatabaseMetadataValue<number>;
+};
+
+export type DatabaseSessionSummary = {
+  id: number;
+  user: string;
+  host: DatabaseMetadataValue<string>;
+  database: DatabaseMetadataValue<string>;
+  applicationName: DatabaseMetadataValue<string>;
+  command: DatabaseMetadataValue<string>;
+  state: DatabaseMetadataValue<string>;
+  waitEvent: DatabaseMetadataValue<string>;
+  backendType: DatabaseMetadataValue<string>;
+  connectedAt: DatabaseMetadataValue<string>;
+  isCurrent: boolean;
+  query: DatabaseMetadataValue<DatabaseSessionQuery>;
+};
+
+export type DatabaseSessionActionKind = "cancel_query" | "terminate_session";
+
+export type DatabaseSessionActionRequest = {
+  sessionId: number;
+  action: DatabaseSessionActionKind;
+  expectedUser: string;
+  expectedDatabase?: string | null;
+  confirmation: string;
+};
+
+export type DatabaseSessionActionResult = {
+  action: DatabaseSessionActionKind;
+  engine: DatabaseEngine;
+  sessionId: number;
+  user: string;
+  database: DatabaseMetadataValue<string>;
+  requestAccepted: boolean;
+  verified: boolean;
+  verification: string;
+  verificationError?: string | null;
+  durationMs: number;
+};
+
 export type ProjectType = "laravel";
 
 export type OperationCategory = "command" | "service" | "artisan" | "sftp" | "queue" | "database";
