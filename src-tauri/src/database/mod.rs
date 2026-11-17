@@ -14,6 +14,7 @@ pub mod dump;
 pub mod dump_remote;
 pub mod errors;
 pub mod fake;
+pub mod health;
 pub mod mysql;
 pub mod objects;
 pub mod pagination;
@@ -74,6 +75,10 @@ pub use dump_remote::SshDumpRemote;
 pub use errors::{DatabaseError, DatabaseErrorKind};
 pub use fake::FakeDatabaseAdapter;
 pub use fake::FakeRowTable;
+pub use health::{
+    DEFAULT_HEALTH_TABLE_LIMIT, DatabaseHealthMetrics, DatabaseHealthService,
+    DatabaseHealthSnapshot, DatabaseTableSize, MAX_HEALTH_TABLE_LIMIT,
+};
 pub use mysql::MysqlDatabaseAdapter;
 pub use objects::{
     DatabaseObjectKind, DatabaseObjectService, MAX_OBJECT_BODY_LENGTH,

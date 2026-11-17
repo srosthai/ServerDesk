@@ -530,6 +530,27 @@ export type DatabaseBounded<T> = {
   truncated: boolean;
 };
 
+export type DatabaseTableSize = {
+  database: string | null;
+  schema: string | null;
+  name: string;
+  kind: DatabaseTableKind;
+  sizeBytes: DatabaseMetadataValue<number>;
+  estimatedRows: DatabaseMetadataValue<number>;
+  metadataRefreshedAt: DatabaseMetadataValue<string>;
+};
+
+export type DatabaseHealthSnapshot = {
+  profileId: string;
+  engine: DatabaseEngine;
+  database: string | null;
+  version: DatabaseVersionInfo;
+  sampledAt: number;
+  latencyMs: DatabaseMetadataValue<number>;
+  databaseSizeBytes: DatabaseMetadataValue<number>;
+  tableSizes: DatabaseMetadataValue<DatabaseBounded<DatabaseTableSize>>;
+};
+
 export type DatabaseTableDependencies = {
   incomingForeignKeys: DatabaseMetadataValue<DatabaseBounded<DatabaseDependencySummary>>;
   dependentViews: DatabaseMetadataValue<DatabaseBounded<DatabaseDependencySummary>>;
