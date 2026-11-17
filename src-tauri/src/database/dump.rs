@@ -472,6 +472,8 @@ pub struct DumpConnection {
     pub database: Option<String>,
     pub username: String,
     pub ssl_mode: Option<String>,
+    /// Restores are refused when the saved profile is read-only.
+    pub read_only: bool,
 }
 
 impl From<&DatabaseConnection> for DumpConnection {
@@ -484,6 +486,7 @@ impl From<&DatabaseConnection> for DumpConnection {
             database: profile.database_name.clone(),
             username: profile.username.clone(),
             ssl_mode: profile.ssl_mode.clone(),
+            read_only: profile.read_only,
         }
     }
 }
@@ -840,6 +843,7 @@ pub fn validate_restore_request(
             "Choose the database that the dump should be restored into.",
         ));
     }
+    validate_tool_database_name(request.target_database.as_str())?;
     restore_tool_for(context.engine, request.format, request.tool)?;
     match context.engine {
         DatabaseEngine::Mysql => {
@@ -876,6 +880,7 @@ pub fn validate_restore_preview_request(
             "Choose the database that the dump should be restored into.",
         ));
     }
+    validate_tool_database_name(request.target_database.as_str())?;
     restore_tool_for(context.engine, request.format, request.tool)?;
     match context.engine {
         DatabaseEngine::Mysql => {
@@ -920,6 +925,45 @@ pub fn validate_restore_confirmation(
     Ok(())
 }
 
+/// Rejects database names that a dump tool would interpret as a connection
+/// string instead of a literal database name.
+///
+/// `pg_dump`, `pg_dumpall`, `psql`, and `pg_restore` accept a libpq conninfo
+/// string in `--dbname`. A document value such as `host=attacker` would make
+/// the tool connect elsewhere and send the process `PGPASSWORD` there. The
+/// same characters are not valid in a MySQL database name on any supported
+/// platform, so both engines share this fail-closed check.
+fn validate_tool_database_name(name: &str) -> Result<(), DatabaseError> {
+    if name.trim().is_empty() || name.trim() != name {
+        return Err(DatabaseError::validation(
+            "The dump database name must not be empty or surrounded by whitespace.",
+        ));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(DatabaseError::validation(
+            "The dump database name cannot contain control characters.",
+        ));
+    }
+    if name.starts_with('-') {
+        return Err(DatabaseError::validation(
+            "The dump database name cannot start with '-'; a database tool could treat it as an option.",
+        )
+        .with_details("Rename the database or choose one that does not begin with a dash."));
+    }
+    if let Some(character) = name
+        .chars()
+        .find(|character| matches!(character, '=' | ':' | '/' | '@' | '?' | '&' | '%' | '#'))
+    {
+        return Err(DatabaseError::validation(format!(
+            "The dump database name contains {character:?}, which a database tool can interpret as a connection string."
+        ))
+        .with_details(
+            "Choose a database name without '=', ':', '/', '@', '?', '&', '%', or '#'. The tool receives the name as a literal database, never as a connection string.",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_scope(
     engine: DatabaseEngine,
     connection: &DumpConnection,
@@ -953,6 +997,7 @@ fn validate_scope(
                         "Choose the MySQL database to dump; the profile has no default database.",
                     )
                 })?;
+            validate_tool_database_name(database)?;
             if let DumpScope::Tables {
                 schema: Some(schema),
                 tables,
@@ -976,13 +1021,18 @@ fn validate_scope(
                         "pg_dumpall exports plain SQL only. Choose the plain SQL format.",
                     ));
                 }
+                let database = connection.database.as_deref().unwrap_or("postgres");
+                validate_tool_database_name(database)?;
                 return Ok(());
             }
-            if scope.database(connection.database.as_deref()).is_none() {
-                return Err(DatabaseError::validation(
-                    "Choose the PostgreSQL database to dump; the profile has no default database.",
-                ));
-            }
+            let database = scope
+                .database(connection.database.as_deref())
+                .ok_or_else(|| {
+                    DatabaseError::validation(
+                        "Choose the PostgreSQL database to dump; the profile has no default database.",
+                    )
+                })?;
+            validate_tool_database_name(database)?;
             if let DumpScope::Schema { schema, .. } = scope {
                 validate_pg_pattern_name(schema, "schema")?;
             }
@@ -1034,6 +1084,12 @@ fn validate_tables(tables: &[Identifier], engine: DatabaseEngine) -> Result<(), 
         if !seen.insert(table.as_str()) {
             return Err(DatabaseError::validation(format!(
                 "The table {} was selected more than once.",
+                table.as_str()
+            )));
+        }
+        if table.as_str().starts_with('-') {
+            return Err(DatabaseError::validation(format!(
+                "The table {} cannot start with '-'; a database tool could treat it as an option.",
                 table.as_str()
             )));
         }
@@ -2370,6 +2426,14 @@ impl<'a> DatabaseDumpService<'a> {
     ) -> Result<DumpRestoreResult, AppError> {
         validate_restore_request(context, request).map_err(AppError::from)?;
         validate_restore_confirmation(server_id, request).map_err(AppError::from)?;
+        if connection.read_only {
+            return Err(AppError::permission(
+                "The database connection profile is read-only; restoring a dump requires a writable connection profile.",
+            )
+            .with_details(
+                "No statement was executed and no dump file was read. Use a writable database profile to restore data.",
+            ));
+        }
         let started = Instant::now();
         let tracker =
             DumpProgressTracker::new(transfer_id, DumpDirection::Restore, Arc::clone(&events));
@@ -3192,6 +3256,7 @@ pub fn join_remote(parent: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::errors::DatabaseErrorKind;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[derive(Default)]
@@ -3543,6 +3608,7 @@ mod tests {
             database: Some("app".to_string()),
             username: "app".to_string(),
             ssl_mode: None,
+            read_only: false,
         }
     }
 
@@ -3922,6 +3988,86 @@ mod tests {
         assert_eq!(error.code, ErrorCode::Validation);
         assert!(error.message.contains("confirmation"));
         assert!(remote.commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_only_profile_cannot_restore_before_any_command() {
+        let remote = FakeRemote::new();
+        let service = DatabaseDumpService::new(&remote);
+        let mut connection = connection(DatabaseEngine::Postgresql);
+        connection.read_only = true;
+        let error = service
+            .restore(
+                "server-1",
+                &context(DatabaseEngine::Postgresql),
+                &connection,
+                &password(),
+                "restore-read-only",
+                &restore_request(DumpSource::Remote {
+                    path: "/home/deploy/backup.sql".to_string(),
+                }),
+                &control(),
+                Arc::new(RecordingSink::new()),
+            )
+            .await
+            .expect_err("read-only restore must fail");
+
+        assert_eq!(error.code, ErrorCode::Permission);
+        assert!(error.message.contains("read-only"));
+        assert!(remote.commands().is_empty());
+    }
+
+    #[test]
+    fn dump_database_names_cannot_smuggle_a_connection_string() {
+        let hostile = "host=attacker port=5432 dbname=postgres";
+        let database = Identifier::new(hostile).expect("identifier accepts the payload");
+        let connection = DumpConnection {
+            database: Some(hostile.to_string()),
+            ..connection(DatabaseEngine::Postgresql)
+        };
+        let context = context(DatabaseEngine::Postgresql);
+
+        let export = DumpExportRequest {
+            scope: DumpScope::Database {
+                database: Some(database.clone()),
+            },
+            format: DumpFormat::PlainSql,
+            tool: None,
+            destination: remote_destination(),
+            no_owner: false,
+        };
+        let error = validate_export_request(&context, &connection, &export)
+            .expect_err("conninfo database must fail closed");
+        assert_eq!(error.kind, DatabaseErrorKind::Validation);
+        assert!(error.message.contains("connection string"));
+
+        let cluster = DumpExportRequest {
+            scope: DumpScope::Cluster,
+            ..export
+        };
+        assert!(
+            validate_export_request(&context, &connection, &cluster).is_err(),
+            "cluster dump uses the profile database too"
+        );
+
+        let mut restore = restore_request(DumpSource::Remote {
+            path: "/home/deploy/backup.sql".to_string(),
+        });
+        restore.target_database = database;
+        restore
+            .confirmation
+            .as_mut()
+            .expect("confirmation")
+            .target_database = hostile.to_string();
+        restore
+            .confirmation
+            .as_mut()
+            .expect("confirmation")
+            .replaced_data = restore_replaced_data(hostile, false);
+        let error = validate_restore_request(&context, &restore)
+            .expect_err("conninfo restore target must fail closed");
+        assert_eq!(error.kind, DatabaseErrorKind::Validation);
+        assert!(error.message.contains("connection string"));
     }
 
     #[tokio::test]

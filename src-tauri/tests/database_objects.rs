@@ -404,7 +404,7 @@ async fn object_ddl_previews_are_engine_specific() {
             .ddl
             .starts_with("CREATE OR REPLACE FUNCTION \"public\".\"user_email\"")
     );
-    assert!(routine.ddl.contains("LANGUAGE sql"));
+    assert!(routine.ddl.contains("LANGUAGE \"sql\""));
     assert!(routine.requires_confirmation);
 
     let trigger = preview_object_with_adapter(

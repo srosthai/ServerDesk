@@ -333,6 +333,14 @@ impl TunnelListenerFactory for FailingListenerFactory {
     }
 }
 
+struct PublicListenerFactory;
+
+impl TunnelListenerFactory for PublicListenerFactory {
+    fn bind_loopback(&self) -> io::Result<StdTcpListener> {
+        StdTcpListener::bind("0.0.0.0:0")
+    }
+}
+
 #[tokio::test]
 async fn successful_tunnel_forwards_only_through_the_ssh_session() {
     let fixture = FixtureServer::start(false, Duration::ZERO).await;
@@ -410,6 +418,39 @@ async fn bind_failure_returns_a_typed_error_without_publishing_a_tunnel() {
     assert_eq!(error.code, ErrorCode::Network);
     assert!(error.message.contains("loopback"));
     assert!(tunnels.list().expect("list tunnels").is_empty());
+    connections
+        .disconnect("fixture-server")
+        .await
+        .expect("disconnect");
+}
+
+#[tokio::test]
+async fn a_public_listener_factory_is_rejected_without_publishing_a_tunnel() {
+    let fixture = FixtureServer::start(false, Duration::ZERO).await;
+    let connections = connection_manager();
+    connections
+        .connect(fixture.request("fixture-server"))
+        .await
+        .expect("connect fixture");
+    let tunnels = TunnelManager::with_options(
+        Arc::clone(&connections),
+        Arc::new(PublicListenerFactory),
+        tunnel_timeouts(),
+        4,
+    );
+
+    let error = tunnels
+        .open(request("db-public", "fixture-server", 5432))
+        .await
+        .expect_err("a wildcard listener must be rejected");
+
+    assert_eq!(error.code, ErrorCode::Network);
+    assert!(error.message.contains("loopback"));
+    assert!(tunnels.list().expect("list tunnels").is_empty());
+    assert!(
+        fixture.targets().is_empty(),
+        "no remote channel may be opened for a rejected listener"
+    );
     connections
         .disconnect("fixture-server")
         .await

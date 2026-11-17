@@ -507,6 +507,8 @@ impl TunnelManager {
             .listener_factory
             .bind_loopback()
             .map_err(|error| loopback_error().with_details(format!("{error}")))?;
+        let listener = require_loopback_listener(listener)
+            .map_err(|error| loopback_error().with_details(format!("{error}")))?;
         listener
             .set_nonblocking(true)
             .map_err(|_| loopback_error())?;
@@ -717,6 +719,23 @@ fn validate_request(request: TunnelRequest) -> Result<(TunnelRequest, TunnelTarg
     ))
 }
 
+/// Enforces the listener contract even if a future factory implementation
+/// returns a wildcard or public address by mistake. The bound address is
+/// checked before the listener is published or accepted from.
+fn require_loopback_listener(listener: StdTcpListener) -> io::Result<StdTcpListener> {
+    let address = listener.local_addr()?;
+    if !address.ip().is_loopback() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the tunnel listener bound {}, but database tunnels require a loopback address",
+                address.ip()
+            ),
+        ));
+    }
+    Ok(listener)
+}
+
 fn take_listener(listener: &SharedListener) -> Option<TcpListener> {
     listener
         .lock()
@@ -768,6 +787,15 @@ mod tests {
         assert!(address.ip().is_loopback());
         assert_eq!(address.ip(), Ipv4Addr::LOCALHOST);
         assert_ne!(address.port(), 0);
+    }
+
+    #[test]
+    fn a_misbehaving_factory_cannot_publish_a_public_listener() {
+        let public = StdTcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .expect("wildcard listener");
+        let error = require_loopback_listener(public).expect_err("wildcard listener rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("loopback"));
     }
 
     #[test]

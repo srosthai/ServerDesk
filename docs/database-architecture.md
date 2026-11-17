@@ -279,6 +279,12 @@ disturbs the active session for the same profile.
 | `disconnect_database_profile`   | Close the adapter and tunnel                                 |
 | `get_database_connection_state` | Read a typed connection snapshot                             |
 
+`delete_database_profile` requires `confirmed: true`. The command rejects an
+unconfirmed request before closing a session or tunnel, deleting the credential,
+or removing the profile row. The UI confirmation names the profile, server,
+engine, and local data that is removed; the backend check makes bypassing that
+dialog fail closed.
+
 DTOs are camelCase. `DatabaseProfile` exposes `hasCredential` rather than the
 opaque credential reference, and neither the reference nor a password is ever
 serialized. `DatabaseConnectionSnapshot` exposes the engine, server version,
@@ -875,12 +881,16 @@ returned, the extra sets are counted as truncated and discarded.
 
 SQL analysis is conservative and engine-aware. `hasWrites` is true for DML,
 DDL, session-changing statements, data-modifying CTEs, `SELECT ... INTO`, and
-locking reads such as `FOR UPDATE`. A read-only profile rejects these before the
-adapter executes anything. Destructive analysis flags `DROP` and `TRUNCATE`, and
-flags `DELETE`/`UPDATE` that have no top-level `WHERE` or an always-true
-predicate. Destructive SQL returns a typed `cancelled` error unless the caller
-passes `confirmed: true`, so bypassing the UI cannot run it. Warnings name the
-one-based statement index and never echo the SQL text.
+locking reads such as `FOR UPDATE`. Session- and sequence-mutating functions
+(`set_config`, `setval`, `nextval`, `pg_terminate_backend`,
+`pg_cancel_backend`, `lo_import`, `lo_export`, `dblink_exec`) are also writes,
+so a `SELECT` cannot quietly disable a read-only session default. A read-only
+profile rejects these before the adapter executes anything. Destructive
+analysis flags `DROP`, `TRUNCATE`, `ALTER ... DROP`, and `DELETE`/`UPDATE` that
+have no top-level `WHERE` or an always-true predicate. Destructive SQL returns
+a typed `cancelled` error unless the caller passes `confirmed: true`, so
+bypassing the UI cannot run it. Warnings name the one-based statement index and
+never echo the SQL text.
 
 Comments, quoted strings, quoted identifiers, MySQL `#` comments, and
 PostgreSQL dollar-quoted strings are excluded from keyword detection. An
@@ -1538,6 +1548,21 @@ field, a progress event, a history field, or a log line. Every path and
 identifier is quoted as one POSIX shell argument; tool names and flags are
 closed literals. There is no generic shell command path.
 
+A restore is refused for a read-only database profile before the password is
+loaded, a tool is detected, or a remote session is opened. Export remains
+available because it is read-only. A read-only check at the command layer and
+again in `DatabaseDumpService::restore` prevents a caller from bypassing the UI.
+
+PostgreSQL accepts a libpq conninfo string in `--dbname`. A database name such
+as `host=attacker port=5432` would send `PGPASSWORD` to that endpoint, so every
+dump and restore database name (including the profile fallback and cluster
+scope) rejects `=`, `:`, `/`, `@`, `?`, `&`, `%`, `#`, control characters, and
+surrounding whitespace. MySQL passes the database and selected tables as
+positional arguments, so names beginning with `-` are also rejected before
+command construction; otherwise `mysqldump` could parse a table name as an
+option. A normal name is still passed as one quoted argument. MySQL restore
+targets receive the same fail-closed check for consistency.
+
 A remote destination is written to a sibling
 `<destination>.serverdesk-<id>.part` file and moved into place only after the
 tool exits with status 0 and the file is confirmed to be a regular, non-empty
@@ -1591,14 +1616,17 @@ construction, hostile identifiers, explicit tool selection, plain SQL and
 archive restore commands, successful remote and local exports, size
 verification, empty and failed dumps, overwrite protection, failure summaries,
 cancellation with process kill, restore preview, restore confirmation naming,
-cancelled restore partial state, local download failure, and credential
-redaction. Command builders additionally assert that `--password` never appears
-and that the password variable is read from the temporary file. Frontend
-service and store tests cover backup command payloads, previews, success,
-failure, missing tools, overwrite conflicts, cancellation, incomplete restore
-state, and refusal to restore without confirmation. Component tests exercise
-the CSV and dump wizards, file selection, mapping, progress, cancel, retry,
-permission-denied and disconnected states, overwrite and restore confirmations,
+read-only restore rejection, conninfo-shaped database-name rejection, cancelled
+restore partial state, local download failure, and credential redaction. Command
+builders additionally assert that `--password` never appears and that the
+password variable is read from the temporary file. `tests/database_security.rs`
+adds the cross-cutting dump security cases and is run as a dedicated CI step.
+Frontend service and store tests cover backup command payloads, previews,
+success, failure, missing tools, overwrite conflicts, cancellation, incomplete
+restore state, and refusal to restore without confirmation. Component tests
+exercise the CSV and dump wizards, file selection, mapping, progress, cancel,
+retry, permission-denied and disconnected states, overwrite and restore
+confirmations,
 partial-result disclosure, and per-connection operation history.
 
 ## Current limitations

@@ -208,6 +208,7 @@ mod tests {
             database: Some("app".to_string()),
             username: "app".to_string(),
             ssl_mode: None,
+            read_only: false,
         }
     }
 

@@ -118,7 +118,13 @@ pub async fn delete_database_profile(
     connections: State<'_, DatabaseConnectionRegistry>,
     tunnels: State<'_, Arc<TunnelManager>>,
     id: String,
+    confirmed: bool,
 ) -> Result<(), AppError> {
+    if !confirmed {
+        return Err(AppError::validation(
+            "Deleting a database profile requires explicit confirmation.",
+        ));
+    }
     let profile = load_profile(database.inner(), &id)?;
 
     // Both calls are idempotent. Closing the registry session also closes its
@@ -132,7 +138,7 @@ pub async fn delete_database_profile(
         credentials.inner().as_ref(),
         credential_index.inner(),
     )
-    .delete(&id)
+    .delete(&id, true)
 }
 
 #[tauri::command]

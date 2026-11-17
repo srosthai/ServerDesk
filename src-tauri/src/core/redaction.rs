@@ -140,18 +140,53 @@ fn sql_secret_literal_after(
             .is_some_and(|byte| *byte == b'=' || *byte == b':')
         {
             index = skip_ascii_whitespace(input, index + 1);
+        } else if let Some(after_for) = consume_ascii_word(input, index, "for") {
+            // MySQL: SET PASSWORD FOR 'user'@'host' = 'password'. The account
+            // expression is not secret; skip it before looking for the literal.
+            index = skip_sql_account_expression(input, after_for);
+            index = skip_ascii_whitespace(input, index);
+            if input
+                .as_bytes()
+                .get(index)
+                .is_some_and(|byte| *byte == b'=')
+            {
+                index = skip_ascii_whitespace(input, index + 1);
+            } else {
+                let after_to = consume_ascii_word(input, index, "to")?;
+                index = skip_ascii_whitespace(input, after_to);
+            }
+        } else if input
+            .as_bytes()
+            .get(index)
+            .is_some_and(|byte| *byte == b'(')
+        {
+            // MySQL: PASSWORD('password') function call.
+            index = skip_ascii_whitespace(input, index + 1);
         }
     } else {
-        // MySQL: IDENTIFIED [WITH auth_plugin] BY 'password'.
+        // MySQL: IDENTIFIED [WITH auth_plugin] BY 'password' or
+        // IDENTIFIED WITH auth_plugin AS 'auth_string'.
         if let Some(after_with) = consume_ascii_word(input, index, "with") {
             index = skip_ascii_whitespace(input, after_with);
             index = skip_auth_plugin(input, index);
             index = skip_ascii_whitespace(input, index);
         }
-        index = consume_ascii_word(input, index, "by")?;
-        index = skip_ascii_whitespace(input, index);
+        if let Some(after_by) = consume_ascii_word(input, index, "by") {
+            index = skip_ascii_whitespace(input, after_by);
+            // Older MySQL syntax: IDENTIFIED BY PASSWORD 'hash'.
+            if let Some(after_password) = consume_ascii_word(input, index, "password") {
+                index = skip_ascii_whitespace(input, after_password);
+            }
+        } else {
+            let after_as = consume_ascii_word(input, index, "as")?;
+            index = skip_ascii_whitespace(input, after_as);
+        }
     }
 
+    quoted_literal_at(input, index)
+}
+
+fn quoted_literal_at(input: &str, index: usize) -> Option<(usize, usize, char)> {
     let quote = match input[index..].chars().next()? {
         '\'' => '\'',
         '"' => '"',
@@ -159,6 +194,43 @@ fn sql_secret_literal_after(
     };
     let literal_end = closing_quote_index(input, index, quote)?;
     Some((index, literal_end, quote))
+}
+
+/// Skips a MySQL account expression such as `'app'@'%'`, `app@localhost`, or
+/// `CURRENT_USER` without treating either part as the password literal.
+fn skip_sql_account_expression(input: &str, start: usize) -> usize {
+    let mut index = skip_ascii_whitespace(input, start);
+    index = skip_sql_account_part(input, index);
+    index = skip_ascii_whitespace(input, index);
+    if input
+        .as_bytes()
+        .get(index)
+        .is_some_and(|byte| *byte == b'@')
+    {
+        index = skip_ascii_whitespace(input, index + 1);
+        index = skip_sql_account_part(input, index);
+    }
+    index
+}
+
+fn skip_sql_account_part(input: &str, start: usize) -> usize {
+    let Some(first) = input[start..].chars().next() else {
+        return start;
+    };
+    if matches!(first, '\'' | '"') {
+        return closing_quote_index(input, start, first)
+            .map(|index| index + first.len_utf8())
+            .unwrap_or(start);
+    }
+
+    let mut index = start;
+    for character in input[start..].chars() {
+        if character.is_whitespace() || matches!(character, '@' | '=' | ';') {
+            break;
+        }
+        index += character.len_utf8();
+    }
+    index
 }
 
 fn skip_ascii_whitespace(input: &str, start: usize) -> usize {
@@ -656,7 +728,10 @@ mod tests {
             "CREATE USER 'app'@'%' IDENTIFIED BY 'fixture-password';\n\
              ALTER ROLE app WITH PASSWORD 'fixture-role-password';\n\
              CREATE USER 'plugin'@'%' IDENTIFIED WITH caching_sha2_password BY 'fixture-plugin-password';\n\
+             CREATE USER 'hash'@'%' IDENTIFIED WITH caching_sha2_password AS 'fixture-auth-hash';\n\
              SET PASSWORD = 'fixture-set-password';\n\
+             SET PASSWORD FOR 'app'@'%' = 'fixture-set-for-password';\n\
+             SELECT PASSWORD('fixture-password-function');\n\
              SELECT password, token FROM users WHERE active = true;\n",
             MAX,
         );
@@ -665,7 +740,10 @@ mod tests {
             "fixture-password",
             "fixture-role-password",
             "fixture-plugin-password",
+            "fixture-auth-hash",
             "fixture-set-password",
+            "fixture-set-for-password",
+            "fixture-password-function",
         ] {
             assert!(
                 !sanitized.contains(secret),

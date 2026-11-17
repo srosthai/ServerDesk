@@ -170,9 +170,10 @@ describe("database profile service contract", () => {
       input,
     });
 
-    await expect(deleteDatabaseProfile("profile-1")).resolves.toBeUndefined();
+    await expect(deleteDatabaseProfile("profile-1", true)).resolves.toBeUndefined();
     expect(invoke).toHaveBeenNthCalledWith(5, databaseProfileCommands.delete, {
       id: "profile-1",
+      confirmed: true,
     });
 
     await expect(testDatabaseProfile("profile-1")).resolves.toEqual(testResult);
