@@ -1543,7 +1543,7 @@ function DatabaseManagerPage() {
     }
 
     setDeletePending(true);
-    const deleted = await deleteProfile(deleteTarget.id);
+    const deleted = await deleteProfile(deleteTarget.id, true);
     setDeletePending(false);
 
     if (deleted) {

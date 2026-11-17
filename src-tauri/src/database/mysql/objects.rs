@@ -108,8 +108,12 @@ pub fn preview(action: &ValidatedObjectAction) -> Result<ObjectDdlPreview, Datab
             };
             let mut statement = header;
             if let Some(language) = language {
-                statement.push_str(" LANGUAGE ");
-                statement.push_str(language.as_str());
+                if !language.as_str().eq_ignore_ascii_case("sql") {
+                    return Err(DatabaseError::capability(
+                        "MySQL stored routines use LANGUAGE SQL only.",
+                    ));
+                }
+                statement.push_str(" LANGUAGE SQL");
             }
             statement.push('\n');
             statement.push_str(body);

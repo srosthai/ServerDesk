@@ -397,15 +397,14 @@ impl MysqlDatabaseAdapter {
         let arguments: Option<String> = None;
         let return_type: Option<String> = decode(&row, "return_type")?;
         let definition = body.as_ref().map(|body| {
+            let name = MYSQL_DIALECT.quote_identifier(&object.name);
             let header = match routine_type.as_str() {
                 "PROCEDURE" => format!(
-                    "CREATE PROCEDURE {}({})",
-                    object.name.as_str(),
+                    "CREATE PROCEDURE {name}({})",
                     arguments.as_deref().unwrap_or("")
                 ),
                 _ => format!(
-                    "CREATE FUNCTION {}({}) RETURNS {}",
-                    object.name.as_str(),
+                    "CREATE FUNCTION {name}({}) RETURNS {}",
                     arguments.as_deref().unwrap_or(""),
                     return_type.as_deref().unwrap_or("?")
                 ),

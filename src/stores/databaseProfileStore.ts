@@ -37,7 +37,7 @@ type DatabaseProfileStore = {
   fetchProfile: (id: string) => Promise<DatabaseProfile | null>;
   createProfile: (input: DatabaseProfileInput) => Promise<DatabaseProfile | null>;
   updateProfile: (id: string, input: DatabaseProfileInput) => Promise<DatabaseProfile | null>;
-  deleteProfile: (id: string) => Promise<boolean>;
+  deleteProfile: (id: string, confirmed: boolean) => Promise<boolean>;
   testProfile: (id: string) => Promise<DatabaseTestResult | null>;
   connectProfile: (id: string) => Promise<boolean>;
   reconnectProfile: (id: string) => Promise<boolean>;
@@ -278,7 +278,7 @@ export const useDatabaseProfileStore = create<DatabaseProfileStore>((set, get) =
     }
   },
 
-  deleteProfile: async (id) => {
+  deleteProfile: async (id, confirmed) => {
     if (!isTauriRuntime()) {
       set({ error: "Database profiles are available in the desktop application." });
       return false;
@@ -291,7 +291,7 @@ export const useDatabaseProfileStore = create<DatabaseProfileStore>((set, get) =
     }));
 
     try {
-      await deleteDatabaseProfile(id);
+      await deleteDatabaseProfile(id, confirmed);
       set((state) => ({
         profiles: removeCachedProfile(state.profiles, id),
         snapshots: omitKey(state.snapshots, id),

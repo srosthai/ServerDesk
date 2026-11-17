@@ -407,13 +407,38 @@ impl<'a> DatabaseProfileService<'a> {
 
     /// Deletes the credential before the metadata row so a failure cannot
     /// leave an orphaned secret.
-    pub fn delete(&self, id: &str) -> Result<(), AppError> {
+    pub fn delete(&self, id: &str, confirmed: bool) -> Result<(), AppError> {
+        if !confirmed {
+            return Err(AppError::validation(
+                "Deleting a database profile requires explicit confirmation.",
+            )
+            .with_details(
+                "No profile metadata, credential, session, or tunnel was changed. Review the profile, server, and engine, then confirm the delete.",
+            ));
+        }
         if self.database.get_database_connection(id)?.is_none() {
             return Err(AppError::not_found("Database profile not found."));
         }
 
         DatabaseCredentialService::new(self.credentials, self.index)
             .delete_profile(self.database, id)
+    }
+
+    /// Deletes every saved database profile for one server and its credential.
+    ///
+    /// SQLite cascades `database_connections` when the server row is removed,
+    /// so callers must run this first. Each credential is removed before its
+    /// profile row; a locked credential store aborts the sequence instead of
+    /// leaving an orphaned database password behind.
+    pub fn delete_for_server(&self, server_id: &str) -> Result<usize, AppError> {
+        let profiles = self
+            .database
+            .list_database_connections(server_id)
+            .map_err(AppError::from)?;
+        for profile in &profiles {
+            self.delete(&profile.id, true)?;
+        }
+        Ok(profiles.len())
     }
 
     fn ensure_server_exists(&self, server_id: &str) -> Result<(), AppError> {

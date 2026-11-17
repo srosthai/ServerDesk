@@ -51,8 +51,8 @@ export function updateDatabaseProfile(
   return invoke<DatabaseProfile>(databaseProfileCommands.update, { id, input });
 }
 
-export function deleteDatabaseProfile(id: string): Promise<void> {
-  return invoke<void>(databaseProfileCommands.delete, { id });
+export function deleteDatabaseProfile(id: string, confirmed: boolean): Promise<void> {
+  return invoke<void>(databaseProfileCommands.delete, { id, confirmed });
 }
 
 export function testDatabaseProfile(id: string): Promise<DatabaseTestResult> {

@@ -224,7 +224,25 @@ fn profile_crud_coordinates_credentials_and_never_serializes_secrets() {
         "replacement-password"
     );
 
-    service.delete(&created.id).expect("delete profile");
+    let error = service
+        .delete(&created.id, false)
+        .expect_err("unconfirmed delete must fail closed");
+    assert_eq!(error.code, ErrorCode::Validation);
+    assert!(error.message.contains("confirmation"));
+    assert!(
+        database
+            .get_database_connection(&created.id)
+            .expect("profile still exists")
+            .is_some()
+    );
+    assert_eq!(
+        credentials
+            .get_secret(&reference)
+            .expect("credential still exists"),
+        "replacement-password"
+    );
+
+    service.delete(&created.id, true).expect("delete profile");
     assert!(
         database
             .get_database_connection(&created.id)
@@ -239,6 +257,52 @@ fn profile_crud_coordinates_credentials_and_never_serializes_secrets() {
             .iter()
             .all(|indexed| indexed != &reference)
     );
+}
+
+#[test]
+fn deleting_a_server_scope_removes_every_database_credential_first() {
+    let (_directory, database, credentials, index, server_id) = setup();
+    let service = DatabaseProfileService::new(&database, &credentials, &index);
+
+    let mut references = Vec::new();
+    for name in ["Primary", "Reporting"] {
+        let created = service
+            .create(profile_input(&server_id, name))
+            .expect("create profile");
+        let stored = database
+            .get_database_connection(&created.id)
+            .expect("read stored profile")
+            .expect("profile");
+        references.push(stored.credential_ref.expect("credential reference"));
+    }
+
+    assert_eq!(
+        service
+            .delete_for_server(&server_id)
+            .expect("delete profiles"),
+        2
+    );
+    assert!(service.list(&server_id).expect("list").is_empty());
+    for reference in &references {
+        assert!(
+            credentials.get_secret(reference).is_err(),
+            "database credential must not outlive its server"
+        );
+        assert!(
+            index
+                .references()
+                .expect("credential index")
+                .iter()
+                .all(|indexed| indexed != reference),
+            "credential index must not retain the reference"
+        );
+    }
+    assert!(
+        database.get_server(&server_id).expect("server").is_some(),
+        "only database profiles are removed in this step"
+    );
+
+    database.delete_server(&server_id).expect("delete server");
 }
 
 #[test]
@@ -285,7 +349,7 @@ fn missing_profiles_and_servers_return_typed_errors() {
     assert_eq!(error.code, ErrorCode::NotFound);
 
     let error = service
-        .delete("missing-profile")
+        .delete("missing-profile", true)
         .expect_err("missing profile");
     assert_eq!(error.code, ErrorCode::NotFound);
 }
@@ -373,7 +437,7 @@ fn creating_a_metadata_only_profile_keeps_has_credential_false() {
             .is_none()
     );
     service
-        .delete(&profile.id)
+        .delete(&profile.id, true)
         .expect("delete metadata-only profile");
 }
 

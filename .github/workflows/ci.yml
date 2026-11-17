@@ -90,3 +90,6 @@ jobs:
 
       - name: Test
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Database security suite
+        run: cargo test --manifest-path src-tauri/Cargo.toml --test database_security
