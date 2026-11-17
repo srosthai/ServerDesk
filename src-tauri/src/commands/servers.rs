@@ -7,9 +7,11 @@ use crate::{
         AppError,
         credential_index::CredentialIndex,
         credentials::CredentialStore,
+        database_profiles::DatabaseProfileService,
         servers::{ServerProfile, ServerProfileInput},
         ssh::ConnectionManager,
     },
+    database::DatabaseConnectionRegistry,
     storage::{Database, NewServer, Server},
 };
 
@@ -88,6 +90,7 @@ pub async fn delete_server(
     credentials: State<'_, Arc<dyn CredentialStore>>,
     credential_index: State<'_, CredentialIndex>,
     connection_manager: State<'_, Arc<ConnectionManager>>,
+    connections: State<'_, DatabaseConnectionRegistry>,
     id: String,
     confirmed: bool,
 ) -> Result<(), AppError> {
@@ -101,6 +104,20 @@ pub async fn delete_server(
     }
 
     connection_manager.disconnect(&id).await?;
+
+    // SQLite cascades database profile rows when the server row is removed.
+    // Close their live adapters and delete their OS credentials first so a
+    // removed server cannot leave database passwords orphaned in the keychain.
+    let profiles = database.list_database_connections(&id)?;
+    for profile in &profiles {
+        let _ = connections.disconnect(&profile.id).await;
+    }
+    DatabaseProfileService::new(
+        database.inner(),
+        credentials.inner().as_ref(),
+        credential_index.inner(),
+    )
+    .delete_for_server(&id)?;
 
     if let Some(reference) = database
         .get_server(&id)?

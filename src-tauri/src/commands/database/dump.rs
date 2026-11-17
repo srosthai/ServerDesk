@@ -150,6 +150,14 @@ pub async fn import_database_dump(
     timeout_ms: Option<u64>,
 ) -> Result<DumpRestoreResult, AppError> {
     let profile = load_profile(database.inner(), &profile_id)?;
+    if profile.read_only {
+        return Err(AppError::permission(
+            "The database connection profile is read-only; restoring a dump requires a writable connection profile.",
+        )
+        .with_details(
+            "No dump tool was started and no data was changed. Use a writable database profile to restore data.",
+        ));
+    }
     let server = load_server(database.inner(), &profile.server_id)?;
     validate_restore_command_confirmation(&server, &request)?;
     let info = connections.info(&profile.id).await?;

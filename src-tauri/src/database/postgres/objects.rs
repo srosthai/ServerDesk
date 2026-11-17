@@ -66,8 +66,8 @@ pub fn preview(action: &ValidatedObjectAction) -> Result<ObjectDdlPreview, Datab
             let arguments = arguments.as_deref().unwrap_or("");
             let language = language
                 .as_ref()
-                .map(Identifier::as_str)
-                .unwrap_or("plpgsql");
+                .map(|value| POSTGRES_DIALECT.quote_identifier(value))
+                .unwrap_or_else(|| "plpgsql".to_string());
             let header = match routine_kind {
                 RoutineKind::Function => {
                     let return_type = return_type.as_deref().ok_or_else(|| {
