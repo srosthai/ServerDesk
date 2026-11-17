@@ -52,6 +52,7 @@ use crate::database::{
     },
     row_writes::{RowDeleteRequest, RowInsertRequest, RowUpdateRequest, RowWriteResult},
     rows::{RowQueryControl, RowReadRequest, RowReadResult},
+    sessions::{SessionQuery, SessionSummary, ValidatedSessionAction},
     structure::{StructureDdlPreview, ValidatedStructureAction},
     traits::{
         ColumnIdentity, ColumnSummary, ConstraintKind, ConstraintSummary, DatabaseAdapter,
@@ -1244,6 +1245,70 @@ impl DatabaseAdapter for MysqlDatabaseAdapter {
         Ok(())
     }
 
+    async fn list_sessions(
+        &self,
+        page: PageRequest,
+        running_only: bool,
+    ) -> Result<Page<SessionSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseSessions)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let rows = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::LIST_SESSIONS)
+                .bind(if running_only { 1_i64 } else { 0_i64 })
+                .bind(i64::from(page.limit) + 1)
+                .bind(i64::try_from(page.offset).unwrap_or(i64::MAX))
+                .fetch_all(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+
+        let sessions = rows
+            .iter()
+            .map(mysql_session_summary)
+            .collect::<Result<Vec<_>, DatabaseError>>()?;
+        Ok(Page::from_items(sessions, page, None))
+    }
+
+    async fn session_summary(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<SessionSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseSessions)?;
+        let mut guard = self.live_connection().await?;
+        let connection = guard.as_mut().expect("checked above");
+        let row = timeout_at(
+            tokio::time::Instant::now() + self.operation_timeout,
+            sqlx::query(sql::SESSION_SUMMARY)
+                .bind(session_id)
+                .fetch_optional(&mut *connection),
+        )
+        .await
+        .map_err(|_| self.operation_timeout_error())?
+        .map_err(map_sqlx_error)?;
+        row.as_ref().map(mysql_session_summary).transpose()
+    }
+
+    async fn execute_session_action(
+        &mut self,
+        action: &ValidatedSessionAction,
+    ) -> Result<bool, DatabaseError> {
+        self.require_capability(action.action.capability())?;
+        self.require_connection()?;
+        let statement = match action.action {
+            crate::database::SessionActionKind::CancelQuery => {
+                format!("{} {}", sql::CANCEL_QUERY, action.session_id)
+            }
+            crate::database::SessionActionKind::TerminateSession => {
+                format!("{} {}", sql::KILL_SESSION, action.session_id)
+            }
+        };
+        self.execute_statement(&statement).await?;
+        Ok(true)
+    }
+
     async fn object_counts(&self, scope: &MetadataScope) -> Result<ObjectCounts, DatabaseError> {
         self.require_capability(DatabaseAction::BrowseTables)?;
         let database = Self::scope_name(scope)?;
@@ -2117,6 +2182,55 @@ fn routine_kind(value: &str) -> Result<RoutineKind, DatabaseError> {
 
 fn decode_flag(row: &MySqlRow, column: &str) -> Result<bool, DatabaseError> {
     Ok(decode::<i64>(row, column)? != 0)
+}
+
+fn mysql_session_summary(row: &MySqlRow) -> Result<SessionSummary, DatabaseError> {
+    let raw_id: u64 = decode(row, "session_id")?;
+    let session_id = i64::try_from(raw_id).map_err(|_| {
+        DatabaseError::query("The database returned an unsupported session id.").with_details(
+            "The process id did not fit the signed range ServerDesk uses for session actions.",
+        )
+    })?;
+    let user: String = decode(row, "user_name")?;
+    let host: Option<String> = decode(row, "host")?;
+    let database: Option<String> = decode(row, "database_name")?;
+    let command: Option<String> = decode(row, "command")?;
+    let state: Option<String> = decode(row, "state")?;
+    let elapsed_seconds: Option<i64> = decode(row, "elapsed_seconds")?;
+    let query_text: Option<String> = decode(row, "query_text")?;
+    let is_current: i64 = decode(row, "is_current")?;
+
+    let is_running = command
+        .as_deref()
+        .is_some_and(|command| !command.eq_ignore_ascii_case("Sleep"));
+    let elapsed_ms = elapsed_seconds
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .map(|seconds| seconds.saturating_mul(1_000));
+    let query = match query_text {
+        Some(text) if is_running && !text.trim().is_empty() => {
+            MetadataValue::available(SessionQuery::from_raw(
+                &text,
+                MetadataValue::unavailable(),
+                elapsed_ms.map_or(MetadataValue::Unavailable, MetadataValue::available),
+            ))
+        }
+        _ => MetadataValue::unavailable(),
+    };
+
+    Ok(SessionSummary {
+        id: session_id,
+        user,
+        host: host.map_or(MetadataValue::Unavailable, MetadataValue::available),
+        database: database.map_or(MetadataValue::Unavailable, MetadataValue::available),
+        application_name: MetadataValue::unavailable(),
+        command: command.map_or(MetadataValue::Unavailable, MetadataValue::available),
+        state: state.map_or(MetadataValue::Unavailable, MetadataValue::available),
+        wait_event: MetadataValue::unavailable(),
+        backend_type: MetadataValue::unavailable(),
+        connected_at: MetadataValue::unavailable(),
+        is_current: is_current != 0,
+        query,
+    })
 }
 
 fn mysql_role_summary(row: &MySqlRow) -> Result<RoleSummary, DatabaseError> {

@@ -11,6 +11,7 @@ import {
   KeyIcon,
   PlugsIcon,
   PlusIcon,
+  PulseIcon,
   RowsIcon,
   ShieldCheckIcon,
   TableIcon,
@@ -33,6 +34,7 @@ import { DatabaseConnectionList, EngineBadge } from "@/features/databases/Databa
 import { DatabaseActionDialog } from "@/features/databases/DatabaseActionDialog";
 import { DatabaseDataGrid } from "@/features/databases/DatabaseDataGrid";
 import { DatabaseOperationsWorkspace } from "@/features/databases/DatabaseOperationsWorkspace";
+import { DatabaseSessionsPanel } from "@/features/databases/DatabaseSessionsPanel";
 import { DatabaseSqlWorkspace } from "@/features/databases/DatabaseSqlWorkspace";
 import { DatabaseExplorerTree } from "@/features/databases/DatabaseExplorerTree";
 import {
@@ -172,6 +174,14 @@ const databaseTabs: DatabaseTab[] = [
     emptyTitle: "No connection selected",
     emptyDescription:
       "Open a saved connection to list users and roles, inspect effective privileges, and preview every grant or revoke before applying it.",
+  },
+  {
+    value: "sessions",
+    label: "Sessions",
+    icon: PulseIcon,
+    emptyTitle: "No connection selected",
+    emptyDescription:
+      "Open a saved connection to monitor active sessions, running queries, and elapsed time, and to cancel or terminate a session after exact confirmation.",
   },
 ];
 
@@ -1946,6 +1956,25 @@ function DatabaseManagerPage() {
                               icon={<ShieldCheckIcon className="size-4" aria-hidden="true" />}
                               title="No connection selected"
                               description="Open a saved connection before listing users, roles, and grants."
+                            />
+                          )
+                        ) : tab.value === "sessions" ? (
+                          structureProfile ? (
+                            <DatabaseSessionsPanel
+                              profileId={structureProfile.id}
+                              profileName={structureProfile.name}
+                              engine={selectedEngineForStructure}
+                              version={selectedSnapshot?.version?.version}
+                              connected={structureConnected}
+                              readOnly={selectedSnapshot?.readOnly ?? structureProfile.readOnly}
+                              actions={selectedSnapshot?.capabilities?.actions}
+                              flags={selectedSnapshot?.capabilities?.flags}
+                            />
+                          ) : (
+                            <EmptyState
+                              icon={<PulseIcon className="size-4" aria-hidden="true" />}
+                              title="No connection selected"
+                              description="Open a saved connection before monitoring active sessions and running queries."
                             />
                           )
                         ) : (

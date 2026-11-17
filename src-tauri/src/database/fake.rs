@@ -50,6 +50,7 @@ use super::{
         RowReadRequest, RowReadResult, RowRecord, RowSortDirection, RowTableMetadata,
         resolve_read_plan,
     },
+    sessions::{SessionQuery, SessionSummary, ValidatedSessionAction},
     structure::{
         ColumnDefault, ColumnPosition, StructureDdlPreview, ValidatedColumnChanges,
         ValidatedColumnDefinition, ValidatedConstraint, ValidatedStructureAction,
@@ -151,6 +152,11 @@ pub struct FakeDatabaseAdapter {
     role_execution_error: Option<DatabaseError>,
     skip_role_execution: bool,
     role_execution_count: AtomicUsize,
+    sessions: Vec<SessionSummary>,
+    session_list_error: Option<DatabaseError>,
+    session_execution_error: Option<DatabaseError>,
+    skip_session_execution: bool,
+    session_execution_count: AtomicUsize,
     columns: Vec<ColumnSummary>,
     created_tables: HashMap<String, Vec<ColumnSummary>>,
     indexes: HashMap<String, Vec<IndexSummary>>,
@@ -227,6 +233,11 @@ impl FakeDatabaseAdapter {
             role_execution_error: None,
             skip_role_execution: false,
             role_execution_count: AtomicUsize::new(0),
+            sessions: fixtures.sessions,
+            session_list_error: None,
+            session_execution_error: None,
+            skip_session_execution: false,
+            session_execution_count: AtomicUsize::new(0),
             columns: fixtures.columns,
             created_tables: HashMap::from([(detail_table.clone(), detail_columns)]),
             indexes: HashMap::from([(detail_table.clone(), detail_indexes)]),
@@ -286,6 +297,42 @@ impl FakeDatabaseAdapter {
 
     pub fn role_execution_count(&self) -> usize {
         self.role_execution_count.load(Ordering::SeqCst)
+    }
+
+    /// Makes every session listing fail with a typed database error.
+    pub fn with_session_list_error(mut self, error: DatabaseError) -> Self {
+        self.session_list_error = Some(error);
+        self
+    }
+
+    /// Makes the next session cancellation or termination fail with a typed
+    /// database error.
+    pub fn with_session_execution_error(mut self, error: DatabaseError) -> Self {
+        self.session_execution_error = Some(error);
+        self
+    }
+
+    /// Simulates a server that accepts the request but leaves the session or
+    /// query running, so verification must report an unverified outcome.
+    pub fn with_skipped_session_execution(mut self) -> Self {
+        self.skip_session_execution = true;
+        self
+    }
+
+    pub fn session_execution_count(&self) -> usize {
+        self.session_execution_count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub fn connect_for_test(&mut self) {
+        self.connected.store(true, Ordering::SeqCst);
+        self.active_database = Some("app".to_string());
+        self.read_only = false;
+    }
+
+    #[cfg(test)]
+    pub fn set_read_only_for_test(&mut self, read_only: bool) {
+        self.read_only = read_only;
     }
 
     pub fn query_execution_count(&self) -> usize {
@@ -1667,6 +1714,70 @@ impl DatabaseAdapter for FakeDatabaseAdapter {
             }
         }
         Ok(())
+    }
+
+    async fn list_sessions(
+        &self,
+        page: PageRequest,
+        running_only: bool,
+    ) -> Result<Page<SessionSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseSessions)?;
+        self.require_connection()?;
+        if let Some(error) = &self.session_list_error {
+            return Err(error.clone());
+        }
+        let sessions = self
+            .sessions
+            .iter()
+            .filter(|session| !running_only || session.is_running())
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(Self::paginate(&sessions, page))
+    }
+
+    async fn session_summary(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<SessionSummary>, DatabaseError> {
+        self.require_capability(DatabaseAction::BrowseSessions)?;
+        self.require_connection()?;
+        Ok(self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned())
+    }
+
+    async fn execute_session_action(
+        &mut self,
+        action: &ValidatedSessionAction,
+    ) -> Result<bool, DatabaseError> {
+        self.require_capability(action.action.capability())?;
+        self.require_connection()?;
+        self.session_execution_count.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = self.session_execution_error.take() {
+            return Err(error);
+        }
+        if self.skip_session_execution {
+            return Ok(true);
+        }
+
+        let Some(index) = self
+            .sessions
+            .iter()
+            .position(|session| session.id == action.session_id)
+        else {
+            return Ok(false);
+        };
+        match action.action {
+            crate::database::SessionActionKind::CancelQuery => {
+                self.sessions[index].query = MetadataValue::unavailable();
+            }
+            crate::database::SessionActionKind::TerminateSession => {
+                self.sessions.remove(index);
+            }
+        }
+        Ok(true)
     }
 
     async fn preview_object_action(
@@ -3524,6 +3635,7 @@ struct FakeFixtures {
     sequence_details: HashMap<String, SequenceDetails>,
     roles: Vec<RoleSummary>,
     role_grants: HashMap<String, RoleGrantData>,
+    sessions: Vec<SessionSummary>,
     columns: Vec<ColumnSummary>,
     indexes: Vec<IndexSummary>,
     constraints: Vec<ConstraintSummary>,
@@ -3613,6 +3725,24 @@ fn role_summary(fixture: FakeRoleFixture, engine: DatabaseEngine) -> RoleSummary
             DatabaseEngine::Postgresql => MetadataValue::available(fixture.inherit),
         },
     }
+}
+
+fn optional_metadata(value: Option<&str>) -> MetadataValue<String> {
+    value.map_or(MetadataValue::Unavailable, |value| {
+        MetadataValue::available(value.to_string())
+    })
+}
+
+fn session_query(
+    text: &str,
+    started_at: Option<&str>,
+    elapsed_ms: Option<u64>,
+) -> MetadataValue<SessionQuery> {
+    MetadataValue::available(SessionQuery::from_raw(
+        text,
+        optional_metadata(started_at),
+        elapsed_ms.map_or(MetadataValue::Unavailable, MetadataValue::available),
+    ))
 }
 
 fn mysql_fixtures() -> FakeFixtures {
@@ -3926,6 +4056,72 @@ fn mysql_fixtures() -> FakeFixtures {
                 },
             ),
         ]),
+        sessions: vec![
+            SessionSummary {
+                id: 101,
+                user: "app".to_string(),
+                host: optional_metadata(Some("10.0.0.5:51234")),
+                database: optional_metadata(Some("app")),
+                application_name: MetadataValue::unavailable(),
+                command: optional_metadata(Some("Query")),
+                state: optional_metadata(Some("Sending data")),
+                wait_event: MetadataValue::unavailable(),
+                backend_type: MetadataValue::unavailable(),
+                connected_at: MetadataValue::unavailable(),
+                is_current: false,
+                query: session_query(
+                    "SELECT id, status FROM orders WHERE status = 'pending'",
+                    None,
+                    Some(2_500),
+                ),
+            },
+            SessionSummary {
+                id: 102,
+                user: "reporting".to_string(),
+                host: optional_metadata(Some("10.0.0.6:49876")),
+                database: optional_metadata(Some("app")),
+                application_name: MetadataValue::unavailable(),
+                command: optional_metadata(Some("Sleep")),
+                state: optional_metadata(Some("Sleep")),
+                wait_event: MetadataValue::unavailable(),
+                backend_type: MetadataValue::unavailable(),
+                connected_at: MetadataValue::unavailable(),
+                is_current: false,
+                query: MetadataValue::unavailable(),
+            },
+            SessionSummary {
+                id: 103,
+                user: "app".to_string(),
+                host: optional_metadata(Some("127.0.0.1:3306")),
+                database: optional_metadata(Some("app")),
+                application_name: MetadataValue::unavailable(),
+                command: optional_metadata(Some("Query")),
+                state: optional_metadata(Some("executing")),
+                wait_event: MetadataValue::unavailable(),
+                backend_type: MetadataValue::unavailable(),
+                connected_at: MetadataValue::unavailable(),
+                is_current: true,
+                query: session_query("SELECT 1", None, Some(10)),
+            },
+            SessionSummary {
+                id: 104,
+                user: "admin".to_string(),
+                host: optional_metadata(Some("10.0.0.7:55100")),
+                database: optional_metadata(Some("app")),
+                application_name: MetadataValue::unavailable(),
+                command: optional_metadata(Some("Query")),
+                state: optional_metadata(Some("executing")),
+                wait_event: MetadataValue::unavailable(),
+                backend_type: MetadataValue::unavailable(),
+                connected_at: MetadataValue::unavailable(),
+                is_current: false,
+                query: session_query(
+                    "ALTER USER 'app'@'%' IDENTIFIED BY 'fixture-session-secret'",
+                    None,
+                    Some(1_500),
+                ),
+            },
+        ],
         detail_table: "users".to_string(),
     }
 }
@@ -4300,6 +4496,76 @@ fn postgres_fixtures() -> FakeFixtures {
                 },
             ),
         ]),
+        sessions: vec![
+            SessionSummary {
+                id: 501,
+                user: "app".to_string(),
+                host: optional_metadata(Some("10.0.0.5")),
+                database: optional_metadata(Some("app")),
+                application_name: optional_metadata(Some("psql")),
+                command: MetadataValue::unavailable(),
+                state: optional_metadata(Some("active")),
+                wait_event: MetadataValue::unavailable(),
+                backend_type: MetadataValue::unavailable(),
+                connected_at: optional_metadata(Some("2026-11-17T08:00:00Z")),
+                is_current: false,
+                query: session_query(
+                    "SELECT pg_sleep(30)",
+                    Some("2026-11-17T08:05:00Z"),
+                    Some(30_000),
+                ),
+            },
+            SessionSummary {
+                id: 502,
+                user: "reporting".to_string(),
+                host: MetadataValue::unavailable(),
+                database: optional_metadata(Some("app")),
+                application_name: optional_metadata(Some("reporting-job")),
+                command: MetadataValue::unavailable(),
+                state: optional_metadata(Some("idle")),
+                wait_event: MetadataValue::unavailable(),
+                backend_type: MetadataValue::unavailable(),
+                connected_at: optional_metadata(Some("2026-11-17T07:55:00Z")),
+                is_current: false,
+                query: MetadataValue::unavailable(),
+            },
+            SessionSummary {
+                id: 503,
+                user: "app".to_string(),
+                host: optional_metadata(Some("127.0.0.1")),
+                database: optional_metadata(Some("app")),
+                application_name: optional_metadata(Some("serverdesk")),
+                command: MetadataValue::unavailable(),
+                state: optional_metadata(Some("active")),
+                wait_event: MetadataValue::unavailable(),
+                backend_type: MetadataValue::unavailable(),
+                connected_at: optional_metadata(Some("2026-11-17T08:04:00Z")),
+                is_current: true,
+                query: session_query(
+                    "SELECT 1",
+                    Some("2026-11-17T08:05:00Z"),
+                    Some(5),
+                ),
+            },
+            SessionSummary {
+                id: 504,
+                user: "admin".to_string(),
+                host: optional_metadata(Some("10.0.0.7")),
+                database: optional_metadata(Some("app")),
+                application_name: optional_metadata(Some("psql")),
+                command: MetadataValue::unavailable(),
+                state: optional_metadata(Some("active")),
+                wait_event: MetadataValue::unavailable(),
+                backend_type: MetadataValue::unavailable(),
+                connected_at: optional_metadata(Some("2026-11-17T08:01:00Z")),
+                is_current: false,
+                query: session_query(
+                    "ALTER ROLE reporting WITH PASSWORD 'fixture-role-session-secret'",
+                    Some("2026-11-17T08:05:00Z"),
+                    Some(1_200),
+                ),
+            },
+        ],
         detail_table: "users".to_string(),
     }
 }
