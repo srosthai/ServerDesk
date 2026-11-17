@@ -597,9 +597,9 @@ copies fields into another connection.
 
 The Database Manager renders the open connections as a tab strip above the
 workspace. Every connection tab shows the profile name and engine, and the
-workspace header for the Overview, Structure, Data, SQL, Indexes, Operations,
-Access, and Sessions views repeats the connection name, engine, endpoint,
-connection state, and selected database/schema. A tab opens from the connection
+workspace header for the Overview, Structure, Diagram, Data, SQL, Indexes,
+Operations, Access, and Sessions views repeats the connection name, engine,
+endpoint, connection state, and selected database/schema. A tab opens from the connection
 list, the explorer, or Connect; connecting another profile leaves existing tabs
 open.
 
@@ -610,6 +610,39 @@ closing keeps the tab's context so a later connect or reconnect can restore the
 selected database, SQL draft, and last results. The explorer remains scoped by
 profile id, so neither disconnect nor close can mutate another connection's
 tree.
+
+## Schema relationship diagram
+
+The Diagram workspace view is a frontend-only, read-only projection of the
+existing discovery contract. It does not add a backend command, SQL, or a new
+database schema change. It first reads one bounded `list_database_tables` page
+(maximum 500 names) for the selected database/schema, then requests
+`list_database_constraints` only for the tables that the active filter and
+table limit actually draw. Constraint results are cached per table key, so
+changing the search text reuses loaded metadata instead of re-reading the
+catalog on every keystroke.
+
+`databaseErDiagramModel.ts` keeps graph construction pure and bounded. It
+deduplicates catalog rows, sorts tables deterministically, matches foreign keys
+to loaded target tables, and drops a relationship whose target is outside the
+loaded catalog while counting it as unresolved. A foreign key is `1:1` when its
+source columns are also covered by a primary key or unique constraint on the
+referencing table; otherwise the diagram labels it `N:1`. The view draws at most
+100 tables and 300 relationships, reports tables hidden by search or by the
+limit, and shows isolated tables even when no foreign keys exist. The same
+metadata builds a keyboard-accessible table and relationship index below the
+canvas.
+
+The renderer is lazy: the Diagram view is a dynamic import in
+`DatabaseManagerPage`, and `@xyflow/react`, `@dagrejs/dagre`, and
+`html-to-image` live in a second dynamic canvas chunk. The canvas supports pan,
+wheel/pinch zoom, fit-to-view, minimap navigation, and table selection. Selecting
+a card or an index row emits the same explorer selection id as a tree click and
+then switches the owning workspace tab to Structure. PNG export is generated
+from the rendered viewport on demand; it does not call the backend. Empty
+schemas, schemas without foreign keys, partial constraint failures, catalog
+limits, permission errors, and disconnected profiles each render an explicit
+state, and no relationship is inferred from naming conventions.
 
 ## Capability model
 
@@ -1670,3 +1703,14 @@ partial-result disclosure, and per-connection operation history.
   observed from the live server instead.
 - Profile commands validate and persist metadata, but profile UI is tracked
   separately in issue #164.
+- The ER diagram reads one 500-table catalog page. A larger schema must be
+  narrowed with the table filter; relationships are loaded only for drawn
+  tables and a foreign key whose target is not in the loaded catalog is counted
+  but not drawn. The diagram is an inspection aid, not a complete schema
+  export format.
+- Diagram cardinality is inferred from the referencing table's primary-key and
+  unique constraints. It does not inspect partial/composite index semantics
+  beyond the constraint metadata returned by the adapter, and it does not infer
+  many-to-many relationships through a junction table.
+- PNG export uses the webview's download behavior and captures the current
+  rendered canvas. It is unavailable if the webview blocks local downloads.
