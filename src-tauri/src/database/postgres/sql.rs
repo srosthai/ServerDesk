@@ -36,6 +36,44 @@ FROM pg_catalog.pg_database
 WHERE datname = $1
 LIMIT 1"#;
 
+/// Catalog-only size for the active database. It never reads table rows,
+/// counts rows, or runs statistics maintenance.
+pub const HEALTH_DATABASE_SIZE: &str =
+    r#"SELECT pg_catalog.pg_database_size(current_database()) AS size_bytes"#;
+
+/// Largest tables in the active database, read from catalog metadata only.
+/// `has_table_privilege` keeps restricted accounts from receiving a guessed
+/// size. The caller asks for one extra row to disclose truncation.
+pub const HEALTH_TABLE_SIZES: &str = r#"SELECT current_database() AS database_name,
+    n.nspname AS schema_name,
+    c.relname AS name,
+    CASE c.relkind
+        WHEN 'r' THEN 'BASE TABLE'
+        WHEN 'p' THEN 'PARTITIONED TABLE'
+        WHEN 'f' THEN 'FOREIGN TABLE'
+        ELSE 'OTHER'
+    END AS table_type,
+    CASE WHEN pg_catalog.has_table_privilege(c.oid, 'SELECT')
+         THEN pg_catalog.pg_total_relation_size(c.oid)
+    END AS size_bytes,
+    CASE WHEN c.reltuples >= 0 THEN c.reltuples::bigint END AS estimated_rows,
+    CASE
+        WHEN GREATEST(st.last_analyze, st.last_autoanalyze) IS NOT NULL
+        THEN pg_catalog.to_char(
+            GREATEST(st.last_analyze, st.last_autoanalyze) AT TIME ZONE 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+        )
+    END AS metadata_refreshed_at
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_catalog.pg_stat_user_tables st ON st.relid = c.oid
+WHERE c.relkind IN ('r', 'p', 'f')
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+  AND n.nspname NOT LIKE 'pg_toast%'
+  AND n.nspname NOT LIKE 'pg_temp%'
+ORDER BY pg_catalog.pg_total_relation_size(c.oid) DESC, n.nspname, c.relname
+LIMIT $1"#;
+
 pub const LIST_SCHEMAS: &str = r#"SELECT nspname AS name,
     pg_catalog.pg_get_userbyid(nspowner) AS owner,
     (nspname IN ('information_schema', 'pg_catalog')

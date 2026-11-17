@@ -19,6 +19,7 @@ use super::{
     },
     dialect::{Identifier, SqlDialect},
     errors::DatabaseError,
+    health::DatabaseHealthMetrics,
     objects::{
         ObjectDdlPreview, ObjectDefinition, ObjectRef, RoutineSummary, TriggerSummary,
         ValidatedObjectAction,
@@ -442,6 +443,12 @@ pub trait DatabaseAdapter: Send + Sync {
     async fn ping(&self) -> Result<DatabasePing, DatabaseError>;
 
     async fn version(&self) -> Result<DatabaseVersionInfo, DatabaseError>;
+
+    /// Reads catalog-only size and row-estimate metadata for the active
+    /// database. Implementations must not count table rows, sample table data,
+    /// or run statistics maintenance. Missing permissions become unavailable
+    /// values instead of guessed zeros.
+    async fn health_metrics(&self, limit: u32) -> Result<DatabaseHealthMetrics, DatabaseError>;
 
     async fn close(&mut self) -> Result<(), DatabaseError>;
 

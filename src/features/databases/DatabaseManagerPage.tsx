@@ -33,6 +33,7 @@ import { DatabaseAccessPanel } from "@/features/databases/DatabaseAccessPanel";
 import { DatabaseConnectionList, EngineBadge } from "@/features/databases/DatabaseConnectionList";
 import { DatabaseActionDialog } from "@/features/databases/DatabaseActionDialog";
 import { DatabaseDataGrid } from "@/features/databases/DatabaseDataGrid";
+import { DatabaseHealthPanel } from "@/features/databases/DatabaseHealthPanel";
 import { DatabaseOperationsWorkspace } from "@/features/databases/DatabaseOperationsWorkspace";
 import { DatabaseSessionsPanel } from "@/features/databases/DatabaseSessionsPanel";
 import { DatabaseSqlWorkspace } from "@/features/databases/DatabaseSqlWorkspace";
@@ -83,6 +84,7 @@ import { cn } from "@/lib/utils";
 import { dropDatabase, previewDatabaseAction, setActiveDatabase } from "@/services/databaseActions";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useDatabaseExplorerStore } from "@/stores/databaseExplorerStore";
+import { useDatabaseHealthStore } from "@/stores/databaseHealthStore";
 import { useDatabaseProfileStore } from "@/stores/databaseProfileStore";
 import { useDatabaseQueryStore } from "@/stores/databaseQueryStore";
 import { useDatabaseRowStore } from "@/stores/databaseRowStore";
@@ -1537,6 +1539,7 @@ function DatabaseManagerPage() {
       const deletedTab = useDatabaseWorkspaceStore.getState().tabs[deleteTarget.id];
       closeWorkspaceTab(deleteTarget.id);
       useDatabaseExplorerStore.getState().resetProfile(deleteTarget.id);
+      useDatabaseHealthStore.getState().reset(deleteTarget.id);
       useDatabaseRowStore.getState().resetProfile(deleteTarget.id);
       useDatabaseRowWriteStore.getState().resetProfile(deleteTarget.id);
       if (deletedTab) {
@@ -1555,6 +1558,26 @@ function DatabaseManagerPage() {
   const dropServer = dropTarget
     ? (servers.find((server) => server.id === dropTarget.profile.serverId) ?? null)
     : null;
+
+  const connectionList = (
+    <DatabaseConnectionList
+      profiles={profiles}
+      servers={servers}
+      snapshots={profilesRecord}
+      testResults={testResultsRecord}
+      busy={busyRecord}
+      selectedProfileId={selectedProfileId}
+      sshConnected={sshConnected}
+      onOpen={handleOpenWorkspace}
+      onConnect={(profile) => void handleConnect(profile)}
+      onReconnect={(profile) => void handleReconnect(profile)}
+      onDisconnect={(profile) => void handleDisconnect(profile)}
+      onTest={(profile) => void handleTest(profile)}
+      onEdit={openEditDialog}
+      onDelete={setDeleteTarget}
+      onAdd={openCreateDialog}
+    />
+  );
 
   return (
     <div className="mx-auto w-full max-w-[80rem] space-y-5">
@@ -1771,24 +1794,22 @@ function DatabaseManagerPage() {
                               onConnect={() => void handleConnect(structureProfile)}
                               onRefresh={tableStructure.reload}
                             />
+                          ) : structureProfile &&
+                            structureConnected &&
+                            (activeExplorerSelection?.kind === "database" ||
+                              activeExplorerSelection?.kind === "schema") ? (
+                            <div className="space-y-5">
+                              <DatabaseHealthPanel
+                                profileId={structureProfile.id}
+                                profileName={structureProfile.name}
+                                engine={selectedEngineForStructure}
+                                connected={structureConnected}
+                                selectedDatabase={selectedDatabase}
+                              />
+                              {connectionList}
+                            </div>
                           ) : (
-                            <DatabaseConnectionList
-                              profiles={profiles}
-                              servers={servers}
-                              snapshots={profilesRecord}
-                              testResults={testResultsRecord}
-                              busy={busyRecord}
-                              selectedProfileId={selectedProfileId}
-                              sshConnected={sshConnected}
-                              onOpen={handleOpenWorkspace}
-                              onConnect={(profile) => void handleConnect(profile)}
-                              onReconnect={(profile) => void handleReconnect(profile)}
-                              onDisconnect={(profile) => void handleDisconnect(profile)}
-                              onTest={(profile) => void handleTest(profile)}
-                              onEdit={openEditDialog}
-                              onDelete={setDeleteTarget}
-                              onAdd={openCreateDialog}
-                            />
+                            connectionList
                           )
                         ) : tab.value === "structure" ? (
                           selectedObjectRef && structureProfile ? (
