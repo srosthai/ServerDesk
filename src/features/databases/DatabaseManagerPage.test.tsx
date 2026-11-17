@@ -135,6 +135,48 @@ vi.mock("@/services/databaseHealth", () => ({
   getDatabaseHealth: vi.fn(),
 }));
 
+vi.mock("@/features/databases/DatabaseErDiagramView", () => ({
+  default: function MockErDiagramView({
+    profileName,
+    onSelectTable,
+  }: {
+    profileName: string;
+    onSelectTable: (selection: {
+      id: string;
+      profileId: string;
+      kind: "table";
+      label: string;
+      engine: "postgresql" | "mysql";
+      database: string | null;
+      schema: string | null;
+      objectName: string | null;
+    }) => void;
+  }) {
+    return (
+      <div>
+        <h2>Entity relationship diagram mock for {profileName}</h2>
+        <button
+          type="button"
+          onClick={() =>
+            onSelectTable({
+              id: "diagram-orders",
+              profileId: "profile-1",
+              kind: "table",
+              label: "orders",
+              engine: "postgresql",
+              database: "app",
+              schema: "public",
+              objectName: "orders",
+            })
+          }
+        >
+          Select orders from diagram
+        </button>
+      </div>
+    );
+  },
+}));
+
 const server: ServerProfile = {
   id: "server-1",
   name: "Production",
@@ -2037,5 +2079,27 @@ describe("DatabaseManagerPage", () => {
         false,
       );
     });
+  });
+
+  it("lazy-loads the diagram view and routes a diagram table selection to Structure", async () => {
+    const user = userEvent.setup();
+    useSelectedTable("diagram");
+    renderPage();
+
+    expect(
+      await screen.findByRole("heading", {
+        name: "Entity relationship diagram mock for Primary",
+      }),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Select orders from diagram" }));
+
+    await waitFor(() => {
+      const state = useDatabaseWorkspaceStore.getState();
+      expect(state.tabs[profile.id]?.activeView).toBe("structure");
+      expect(state.tabs[profile.id]?.selection?.objectName).toBe("orders");
+      expect(state.tabs[profile.id]?.selection?.database).toBe("app");
+    });
+    expect(screen.getByRole("tab", { name: "Structure" })).toHaveAttribute("aria-selected", "true");
   });
 });
