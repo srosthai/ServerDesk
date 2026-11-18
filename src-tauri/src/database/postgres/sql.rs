@@ -733,5 +733,19 @@ FROM pg_catalog.pg_stat_activity
 WHERE pid = $1 AND usename IS NOT NULL
 LIMIT 1"#;
 
-pub const CANCEL_QUERY: &str = "SELECT pg_catalog.pg_cancel_backend($1)";
-pub const KILL_SESSION: &str = "SELECT pg_catalog.pg_terminate_backend($1)";
+pub const CANCEL_QUERY: &str = "SELECT pg_catalog.pg_cancel_backend($1::integer)";
+pub const KILL_SESSION: &str = "SELECT pg_catalog.pg_terminate_backend($1::integer)";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SQLx binds a session id as a signed 64-bit value. PostgreSQL resolves an
+    /// untyped `$1` as bigint and has no `pg_cancel_backend(bigint)` overload,
+    /// so the cast is required for the live action to run at all.
+    #[test]
+    fn session_actions_cast_the_bound_id_to_integer() {
+        assert!(CANCEL_QUERY.contains("$1::integer"));
+        assert!(KILL_SESSION.contains("$1::integer"));
+    }
+}
