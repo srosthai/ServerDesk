@@ -2,7 +2,7 @@
 
 ServerDesk can check for, download, verify, and install signed updates from GitHub Releases. The updater is separate from the Windows Authenticode signature and Apple notarization: it uses a Tauri minisign keypair that is embedded in the application as a public key.
 
-The feature ships in the first updater-capable release. A `v0.1.0` installation predates the updater and cannot self-update; those users must install the first updater-capable build manually.
+The feature ships in `v0.1.1`, the first updater-capable release. A `v0.1.0` installation predates the updater and cannot self-update; those users must install `v0.1.1` manually once. Later updater-capable releases can be installed in place.
 
 ## Platform support
 
@@ -191,11 +191,11 @@ AppImage replacement may keep the old file in a temporary location during the up
 
 ## Verification limits
 
-A full live self-update test requires two published versions. The `v0.1.0` installation predates the updater and cannot install `v0.1.1` in place. Release QA for `v0.1.1` must:
+A full live self-update test requires two updater-capable published versions. `v0.1.1` is the first, and the `v0.1.0` installation predates the updater, so no in-place self-update can be proven until a later release exists. Release QA for the first update must:
 
 1. Install a signed `v0.1.1` build.
-2. Publish or stage a `v0.1.2` release with the same endpoint.
-3. Confirm the `v0.1.1` build detects, downloads, verifies, installs, and relaunches into `v0.1.2`.
+2. Publish or stage a later release, such as `v0.1.2`, with the same endpoint.
+3. Confirm the `v0.1.1` build detects, downloads, verifies, installs, and relaunches into the later version.
 4. Repeat with a deliberately corrupted `.sig` or an artifact signed by a different key and confirm the update is rejected.
 5. Repeat with the network disabled and confirm the current installation still starts and works.
 

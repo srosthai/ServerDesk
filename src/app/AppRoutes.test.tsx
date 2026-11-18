@@ -81,7 +81,7 @@ describe("application shell", () => {
 
     expect((await screen.findAllByText("RentMee")).length).toBeGreaterThan(0);
     expect(screen.getAllByText("Connected").length).toBeGreaterThan(0);
-    expect(screen.getByText("ServerDesk v0.1.0")).toBeInTheDocument();
+    expect(screen.getByText("ServerDesk v0.1.1")).toBeInTheDocument();
   });
 
   it("opens settings from navigation", async () => {
