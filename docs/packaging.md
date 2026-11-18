@@ -19,7 +19,7 @@ An MSI is intentionally not produced. The NSIS installer is the supported Window
 
 - Product name: `ServerDesk`
 - Bundle identifier: `com.serverdesk.app`
-- Version: `0.1.0`, kept identical in `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`
+- Version: `0.1.1`, kept identical in `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`
 - Brand source: `assets/brand/serverdesk-logo.png`
 - Icon-only crop: `assets/brand/serverdesk-mark-source.png`
 - UI-ready sidebar mark: `src/assets/brand/serverdesk-mark.png`
@@ -110,7 +110,7 @@ Tauri merges the platform file into `src-tauri/tauri.conf.json` automatically. T
 - The binary is installed as `/usr/bin/serverdesk`.
 - The DEB section is `admin`; the RPM release is `1`.
 - Runtime dependencies are the standard Tauri WebKitGTK 4.1 stack. `webkit2gtk-4.1` is available on Ubuntu 22.04 and newer, Debian 12 and newer, and Fedora 39 and newer. Older distributions that only package WebKitGTK 4.0 are not supported by this build.
-- AppImages need FUSE 2 to run normally. On systems without FUSE, use `./ServerDesk_0.1.0_amd64.AppImage --appimage-extract-and-run`.
+- AppImages need FUSE 2 to run normally. On systems without FUSE, use `./ServerDesk_0.1.1_amd64.AppImage --appimage-extract-and-run`.
 
 ## Uninstall and credential cleanup
 
@@ -172,7 +172,7 @@ Verify a signed and notarized build:
 ```bash
 codesign --verify --deep --strict --verbose=2 "ServerDesk.app"
 spctl --assess --type execute --verbose=4 "ServerDesk.app"
-xcrun stapler validate "ServerDesk_0.1.0_universal.dmg"
+xcrun stapler validate "ServerDesk_0.1.1_universal.dmg"
 ```
 
 Without the secrets, the release workflow still builds an unsigned universal DMG. It is suitable for internal testing only and must not be presented as a normal end-user download. The workflow unsets empty signing variables before calling Tauri so a missing certificate is not treated as an empty-import request.
@@ -186,7 +186,7 @@ Windows Authenticode signing is not configured. Unsigned NSIS installers trigger
 1. Bump the version in `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json` together.
 2. Run `npm run check` and `npm run check:versions`.
 3. Merge the change through `dev`, `production`, and `main`.
-4. Create and push a tag such as `v0.1.0` from `main`.
+4. Create and push a tag such as `v0.1.1` from `main`.
 5. The workflow builds:
    - Ubuntu 22.04: DEB, RPM, and AppImage, plus the signed AppImage updater artifact and `.sig` files, then smoke-tests the release binary in Xvfb against a clean data directory.
    - macOS 15 Intel: universal `.app`, DMG, updater app archive, and `.sig` files, signed and notarized when the Apple secrets exist.
@@ -203,7 +203,7 @@ The release binary supports an internal smoke-test mode. It starts the real Taur
 
 ```bash
 ./src-tauri/target/release/serverdesk --version
-# ServerDesk 0.1.0
+# ServerDesk 0.1.1
 
 smoke_dir="$(mktemp -d)"
 XDG_DATA_HOME="$smoke_dir" SERVERDESK_SMOKE_TEST=1 \
@@ -223,7 +223,7 @@ rpm -qlp target/release/bundle/rpm/*.rpm
 rpm -qip target/release/bundle/rpm/*.rpm
 ```
 
-Check that the package installs `/usr/bin/serverdesk`, a desktop entry, and the icon, and that the version matches `0.1.0`.
+Check that the package installs `/usr/bin/serverdesk`, a desktop entry, and the icon, and that the version matches `0.1.1`.
 
 ### Updater artifact checks
 
@@ -273,7 +273,7 @@ Known limitations:
 - macOS DMG has no uninstall hook; the documented purge step is required before deleting the app.
 - MSI is not shipped. Only NSIS installers include automatic Windows credential cleanup.
 - The macOS `.app` is not signed for App Store distribution and has no sandbox entitlements.
-- In-app updates are supported for AppImage, NSIS, and the macOS app bundle. DEB and RPM installs are detected but require the system package manager. The `v0.1.0` release predates the updater and cannot install `v0.1.1` in place.
+- In-app updates are supported for AppImage, NSIS, and the macOS app bundle. DEB and RPM installs are detected but require the system package manager. The `v0.1.0` release predates the updater and cannot install `v0.1.1` in place; `v0.1.1` is the first updater-capable release.
 - There is no automatic rollback. Keep previous installers and a database backup if a downgrade is required.
 - macOS updates require a signed, notarized app for reliable Gatekeeper behavior; unsigned builds are test-only.
 - AppImages built on Ubuntu 22.04 require glibc 2.35 or newer and FUSE 2 (or the extract-and-run flag). Extract-and-run installs are not self-updatable.

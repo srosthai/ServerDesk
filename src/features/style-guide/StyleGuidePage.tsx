@@ -378,7 +378,7 @@ function StyleGuidePage() {
 
           <footer className="flex items-center justify-between border-t border-border pt-5 font-mono text-[10px] text-muted-foreground">
             <span>ServerDesk design system</span>
-            <span>v0.1.0</span>
+            <span>v0.1.1</span>
           </footer>
         </div>
       </main>

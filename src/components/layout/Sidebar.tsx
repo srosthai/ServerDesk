@@ -16,7 +16,7 @@ type SidebarProps = {
 function Sidebar({ open, collapsed, onClose }: SidebarProps) {
   const isDesktop = useMediaQuery("(min-width: 768px)");
   const appInfo = useAppInfo();
-  const version = appInfo.status === "ready" ? `v${appInfo.info.appVersion}` : "v0.1.0";
+  const version = appInfo.status === "ready" ? `v${appInfo.info.appVersion}` : "v0.1.1";
   const { activeServer, connection } = useActiveServer();
   const connectionState = connection?.state ?? "disconnected";
   const activeServerName = activeServer?.name ?? "None selected";
