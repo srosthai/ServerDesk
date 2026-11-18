@@ -27,12 +27,12 @@ mod tests {
     #[test]
     fn app_info_serializes_as_camel_case() {
         let value = serde_json::to_value(AppInfo {
-            app_version: "0.1.0".to_string(),
+            app_version: "0.1.1".to_string(),
             database_schema_version: 1,
         })
         .expect("serialized app info");
 
-        assert_eq!(value["appVersion"], "0.1.0");
+        assert_eq!(value["appVersion"], "0.1.1");
         assert_eq!(value["databaseSchemaVersion"], 1);
     }
 }

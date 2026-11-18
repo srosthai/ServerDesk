@@ -436,8 +436,8 @@ are not supported.
 
 - Install FUSE 2. On Ubuntu 22.04, `sudo apt install libfuse2`.
 - If FUSE is unavailable, use
-  `./ServerDesk_0.1.0_amd64.AppImage --appimage-extract-and-run`.
-- Confirm the file is executable: `chmod +x ServerDesk_0.1.0_amd64.AppImage`.
+  `./ServerDesk_0.1.1_amd64.AppImage --appimage-extract-and-run`.
+- Confirm the file is executable: `chmod +x ServerDesk_0.1.1_amd64.AppImage`.
 - The AppImage is not installed, so no package manager resolves missing system
   libraries. Check the terminal output for the missing library.
 
