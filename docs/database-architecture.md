@@ -3,7 +3,9 @@
 The Database Manager shares one adapter contract between MySQL and PostgreSQL.
 Engine-specific SQL, metadata queries, version checks, and driver errors stay
 inside the adapter layer. Tauri commands and React consume typed metadata,
-capability documents, stable error kinds, and bounded pages only.
+capability documents, stable error kinds, and bounded pages only. User-facing
+setup, least-privilege accounts, TLS choices, and safety guidance are in
+[database-manager.md](database-manager.md).
 
 This slice adds the shared foundation and live SQLx adapters for both MySQL and
 PostgreSQL. Both adapters connect through a loopback tunnel endpoint, enforce
@@ -1718,19 +1720,14 @@ partial-result disclosure, and per-connection operation history.
   `--column-statistics=0`; ServerDesk does not add that flag because MariaDB
   clients reject it. Install a client matching the server major version when
   the dump reports an unknown `COLUMN_STATISTICS` table.
-- Real SQL query execution, streaming result sets, and cancellation are
-  follow-up work. The SQL tab owns a per-connection draft and result panel,
-  but its Run action stays disabled until the query commands land.
 - Workspace tabs live in frontend memory for the current application run. The
   selected database, SQL draft, and result document are restored across
   reconnect, not across an application restart.
 - Capability checks are only as accurate as the server version string. An
   unknown version disables version-dependent actions rather than guessing.
-- The standalone capability command accepts an engine and raw version for
-  profiles that are not connected yet. Connected snapshots carry capabilities
-  observed from the live server instead.
-- Profile commands validate and persist metadata, but profile UI is tracked
-  separately in issue #164.
+- Connected snapshots carry capabilities observed from the live server instead.
+  The standalone capability command remains available for profiles that are not
+  connected yet.
 - The ER diagram reads one 500-table catalog page. A larger schema must be
   narrowed with the table filter; relationships are loaded only for drawn
   tables and a foreign key whose target is not in the loaded catalog is counted

@@ -199,6 +199,28 @@ The terminal, file manager, services, projects, logs, and monitoring pages are
 available after the connection is established. The exact verification and
 recovery steps are in [host-keys.md](host-keys.md).
 
+## Add a database connection
+
+The Database Manager connects to MySQL, MariaDB, and PostgreSQL through the
+authenticated SSH session. The database port is never opened directly from this
+computer.
+
+1. Connect the server profile and complete host-key verification.
+2. Open **Databases**, select **Add connection**, and choose the server and
+   engine.
+3. Enter the database **Host** and **Port** as the SSH server sees them. Use
+   `127.0.0.1` when the database runs on the SSH server itself.
+4. Enter the database name, a dedicated database username, and its password.
+5. Select **Read-only connection** unless the task requires writes, and choose
+   the TLS mode that matches the server.
+6. Select **Test connection**, then **Save connection** and **Connect**.
+
+Create the database account separately with only the privileges the task needs.
+A read-only profile is an application guard, not a substitute for database
+grants. Setup for both engines, least-privilege SQL, tunnel behavior, destructive
+confirmations, backup tool requirements, and failure recovery are documented in
+[database-manager.md](database-manager.md).
+
 ## Local data and credentials
 
 ServerDesk keeps its SQLite database, preferences, project records, sanitized
