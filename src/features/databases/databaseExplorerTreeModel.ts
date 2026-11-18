@@ -623,10 +623,10 @@ function pushObjectGroups(
   });
 }
 
-function objectKindFor(
+export function objectKindFor(
   group: DatabaseObjectGroupKind,
   item: DatabaseObjectSummary,
-): DatabaseExplorerObjectKind {
+): DatabaseExplorerObjectKind | null {
   switch (group) {
     case "views":
       return (item as { kind?: string }).kind === "materialized_view"
@@ -639,7 +639,10 @@ function objectKindFor(
     case "sequences":
       return "sequence";
     default:
-      return "view";
+      // Tables are selected through `kind: "table"` and the table structure
+      // panel. Returning a view kind here made objectRefForSelection treat
+      // every table as a view and broke the Structure tab.
+      return null;
   }
 }
 

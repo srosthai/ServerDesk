@@ -10,7 +10,7 @@ use std::{
     io,
     net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncWriteExt, copy_bidirectional},
     net::{TcpListener, TcpStream},
+    runtime::Handle,
     sync::{OwnedSemaphorePermit, Semaphore, watch},
     task::{JoinHandle, JoinSet},
 };
@@ -264,6 +265,7 @@ impl TunnelManager {
         });
         connections.subscribe(Arc::new(TunnelConnectionEventSink {
             manager: Arc::downgrade(&manager),
+            runtime: OnceLock::new(),
         }));
         manager
     }
@@ -536,6 +538,17 @@ impl TunnelManager {
             .lock()
             .map_err(|_| AppError::internal("Database tunnel manager lock was poisoned."))
     }
+
+    fn has_tunnels_for_server(&self, server_id: &str) -> bool {
+        self.lock()
+            .map(|inner| {
+                inner
+                    .tunnels
+                    .values()
+                    .any(|entry| entry.server_id() == server_id)
+            })
+            .unwrap_or(false)
+    }
 }
 
 impl Drop for TunnelManager {
@@ -560,6 +573,7 @@ impl Drop for TunnelManager {
 
 struct TunnelConnectionEventSink {
     manager: Weak<TunnelManager>,
+    runtime: OnceLock<Handle>,
 }
 
 impl ConnectionEventSink for TunnelConnectionEventSink {
@@ -571,8 +585,37 @@ impl ConnectionEventSink for TunnelConnectionEventSink {
             return;
         };
         let server_id = snapshot.server_id.clone();
-        tokio::spawn(async move {
-            manager.close_server(&server_id).await;
+        if !manager.has_tunnels_for_server(&server_id) {
+            return;
+        }
+
+        // Host-key approval and rejection are synchronous commands. They can
+        // emit a disconnected snapshot from a thread that is not running a
+        // Tokio reactor, so spawning unconditionally would panic and terminate
+        // the application. Reuse the first runtime handle that a connection
+        // event provides, and fall back to a short-lived runtime on a plain
+        // thread for a synchronous event before any async connect has run.
+        let runtime = self
+            .runtime
+            .get()
+            .cloned()
+            .or_else(|| Handle::try_current().ok());
+        if let Some(runtime) = runtime {
+            let _ = self.runtime.set(runtime.clone());
+            runtime.spawn(async move {
+                manager.close_server(&server_id).await;
+            });
+            return;
+        }
+
+        std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(manager.close_server(&server_id));
         });
     }
 }

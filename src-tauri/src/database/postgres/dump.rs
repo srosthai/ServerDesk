@@ -9,7 +9,8 @@ use crate::{
     database::{
         dialect::Identifier,
         dump::{
-            DumpConnection, DumpFormat, DumpPaths, DumpScope, DumpToolVendor, wrap_tool_command,
+            DumpConnection, DumpFormat, DumpPaths, DumpScope, DumpToolVendor,
+            wrap_tool_command_with_environment,
         },
         errors::DatabaseError,
     },
@@ -38,10 +39,11 @@ pub fn export_command(
         let database = connection.database.as_deref().unwrap_or("postgres");
         let mut arguments = connection_arguments(connection);
         arguments.push(format!("--dbname={}", shell_quote(database)));
-        return Ok(wrap_tool_command(
+        return Ok(wrap_tool_command_with_environment(
             "pg_dumpall",
             "PGPASSWORD",
             &arguments,
+            &connection_environment(connection),
             paths,
             output,
             None,
@@ -85,10 +87,11 @@ pub fn export_command(
         DumpScope::Cluster => unreachable!("cluster scope is handled above"),
     }
 
-    Ok(wrap_tool_command(
+    Ok(wrap_tool_command_with_environment(
         "pg_dump",
         "PGPASSWORD",
         &arguments,
+        &connection_environment(connection),
         paths,
         output,
         None,
@@ -124,10 +127,11 @@ pub fn restore_command(
                 "--dbname={}",
                 shell_quote(target_database.as_str())
             ));
-            Ok(wrap_tool_command(
+            Ok(wrap_tool_command_with_environment(
                 "psql",
                 "PGPASSWORD",
                 &arguments,
+                &connection_environment(connection),
                 paths,
                 "/dev/null",
                 Some(input),
@@ -149,10 +153,11 @@ pub fn restore_command(
                 arguments.push("--no-owner".to_string());
             }
             arguments.push(shell_quote(input));
-            Ok(wrap_tool_command(
+            Ok(wrap_tool_command_with_environment(
                 "pg_restore",
                 "PGPASSWORD",
                 &arguments,
+                &connection_environment(connection),
                 paths,
                 "/dev/null",
                 None,
@@ -166,10 +171,13 @@ fn connection_arguments(connection: &DumpConnection) -> Vec<String> {
     arguments.push(format!("--host={}", shell_quote(&connection.host)));
     arguments.push(format!("--port={}", connection.port));
     arguments.push(format!("--username={}", shell_quote(&connection.username)));
-    if let Some(mode) = ssl_mode(connection.ssl_mode.as_deref()) {
-        arguments.push(format!("--sslmode={mode}"));
-    }
     arguments
+}
+
+fn connection_environment(connection: &DumpConnection) -> Vec<String> {
+    ssl_mode(connection.ssl_mode.as_deref())
+        .map(|mode| vec![format!("PGSSLMODE={mode}")])
+        .unwrap_or_default()
 }
 
 fn ssl_mode(mode: Option<&str>) -> Option<&'static str> {
@@ -425,6 +433,6 @@ mod tests {
             DumpToolVendor::Postgresql,
         )
         .expect("command");
-        assert!(command.contains("--sslmode=verify-full"));
+        assert!(command.contains("PGSSLMODE=verify-full"));
     }
 }
