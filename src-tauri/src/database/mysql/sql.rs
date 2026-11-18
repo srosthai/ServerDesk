@@ -152,7 +152,8 @@ pub const LIST_COLUMNS: &str = "SELECT COLUMN_NAME AS name, COLUMN_TYPE AS data_
     CAST(NUMERIC_SCALE AS SIGNED) AS numeric_scale, IS_NULLABLE = 'YES' AS nullable, \
     COLUMN_DEFAULT AS default_value, \
     CAST(ORDINAL_POSITION AS SIGNED) AS ordinal_position, \
-    COLUMN_KEY = 'PRI' AS primary_key, EXTRA LIKE '%GENERATED%' AS `generated`, \
+    COLUMN_KEY = 'PRI' AS primary_key, \
+    (EXTRA LIKE '%VIRTUAL GENERATED%' OR EXTRA LIKE '%STORED GENERATED%') AS `generated`, \
     GENERATION_EXPRESSION AS generation_expression, \
     EXTRA LIKE '%auto_increment%' AS auto_increment, COLUMN_COMMENT AS comment, \
     COLLATION_NAME AS collation \
@@ -253,7 +254,7 @@ pub const ROW_TABLE_COLUMNS: &str = "SELECT TABLE_SCHEMA AS database_name, \
     CAST(ORDINAL_POSITION AS SIGNED) AS ordinal_position, \
     COLUMN_KEY = 'PRI' AS primary_key, \
     EXTRA LIKE '%auto_increment%' AS auto_increment, \
-    EXTRA LIKE '%GENERATED%' AS `generated` \
+    (EXTRA LIKE '%VIRTUAL GENERATED%' OR EXTRA LIKE '%STORED GENERATED%') AS `generated` \
     FROM information_schema.COLUMNS \
     WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ? \
     ORDER BY ORDINAL_POSITION LIMIT ?";
@@ -330,7 +331,7 @@ pub const ROLE_DIRECT_GRANTS: &str = "SELECT 'global' AS target_kind, \
     WHERE GRANTEE = CONCAT('''', ?, '''@''', ?, '''') \
     AND PRIVILEGE_TYPE <> 'GRANT OPTION' \
     UNION ALL \
-    SELECT 'table', TABLE_SCHEMA, TABLE_SCHEMA, TABLE_NAME, PRIVILEGE_TYPE, \
+    SELECT 'table', TABLE_SCHEMA, NULL, TABLE_NAME, PRIVILEGE_TYPE, \
     IS_GRANTABLE = 'YES' \
     FROM information_schema.TABLE_PRIVILEGES \
     WHERE GRANTEE = CONCAT('''', ?, '''@''', ?, '''') \
@@ -362,3 +363,30 @@ pub const SESSION_SUMMARY: &str = "SELECT p.ID AS session_id, p.USER AS user_nam
 /// adapter appends a validated integer to this fixed prefix.
 pub const CANCEL_QUERY: &str = "KILL QUERY";
 pub const KILL_SESSION: &str = "KILL CONNECTION";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MySQL reports `DEFAULT_GENERATED` in EXTRA for timestamp and expression
+    /// defaults. Those are writable default values, not generated columns, so a
+    /// broad `%GENERATED%` match would make the row editor reject them.
+    #[test]
+    fn column_metadata_distinguishes_generated_columns_from_default_generated_values() {
+        assert!(!LIST_COLUMNS.contains("EXTRA LIKE '%GENERATED%'"));
+        assert!(!ROW_TABLE_COLUMNS.contains("EXTRA LIKE '%GENERATED%'"));
+        assert!(LIST_COLUMNS.contains("VIRTUAL GENERATED"));
+        assert!(LIST_COLUMNS.contains("STORED GENERATED"));
+        assert!(ROW_TABLE_COLUMNS.contains("VIRTUAL GENERATED"));
+        assert!(ROW_TABLE_COLUMNS.contains("STORED GENERATED"));
+    }
+
+    /// MySQL uses the database name for both database and table grants. The
+    /// adapter must not publish a separate schema field: the request contract
+    /// rejects one, and a synthetic schema made every live grant verification
+    /// compare two different target shapes.
+    #[test]
+    fn table_grant_metadata_does_not_synthesize_a_schema() {
+        assert!(ROLE_DIRECT_GRANTS.contains("SELECT 'table', TABLE_SCHEMA, NULL, TABLE_NAME"));
+    }
+}

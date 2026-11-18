@@ -1428,14 +1428,8 @@ fn projected_summary(
                 host: options.role.host.clone(),
                 kind: options.kind,
                 can_login: MetadataValue::available(can_login),
-                superuser: match engine {
-                    DatabaseEngine::Mysql => MetadataValue::Unavailable,
-                    DatabaseEngine::Postgresql => MetadataValue::available(superuser),
-                },
-                create_database: match engine {
-                    DatabaseEngine::Mysql => MetadataValue::Unavailable,
-                    DatabaseEngine::Postgresql => MetadataValue::available(create_database),
-                },
+                superuser: MetadataValue::available(superuser),
+                create_database: MetadataValue::available(create_database),
                 create_role: match engine {
                     DatabaseEngine::Mysql => MetadataValue::Unavailable,
                     DatabaseEngine::Postgresql => MetadataValue::available(create_role),
@@ -1959,6 +1953,28 @@ mod tests {
             .await
             .expect("fake connection");
         adapter
+    }
+
+    #[test]
+    fn mysql_create_projection_matches_the_live_role_metadata_shape() {
+        let action = ValidatedRoleAction::CreateRole(ValidatedCreateRole {
+            role: RoleRef {
+                name: "acc_reader".to_string(),
+                host: Some("%".to_string()),
+            },
+            kind: RoleKind::Role,
+            changes: RoleAttributeChanges {
+                can_login: Some(false),
+                ..RoleAttributeChanges::default()
+            },
+        });
+        let summary = projected_summary(DatabaseEngine::Mysql, &action, None).expect("projection");
+
+        assert_eq!(summary.can_login, MetadataValue::available(false));
+        assert_eq!(summary.superuser, MetadataValue::available(false));
+        assert_eq!(summary.create_database, MetadataValue::available(false));
+        assert_eq!(summary.create_role, MetadataValue::Unavailable);
+        assert_eq!(summary.inherit, MetadataValue::Unavailable);
     }
 
     fn postgres_grant() -> RoleActionRequest {
