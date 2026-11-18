@@ -4,6 +4,11 @@ This document records the Database Manager MVP acceptance run for issue #191.
 It follows section 14 of the Database Manager plan and the project's existing
 MVP acceptance method in [acceptance.md](acceptance.md).
 
+> **Release status:** This run used a pre-release build whose version metadata
+> still reported `0.1.0`. The Database Manager ships in `v0.1.1`. The artifact
+> names and hashes below describe the acceptance build, not the published
+> `v0.1.1` assets.
+
 ## Candidate and environment
 
 - Date: 2026-11-18
