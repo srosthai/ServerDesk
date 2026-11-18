@@ -271,7 +271,8 @@ Database Manager adds a second remote surface: SQL, DDL, row writes, CSV
 transfers, SQL dumps, role management, session control, and an SSH tunnel per
 connection. The audit follows the same trust model as the rest of the app: the
 local desktop session is trusted; the SSH server, the database server, and all
-returned metadata are untrusted.
+returned metadata are untrusted. Operational setup, including least-privilege
+account examples and TLS choices, is in [database-manager.md](database-manager.md).
 
 ### SQL construction and injection resistance
 
