@@ -8,7 +8,7 @@ ServerDesk is a local-first desktop application for managing Linux VPS servers o
 - A live server overview with system identity, CPU load, memory, disk, and network samples.
 - Multiple interactive terminal tabs per server.
 - A remote file browser with verified upload, download, rename, and delete operations.
-- A Database Manager workspace shell with `/databases` navigation and explicit empty states. The backend includes loopback-only SQLx MySQL/MariaDB and PostgreSQL adapters with read-only sessions and version-derived capabilities; connection commands and the profile UI are still in development.
+- A Database Manager for MySQL/MariaDB and PostgreSQL through loopback-only SSH tunnels, with read-only profiles, previewed schema changes, bounded data and SQL browsing, CSV transfer, and verified SQL dumps. See [docs/database-manager.md](docs/database-manager.md) for setup, least-privilege accounts, and safety notes.
 - Systemd service discovery with verified start, stop, and restart actions.
 - Laravel project detection, fixed Artisan actions, and a read-only queue and Supervisor view.
 - Bounded log tails and a local, sanitized operation history.
@@ -61,6 +61,7 @@ Bundle builds create signed updater artifacts, so `TAURI_SIGNING_PRIVATE_KEY` mu
 User guide:
 
 - [Install and first run](docs/install.md)
+- [Database Manager setup and safe use](docs/database-manager.md)
 - [SSH account and scoped sudo](docs/ssh-setup.md)
 - [Host key verification and recovery](docs/host-keys.md)
 - [Features](docs/features.md)

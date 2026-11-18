@@ -200,6 +200,118 @@ action changed the remote state.
   names are rejected.
 - A missing sudo rule produces a permission error, not an empty service list.
 
+## Database Manager problems
+
+The Database Manager adds a database login and an SSH tunnel on top of the
+normal server connection. The full setup and recovery guide is
+[database-manager.md](database-manager.md); the checks below cover the most
+common failure groups.
+
+### The database tunnel cannot be opened
+
+Error codes: `tunnel`, `connection`, `timeout`, or `conflict`.
+
+- Connect the server profile and verify its host key first. A database tunnel
+  needs an authenticated SSH session.
+- Test the endpoint from the SSH server, not from your desktop:
+  `ss -ltn | grep ':5432'` and
+  `psql -h 127.0.0.1 -p 5432 -U serverdesk_ro -d app -c 'SELECT 1'`.
+- Use `127.0.0.1` only when the database is on the SSH server. For a separate
+  host, use an address reachable from that server; a container name or a
+  container-only address normally is not.
+- Check forwarding policy with
+  `sshd -T | grep -Ei 'allowtcpforwarding|permitopen'` on the SSH server.
+- Close unused database tabs if 16 tunnels are already active. A `conflict`
+  also means the profile is already opening or using a different endpoint.
+
+### The database login fails
+
+Error code: `database_auth` (the UI may label it as an authentication failure).
+
+- Confirm the database username, password, and database name with the vendor
+  client from the SSH server. The SSH username is not the database username.
+- Check the account's source host. The database sees the SSH server's address,
+  not this computer's address. For MySQL, grant the account for
+  `127.0.0.1` only when the database is on the SSH server.
+- For PostgreSQL, confirm the target database exists and that `pg_hba.conf`
+  has a matching TCP password rule before any broader rule. Reload PostgreSQL
+  after changing it.
+- Edit the saved profile and re-enter the password after a server-side password
+  change. A locked OS keyring also prevents the saved credential from loading.
+
+### A database connection or query times out
+
+Error code: `timeout`.
+
+- Tunnel setup and database connect are bounded at 10 seconds. Check server
+  load, firewall rules, and whether the database is running.
+- SQL and row reads default to 10 seconds and allow at most 30 seconds. Raise
+  the timeout in the SQL tab for a slow statement; metadata and Data-tab reads
+  do not offer a per-request timeout.
+- Locks, long DDL, and a saturated database can exceed the bound. Use the
+  server's process list to inspect them.
+- A timed-out or cancelled SQL request closes the database session. Reconnect
+  the profile before running another statement.
+
+### A database action is denied
+
+Error code: `permission`.
+
+- Check whether the profile is read-only. A writable database account is still
+  required after the profile flag is off.
+- Inspect the account's grants with `SHOW GRANTS` on MySQL or
+  `has_table_privilege` / `\dp` on PostgreSQL.
+- PostgreSQL object changes require ownership or membership in the owning role.
+- Listing other users' sessions needs `PROCESS` (MySQL) or `pg_monitor`
+  (PostgreSQL); cancelling them needs `CONNECTION_ADMIN` or
+  `pg_signal_backend` respectively. ServerDesk never elevates the account.
+- Some metadata is unavailable when the account cannot read it. It is not an
+  empty database.
+
+### Backup or restore tools are missing or incompatible
+
+Error codes: `capability` or `not_found`.
+
+- Install `mysqldump` and `mysql` (MySQL/MariaDB) or `pg_dump`, `pg_dumpall`,
+  `pg_restore`, and `psql` (PostgreSQL) on the SSH server.
+- Confirm the binaries are on the SSH account's `PATH` and that the client
+  major version is at least the server major version.
+- ServerDesk does not install packages or use a desktop-side client.
+- Check that the destination directory exists and is writable and that the
+  remote server has free space, including for a local download's temporary
+  dump.
+- If `mysqldump` 8 reports an unknown `COLUMN_STATISTICS` table, install a
+  matching server-vendor client. ServerDesk does not pass
+  `--column-statistics=0` because MariaDB clients reject it.
+
+### A restore failed or may be incomplete
+
+A failed, cancelled, or timed-out restore is not rolled back automatically.
+`mayBeIncomplete: true` means objects or rows may already have been restored.
+
+1. Do not retry blindly. Inspect the target database with the vendor client.
+2. Use a disposable target or a fresh database for the next attempt.
+3. Restore ownership or schema problems with a dump created using **Omit object
+   ownership**, or use an archive restore with that option.
+4. Restore a pre-restore snapshot or vendor backup if the target must be reset.
+   ServerDesk has no rollback command.
+
+A read-only profile is rejected before the restore password or tool is loaded.
+Create and connect a writable profile first.
+
+### TLS or certificate validation fails
+
+- **Verify CA** uses ServerDesk's built-in public trust roots and has no custom
+  CA file. A private CA fails even when the system `psql` or `mysql` client
+  trusts it; use **Required** over the authenticated SSH tunnel or install a
+  publicly trusted certificate.
+- **Verify identity** checks the certificate against `127.0.0.1` for the app's
+  driver. Most certificates do not include that address. Use **Verify CA** or
+  **Required** unless the certificate deliberately matches the tunnel endpoint.
+- Remote dump tools use the saved **Host**, so they can fail certificate
+  validation when the profile connects successfully. See
+  [TLS and SSL mode choices](database-manager.md#tls-and-ssl-mode-choices).
+
 ## Key and credential problems
 
 ### The private key is encrypted
