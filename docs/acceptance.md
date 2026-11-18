@@ -5,6 +5,9 @@ release candidate. The run used the package built from this repository, a
 disposable OpenSSH server, and a disposable Laravel fixture. It did not use a
 cloud service, a remote agent, or a hosted backend.
 
+The Database Manager MVP checklist has a separate acceptance record in
+[database-acceptance.md](database-acceptance.md).
+
 ## Candidate and environment
 
 - Date: 2026-11-09

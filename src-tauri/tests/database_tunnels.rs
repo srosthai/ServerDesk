@@ -18,8 +18,9 @@ use serverdesk_lib::{
         ErrorCode,
         ssh::{
             Authentication, ConnectionEventSink, ConnectionManager, ConnectionRequest,
-            ConnectionSnapshot, ConnectionTimeouts, RusshTransport, TrustedHostKey,
-            TunnelListenerFactory, TunnelManager, TunnelRequest, TunnelState, TunnelTimeouts,
+            ConnectionSnapshot, ConnectionState, ConnectionTimeouts, RusshTransport,
+            TrustedHostKey, TunnelListenerFactory, TunnelManager, TunnelRequest, TunnelState,
+            TunnelTimeouts,
         },
     },
     storage::{AuthType, Database, DatabaseEngine, NewDatabaseConnection, NewServer},
@@ -739,6 +740,33 @@ async fn profile_deletion_closes_the_tunnel_before_removing_metadata() {
     );
     assert!(tunnels.snapshot(&profile.id).expect("state").is_none());
     connections.disconnect_all().await;
+}
+
+#[tokio::test]
+async fn host_key_approval_from_a_synchronous_thread_does_not_require_a_reactor() {
+    let fixture = FixtureServer::start(false, Duration::ZERO).await;
+    let connections = connection_manager();
+    let _tunnels = TunnelManager::new(Arc::clone(&connections));
+
+    let mut untrusted = fixture.request("fixture-server");
+    untrusted.trusted_host_keys.clear();
+    connections
+        .connect(untrusted)
+        .await
+        .expect_err("an untrusted host key must fail");
+    let pending = connections
+        .pending_host_key("fixture-server")
+        .expect("pending key")
+        .expect("host key verification state");
+
+    let approval = std::thread::spawn(move || {
+        connections.approve_host_key("fixture-server", &pending.key_type, &pending.fingerprint)
+    })
+    .join()
+    .expect("synchronous host-key approval must not panic");
+
+    let snapshot = approval.expect("host key approval");
+    assert_eq!(snapshot.state, ConnectionState::Disconnected);
 }
 
 #[tokio::test]

@@ -1373,13 +1373,40 @@ pub fn wrap_tool_command(
     stdout: &str,
     stdin: Option<&str>,
 ) -> String {
+    wrap_tool_command_with_environment(
+        binary,
+        password_variable,
+        arguments,
+        &[],
+        paths,
+        stdout,
+        stdin,
+    )
+}
+
+/// Same wrapper with fixed `NAME=value` environment assignments. Callers use
+/// this for libpq options such as `PGSSLMODE`, which `pg_dump`, `pg_restore`,
+/// and `psql` read from the environment rather than a command-line flag.
+pub fn wrap_tool_command_with_environment(
+    binary: &'static str,
+    password_variable: &'static str,
+    arguments: &[String],
+    environment: &[String],
+    paths: &DumpPaths,
+    stdout: &str,
+    stdin: Option<&str>,
+) -> String {
     let args = arguments.join(" ");
     let input = stdin
         .map(|path| format!(" < {}", shell_quote(path)))
         .unwrap_or_default();
+    let environment = environment
+        .iter()
+        .map(|entry| format!("{entry} "))
+        .collect::<String>();
     format!(
         "umask 077; set -C; printf '%s' \"$$\" > {}; {password_variable}=$(cat {}); export \
-         {password_variable}; exec {binary} {args}{input} > {} 2> {}",
+         {password_variable}; {environment}exec {binary} {args}{input} > {} 2> {}",
         shell_quote(&paths.pid),
         shell_quote(&paths.credential),
         shell_quote(stdout),
