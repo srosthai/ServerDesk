@@ -1,6 +1,6 @@
 [package]
 name = "serverdesk"
-version = "0.1.1"
+version = "0.1.2"
 description = "Local-first desktop application for managing Linux VPS servers over SSH"
 authors = ["ServerDesk"]
 edition = "2024"

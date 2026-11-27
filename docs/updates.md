@@ -73,7 +73,7 @@ If the private key is compromised, publish a security advisory and a manually in
 
 ```bash
 node scripts/latest-json.mjs \
-  --version 0.1.1 \
+  --version 0.1.2 \
   --notes-file release-notes.txt \
   --pub-date 2026-11-12T12:00:00Z \
   --asset-dir release-assets \
@@ -95,24 +95,24 @@ Example shape (signatures and URLs abbreviated):
 
 ```json
 {
-  "version": "0.1.1",
-  "notes": "ServerDesk 0.1.1",
+  "version": "0.1.2",
+  "notes": "ServerDesk 0.1.2",
   "pub_date": "2026-11-12T12:00:00Z",
   "platforms": {
     "darwin-aarch64": {
-      "url": "https://github.com/srosthai/ServerDesk/releases/download/v0.1.1/ServerDesk_0.1.1_universal.app.tar.gz",
+      "url": "https://github.com/srosthai/ServerDesk/releases/download/v0.1.2/ServerDesk_0.1.2_universal.app.tar.gz",
       "signature": "…"
     },
     "darwin-x86_64": {
-      "url": "https://github.com/srosthai/ServerDesk/releases/download/v0.1.1/ServerDesk_0.1.1_universal.app.tar.gz",
+      "url": "https://github.com/srosthai/ServerDesk/releases/download/v0.1.2/ServerDesk_0.1.2_universal.app.tar.gz",
       "signature": "…"
     },
     "linux-x86_64": {
-      "url": "https://github.com/srosthai/ServerDesk/releases/download/v0.1.1/ServerDesk_0.1.1_amd64.AppImage",
+      "url": "https://github.com/srosthai/ServerDesk/releases/download/v0.1.2/ServerDesk_0.1.2_amd64.AppImage",
       "signature": "…"
     },
     "windows-x86_64": {
-      "url": "https://github.com/srosthai/ServerDesk/releases/download/v0.1.1/ServerDesk_0.1.1_x64-setup.exe",
+      "url": "https://github.com/srosthai/ServerDesk/releases/download/v0.1.2/ServerDesk_0.1.2_x64-setup.exe",
       "signature": "…"
     }
   }
@@ -163,9 +163,9 @@ Only AppImage installs can replace themselves. The updater needs a writable AppI
 DEB and RPM installs are detected through Tauri's bundle type. They show the available version and link to the release page. Update with the package manager:
 
 ```bash
-sudo apt install ./ServerDesk_0.1.1_amd64.deb
+sudo apt install ./ServerDesk_0.1.2_amd64.deb
 # or
-sudo dnf install ./ServerDesk-0.1.1-1.x86_64.rpm
+sudo dnf install ./ServerDesk-0.1.2-1.x86_64.rpm
 ```
 
 ### Windows
@@ -191,11 +191,11 @@ AppImage replacement may keep the old file in a temporary location during the up
 
 ## Verification limits
 
-A full live self-update test requires two updater-capable published versions. `v0.1.1` is the first, and the `v0.1.0` installation predates the updater, so no in-place self-update can be proven until a later release exists. Release QA for the first update must:
+A full live self-update test requires two updater-capable published versions. `v0.1.1` is the first updater-capable release, and `v0.1.2` is the first release that can be tested as an in-place update. Release QA for this pair must:
 
 1. Install a signed `v0.1.1` build.
-2. Publish or stage a later release, such as `v0.1.2`, with the same endpoint.
-3. Confirm the `v0.1.1` build detects, downloads, verifies, installs, and relaunches into the later version.
+2. Publish `v0.1.2` with the same endpoint.
+3. Confirm the `v0.1.1` build detects, downloads, verifies, installs, and relaunches into `v0.1.2`.
 4. Repeat with a deliberately corrupted `.sig` or an artifact signed by a different key and confirm the update is rejected.
 5. Repeat with the network disabled and confirm the current installation still starts and works.
 

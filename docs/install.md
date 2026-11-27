@@ -9,7 +9,7 @@ to GitHub Releases. Download the asset for your platform. If the Releases page
 has no published build yet, build from source with
 [development.md](development.md) and [packaging.md](packaging.md).
 
-The examples below use version `0.1.1`. Substitute the version and architecture
+The examples below use version `0.1.2`. Substitute the version and architecture
 in the file name you downloaded.
 
 ## Requirements
@@ -39,7 +39,7 @@ and inspect the script before running it.
 ```bash
 curl -fsSLO https://github.com/srosthai/ServerDesk/releases/latest/download/install.sh
 less install.sh
-bash install.sh --version v0.1.1
+bash install.sh --version v0.1.2
 ```
 
 On Linux the AppImage is installed to `~/.local/bin/serverdesk`. Add
@@ -51,7 +51,7 @@ On Linux the AppImage is installed to `~/.local/bin/serverdesk`. Add
 ```powershell
 Invoke-WebRequest -Uri https://github.com/srosthai/ServerDesk/releases/latest/download/install.ps1 -OutFile install.ps1
 Get-Content .\install.ps1
-powershell -ExecutionPolicy Bypass -File .\install.ps1 -Version v0.1.1
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Version v0.1.2
 ```
 
 The NSIS installer runs per-user. Unsigned Windows and macOS builds may trigger
@@ -64,7 +64,7 @@ through the operating system security prompt.
 
 ```bash
 cd ~/Downloads
-sudo apt install ./ServerDesk_0.1.1_amd64.deb
+sudo apt install ./ServerDesk_0.1.2_amd64.deb
 ```
 
 `apt` installs the WebKitGTK 4.1 and GTK 3 runtime dependencies from the
@@ -91,7 +91,7 @@ when that cleanup cannot run.
 
 ```bash
 cd ~/Downloads
-sudo dnf install ./ServerDesk-0.1.1-1.x86_64.rpm
+sudo dnf install ./ServerDesk-0.1.2-1.x86_64.rpm
 ```
 
 Launch ServerDesk from the application menu or run `serverdesk`. The package is
@@ -109,15 +109,15 @@ The AppImage is portable and is not installed system-wide:
 
 ```bash
 cd ~/Downloads
-chmod +x ServerDesk_0.1.1_amd64.AppImage
-./ServerDesk_0.1.1_amd64.AppImage
+chmod +x ServerDesk_0.1.2_amd64.AppImage
+./ServerDesk_0.1.2_amd64.AppImage
 ```
 
 AppImages need FUSE 2. On Ubuntu 22.04, install it with
 `sudo apt install libfuse2`. If FUSE is unavailable, run the AppImage with:
 
 ```bash
-./ServerDesk_0.1.1_amd64.AppImage --appimage-extract-and-run
+./ServerDesk_0.1.2_amd64.AppImage --appimage-extract-and-run
 ```
 
 Quit ServerDesk and run the AppImage with `--purge-data` before deleting the
@@ -125,7 +125,7 @@ file if you want to remove credentials and local data.
 
 ## macOS
 
-1. Open the downloaded `ServerDesk_0.1.1_universal.dmg`.
+1. Open the downloaded `ServerDesk_0.1.2_universal.dmg`.
 2. Drag `ServerDesk.app` into `Applications`.
 3. Eject the DMG and launch ServerDesk from `Applications`.
 
