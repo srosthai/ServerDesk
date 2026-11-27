@@ -288,215 +288,203 @@ function ServerProfileDialog({ server, onOpenChange }: ServerProfileDialogProps)
         }
       }}
     >
-      <DialogContent className="max-w-xl">
-        <form onSubmit={handleSubmit} className="space-y-5">
-          <DialogHeader>
-            <DialogTitle>{server ? "Edit server" : "Add server"}</DialogTitle>
-            <DialogDescription>
-              Connection metadata is stored locally. Secrets are kept in the OS credential store,
-              never in SQLite.
-            </DialogDescription>
-          </DialogHeader>
+      <DialogContent className="max-w-xl overflow-hidden p-0">
+        <form onSubmit={handleSubmit} className="flex max-h-[calc(100dvh-2rem)] min-h-0 flex-col">
+          <div className="min-h-0 flex-1 space-y-5 overflow-y-auto overscroll-contain p-6 pb-4">
+            <DialogHeader>
+              <DialogTitle>{server ? "Edit server" : "Add server"}</DialogTitle>
+              <DialogDescription>
+                Connection metadata is stored locally. Secrets are kept in the OS credential store,
+                never in SQLite.
+              </DialogDescription>
+            </DialogHeader>
 
-          {error ? (
-            <Alert variant="destructive" className="py-2.5">
-              <WarningCircleIcon
-                className="mt-0.5 size-4 shrink-0 text-destructive"
-                aria-hidden="true"
-              />
-              <div>
-                <AlertTitle>Could not save server</AlertTitle>
-                <AlertDescription>{error}</AlertDescription>
+            {error ? (
+              <Alert variant="destructive" className="py-2.5">
+                <WarningCircleIcon
+                  className="mt-0.5 size-4 shrink-0 text-destructive"
+                  aria-hidden="true"
+                />
+                <div>
+                  <AlertTitle>Could not save server</AlertTitle>
+                  <AlertDescription>{error}</AlertDescription>
+                </div>
+              </Alert>
+            ) : null}
+
+            {testState.status === "testing" ? (
+              <Alert variant="info" className="py-2.5" aria-live="polite">
+                <CircleNotchIcon
+                  className="mt-0.5 size-4 shrink-0 animate-spin text-info"
+                  aria-hidden="true"
+                />
+                <div>
+                  <AlertTitle>Testing connection</AlertTitle>
+                  <AlertDescription>
+                    Resolving {testDestination}, checking the host key, authenticating, and running
+                    a remote check.
+                  </AlertDescription>
+                </div>
+              </Alert>
+            ) : null}
+
+            {testState.status === "success" ? (
+              <Alert variant="success" className="py-2.5" aria-live="polite">
+                <PlugsIcon className="mt-0.5 size-4 shrink-0 text-success" aria-hidden="true" />
+                <div>
+                  <AlertTitle>Connection test passed</AlertTitle>
+                  <AlertDescription>
+                    Connected to {testDestination} as {trimmedUsername || "the configured user"} in{" "}
+                    {formatDuration(testState.durationMs)}. The host key, authentication, and remote
+                    check all succeeded.
+                    {hostKeyTrustIsEphemeral ? (
+                      <span className="mt-1 block">
+                        The host key was accepted for this test only. Verify it again when the saved
+                        profile connects.
+                      </span>
+                    ) : null}
+                  </AlertDescription>
+                </div>
+              </Alert>
+            ) : null}
+
+            {testState.status === "error" && testError ? (
+              <Alert variant="destructive" className="py-2.5">
+                <WarningCircleIcon
+                  className="mt-0.5 size-4 shrink-0 text-destructive"
+                  aria-hidden="true"
+                />
+                <div>
+                  <AlertTitle>{testError.title}</AlertTitle>
+                  <AlertDescription>
+                    <p>{testState.error.message}</p>
+                    <p className="mt-1">{testState.error.details ?? testError.action}</p>
+                  </AlertDescription>
+                </div>
+              </Alert>
+            ) : null}
+
+            {testState.status === "cancelled" ? (
+              <Alert variant="info" className="py-2.5" aria-live="polite">
+                <WarningCircleIcon
+                  className="mt-0.5 size-4 shrink-0 text-info"
+                  aria-hidden="true"
+                />
+                <div>
+                  <AlertTitle>Connection test cancelled</AlertTitle>
+                  <AlertDescription>
+                    The host key was rejected. No credentials were sent to the server.
+                  </AlertDescription>
+                </div>
+              </Alert>
+            ) : null}
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="server-name">Name</Label>
+                <Input
+                  id="server-name"
+                  value={name}
+                  onChange={(event) => setName(event.currentTarget.value)}
+                  placeholder="Production"
+                  autoFocus
+                  required
+                />
               </div>
-            </Alert>
-          ) : null}
-
-          {testState.status === "testing" ? (
-            <Alert variant="info" className="py-2.5" aria-live="polite">
-              <CircleNotchIcon
-                className="mt-0.5 size-4 shrink-0 animate-spin text-info"
-                aria-hidden="true"
-              />
-              <div>
-                <AlertTitle>Testing connection</AlertTitle>
-                <AlertDescription>
-                  Resolving {testDestination}, checking the host key, authenticating, and running a
-                  remote check.
-                </AlertDescription>
+              <div className="space-y-2">
+                <Label htmlFor="server-group">Group</Label>
+                <Input
+                  id="server-group"
+                  value={groupName}
+                  onChange={(event) => setGroupName(event.currentTarget.value)}
+                  placeholder="Production"
+                />
               </div>
-            </Alert>
-          ) : null}
-
-          {testState.status === "success" ? (
-            <Alert variant="success" className="py-2.5" aria-live="polite">
-              <PlugsIcon className="mt-0.5 size-4 shrink-0 text-success" aria-hidden="true" />
-              <div>
-                <AlertTitle>Connection test passed</AlertTitle>
-                <AlertDescription>
-                  Connected to {testDestination} as {trimmedUsername || "the configured user"} in{" "}
-                  {formatDuration(testState.durationMs)}. The host key, authentication, and remote
-                  check all succeeded.
-                  {hostKeyTrustIsEphemeral ? (
-                    <span className="mt-1 block">
-                      The host key was accepted for this test only. Verify it again when the saved
-                      profile connects.
-                    </span>
-                  ) : null}
-                </AlertDescription>
-              </div>
-            </Alert>
-          ) : null}
-
-          {testState.status === "error" && testError ? (
-            <Alert variant="destructive" className="py-2.5">
-              <WarningCircleIcon
-                className="mt-0.5 size-4 shrink-0 text-destructive"
-                aria-hidden="true"
-              />
-              <div>
-                <AlertTitle>{testError.title}</AlertTitle>
-                <AlertDescription>
-                  <p>{testState.error.message}</p>
-                  <p className="mt-1">{testState.error.details ?? testError.action}</p>
-                </AlertDescription>
-              </div>
-            </Alert>
-          ) : null}
-
-          {testState.status === "cancelled" ? (
-            <Alert variant="info" className="py-2.5" aria-live="polite">
-              <WarningCircleIcon className="mt-0.5 size-4 shrink-0 text-info" aria-hidden="true" />
-              <div>
-                <AlertTitle>Connection test cancelled</AlertTitle>
-                <AlertDescription>
-                  The host key was rejected. No credentials were sent to the server.
-                </AlertDescription>
-              </div>
-            </Alert>
-          ) : null}
-
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="space-y-2">
-              <Label htmlFor="server-name">Name</Label>
-              <Input
-                id="server-name"
-                value={name}
-                onChange={(event) => setName(event.currentTarget.value)}
-                placeholder="Production"
-                autoFocus
-                required
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="server-group">Group</Label>
-              <Input
-                id="server-group"
-                value={groupName}
-                onChange={(event) => setGroupName(event.currentTarget.value)}
-                placeholder="Production"
-              />
-            </div>
-            <div className="space-y-2 sm:col-span-2">
-              <Label htmlFor="server-host">Host</Label>
-              <Input
-                id="server-host"
-                value={host}
-                onChange={(event) => {
-                  setHost(event.currentTarget.value);
-                  resetForHostChange();
-                }}
-                placeholder="198.51.100.24 or server.example.com"
-                spellCheck={false}
-                required
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="server-port">SSH port</Label>
-              <Input
-                id="server-port"
-                type="number"
-                min={1}
-                max={65535}
-                value={port}
-                onChange={(event) => {
-                  setPort(event.currentTarget.value);
-                  resetForHostChange();
-                }}
-                required
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="server-username">Username</Label>
-              <Input
-                id="server-username"
-                value={username}
-                onChange={(event) => {
-                  setUsername(event.currentTarget.value);
-                  resetTestState();
-                }}
-                placeholder="deploy"
-                autoComplete="username"
-                spellCheck={false}
-                required
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="server-auth">Authentication</Label>
-              <Select
-                value={authType}
-                onValueChange={(value) => {
-                  if (value !== authType) {
-                    setAuthType(value as AuthType);
-                    setSecret("");
-                    setPassphrase("");
-                    setPendingHostKey(null);
-                    resetTestState();
-                  }
-                }}
-              >
-                <SelectTrigger id="server-auth">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="password">Password</SelectItem>
-                  <SelectItem value="private_key">Private key</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="server-tags">Tags</Label>
-              <Input
-                id="server-tags"
-                value={tags}
-                onChange={(event) => setTags(event.currentTarget.value)}
-                placeholder="web, laravel"
-              />
-            </div>
-            {isTauriRuntime() ? (
               <div className="space-y-2 sm:col-span-2">
-                <Label htmlFor="server-secret">
-                  {authType === "password" ? "SSH password" : "Private key"}
-                </Label>
-                {authType === "password" ? (
-                  <Input
-                    id="server-secret"
-                    type="password"
-                    value={secret}
-                    onChange={(event) => {
-                      setSecret(event.currentTarget.value);
+                <Label htmlFor="server-host">Host</Label>
+                <Input
+                  id="server-host"
+                  value={host}
+                  onChange={(event) => {
+                    setHost(event.currentTarget.value);
+                    resetForHostChange();
+                  }}
+                  placeholder="198.51.100.24 or server.example.com"
+                  spellCheck={false}
+                  required
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="server-port">SSH port</Label>
+                <Input
+                  id="server-port"
+                  type="number"
+                  min={1}
+                  max={65535}
+                  value={port}
+                  onChange={(event) => {
+                    setPort(event.currentTarget.value);
+                    resetForHostChange();
+                  }}
+                  required
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="server-username">Username</Label>
+                <Input
+                  id="server-username"
+                  value={username}
+                  onChange={(event) => {
+                    setUsername(event.currentTarget.value);
+                    resetTestState();
+                  }}
+                  placeholder="deploy"
+                  autoComplete="username"
+                  spellCheck={false}
+                  required
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="server-auth">Authentication</Label>
+                <Select
+                  value={authType}
+                  onValueChange={(value) => {
+                    if (value !== authType) {
+                      setAuthType(value as AuthType);
+                      setSecret("");
+                      setPassphrase("");
+                      setPendingHostKey(null);
                       resetTestState();
-                    }}
-                    placeholder={
-                      server?.credentialRef
-                        ? "Leave blank to keep the existing secret"
-                        : "Optional now; stored in the OS credential store"
                     }
-                    autoComplete="new-password"
-                  />
-                ) : (
-                  <>
-                    <Textarea
+                  }}
+                >
+                  <SelectTrigger id="server-auth">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="password">Password</SelectItem>
+                    <SelectItem value="private_key">Private key</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="server-tags">Tags</Label>
+                <Input
+                  id="server-tags"
+                  value={tags}
+                  onChange={(event) => setTags(event.currentTarget.value)}
+                  placeholder="web, laravel"
+                />
+              </div>
+              {isTauriRuntime() ? (
+                <div className="space-y-2 sm:col-span-2">
+                  <Label htmlFor="server-secret">
+                    {authType === "password" ? "SSH password" : "Private key"}
+                  </Label>
+                  {authType === "password" ? (
+                    <Input
                       id="server-secret"
+                      type="password"
                       value={secret}
                       onChange={(event) => {
                         setSecret(event.currentTarget.value);
@@ -504,54 +492,71 @@ function ServerProfileDialog({ server, onOpenChange }: ServerProfileDialogProps)
                       }}
                       placeholder={
                         server?.credentialRef
-                          ? "Leave blank to keep the existing key"
-                          : "Paste an OpenSSH or PEM private key, or enter a key file path"
+                          ? "Leave blank to keep the existing secret"
+                          : "Optional now; stored in the OS credential store"
                       }
-                      className="min-h-20 font-mono text-[11px]"
-                      spellCheck={false}
+                      autoComplete="new-password"
                     />
-                    <div className="space-y-2 pt-1">
-                      <Label htmlFor="server-passphrase">Key passphrase (optional)</Label>
-                      <Input
-                        id="server-passphrase"
-                        type="password"
-                        value={passphrase}
+                  ) : (
+                    <>
+                      <Textarea
+                        id="server-secret"
+                        value={secret}
                         onChange={(event) => {
-                          setPassphrase(event.currentTarget.value);
+                          setSecret(event.currentTarget.value);
                           resetTestState();
                         }}
                         placeholder={
-                          secret.length > 0
-                            ? "Leave blank if the key is not encrypted"
-                            : server?.credentialRef
-                              ? "Leave blank to keep the saved key and passphrase"
-                              : "Leave blank if the key is not encrypted"
+                          server?.credentialRef
+                            ? "Leave blank to keep the existing key"
+                            : "Paste an OpenSSH or PEM private key, or enter a key file path"
                         }
-                        autoComplete="new-password"
+                        className="min-h-20 font-mono text-[11px]"
+                        spellCheck={false}
                       />
-                    </div>
-                  </>
-                )}
-                <p className="text-[11px] leading-relaxed text-muted-foreground">
-                  Secrets are stored in the OS credential store, never in SQLite or logs.
-                  {authType === "private_key"
-                    ? " OpenSSH, PEM (RSA, ECDSA, Ed25519), and PuTTY PPK keys are supported; encrypted keys use the passphrase above."
-                    : null}
-                </p>
+                      <div className="space-y-2 pt-1">
+                        <Label htmlFor="server-passphrase">Key passphrase (optional)</Label>
+                        <Input
+                          id="server-passphrase"
+                          type="password"
+                          value={passphrase}
+                          onChange={(event) => {
+                            setPassphrase(event.currentTarget.value);
+                            resetTestState();
+                          }}
+                          placeholder={
+                            secret.length > 0
+                              ? "Leave blank if the key is not encrypted"
+                              : server?.credentialRef
+                                ? "Leave blank to keep the saved key and passphrase"
+                                : "Leave blank if the key is not encrypted"
+                          }
+                          autoComplete="new-password"
+                        />
+                      </div>
+                    </>
+                  )}
+                  <p className="text-[11px] leading-relaxed text-muted-foreground">
+                    Secrets are stored in the OS credential store, never in SQLite or logs.
+                    {authType === "private_key"
+                      ? " OpenSSH, PEM (RSA, ECDSA, Ed25519), and PuTTY PPK keys are supported; encrypted keys use the passphrase above."
+                      : null}
+                  </p>
+                </div>
+              ) : null}
+              <div className="space-y-2 sm:col-span-2">
+                <Label htmlFor="server-notes">Notes</Label>
+                <Textarea
+                  id="server-notes"
+                  value={notes}
+                  onChange={(event) => setNotes(event.currentTarget.value)}
+                  placeholder="Optional non-sensitive notes"
+                />
               </div>
-            ) : null}
-            <div className="space-y-2 sm:col-span-2">
-              <Label htmlFor="server-notes">Notes</Label>
-              <Textarea
-                id="server-notes"
-                value={notes}
-                onChange={(event) => setNotes(event.currentTarget.value)}
-                placeholder="Optional non-sensitive notes"
-              />
             </div>
           </div>
 
-          <DialogFooter>
+          <DialogFooter className="border-t border-border bg-card px-6 py-4">
             <Button
               type="button"
               variant="secondary"

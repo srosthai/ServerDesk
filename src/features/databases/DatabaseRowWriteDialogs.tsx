@@ -478,7 +478,8 @@ export function RowWriteInfo() {
     <p className="flex items-start gap-1.5 text-[10px] leading-4 text-muted-foreground">
       <InfoIcon className="mt-0.5 size-3 shrink-0" aria-hidden="true" />
       Writes run in a transaction, verify the affected row count, re-read the row where safe, and
-      commit only after verification. History records the action, table, and outcome, never row
+      commit only after verification. Double-click a cell to edit it in place; identity and
+      generated columns stay read-only. History records the action, table, and outcome, never row
       values.
     </p>
   );

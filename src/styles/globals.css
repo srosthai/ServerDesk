@@ -194,6 +194,11 @@
   animation: serverdesk-fade-in 140ms ease-out;
 }
 
+body.database-workspace-fullscreen [data-app-sidebar],
+body.database-workspace-fullscreen [data-app-topbar] {
+  display: none;
+}
+
 [data-slot="dialog-content"][data-state="open"] {
   animation: serverdesk-dialog-in 180ms cubic-bezier(0.16, 1, 0.3, 1);
 }

@@ -3,6 +3,8 @@ import { Link } from "react-router-dom";
 import type { Icon } from "@phosphor-icons/react";
 import {
   ArrowClockwiseIcon,
+  ArrowsInIcon,
+  ArrowsOutIcon,
   CircleNotchIcon,
   CodeIcon,
   DatabaseIcon,
@@ -402,8 +404,10 @@ function DatabaseWorkspaceTopBar({
   selectedSchema,
   selectedObject,
   refreshing,
+  fullscreen,
   onRefresh,
   onAddConnection,
+  onToggleFullscreen,
 }: {
   activeServer: ServerProfile | null;
   connectionState: ConnectionState;
@@ -413,8 +417,10 @@ function DatabaseWorkspaceTopBar({
   selectedSchema: string | null;
   selectedObject: { label: string; kind: string } | null;
   refreshing: boolean;
+  fullscreen: boolean;
   onRefresh: () => void;
   onAddConnection: () => void;
+  onToggleFullscreen: () => void;
 }) {
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-4 py-3">
@@ -489,6 +495,27 @@ function DatabaseWorkspaceTopBar({
                 : "Choose or add a server profile"}
           </p>
         </div>
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={onToggleFullscreen}
+          aria-label={
+            fullscreen
+              ? "Exit fullscreen database workspace"
+              : "Open database workspace in fullscreen"
+          }
+          aria-pressed={fullscreen}
+          title={
+            fullscreen ? "Exit fullscreen (Escape)" : "Use the whole window for this workspace"
+          }
+        >
+          {fullscreen ? (
+            <ArrowsInIcon className="size-3.5" aria-hidden="true" />
+          ) : (
+            <ArrowsOutIcon className="size-3.5" aria-hidden="true" />
+          )}
+          <span className="hidden sm:inline">{fullscreen ? "Exit fullscreen" : "Fullscreen"}</span>
+        </Button>
         <Button
           variant="secondary"
           size="sm"
@@ -875,6 +902,7 @@ function DatabaseManagerPage() {
   const clearDatabaseError = useDatabaseProfileStore((state) => state.clearError);
 
   const [refreshing, setRefreshing] = useState(false);
+  const [workspaceFullscreen, setWorkspaceFullscreen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [dialog, setDialog] = useState<
     { mode: "create" } | { mode: "edit"; profile: DatabaseProfile } | null
@@ -1277,6 +1305,28 @@ function DatabaseManagerPage() {
     }
   }, [activeTabId, openWorkspaceTab, profileStatus, profiles]);
 
+  useEffect(() => {
+    if (!workspaceFullscreen) {
+      return;
+    }
+    const previousOverflow = document.body.style.overflow;
+    document.body.classList.add("database-workspace-fullscreen");
+    document.body.style.overflow = "hidden";
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setWorkspaceFullscreen(false);
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.body.classList.remove("database-workspace-fullscreen");
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [workspaceFullscreen]);
+
   function openCreateDialog() {
     setDialog({ mode: "create" });
   }
@@ -1678,7 +1728,11 @@ function DatabaseManagerPage() {
 
       <section
         aria-label="Database manager workspace"
-        className="overflow-hidden rounded-lg border border-border bg-card"
+        className={cn(
+          "overflow-hidden rounded-lg border border-border bg-card",
+          workspaceFullscreen &&
+            "fixed inset-0 z-40 flex h-dvh flex-col rounded-none border-0 bg-background",
+        )}
       >
         <DatabaseWorkspaceTopBar
           activeServer={activeServer}
@@ -1689,8 +1743,10 @@ function DatabaseManagerPage() {
           selectedSchema={selectedSchema}
           selectedObject={selectedObject}
           refreshing={refreshing}
+          fullscreen={workspaceFullscreen}
           onRefresh={() => void handleRefresh()}
           onAddConnection={openCreateDialog}
+          onToggleFullscreen={() => setWorkspaceFullscreen((current) => !current)}
         />
 
         <DatabaseWorkspaceTabBar
@@ -1703,7 +1759,12 @@ function DatabaseManagerPage() {
           onClose={(profileId) => void handleCloseWorkspace(profileId)}
         />
 
-        <div className="grid min-h-[30rem] lg:grid-cols-[17rem_minmax(0,1fr)]">
+        <div
+          className={cn(
+            "grid min-h-[30rem] lg:grid-cols-[17rem_minmax(0,1fr)]",
+            workspaceFullscreen && "min-h-0 flex-1 overflow-hidden",
+          )}
+        >
           <DatabaseExplorerRail
             activeServer={activeServer}
             connectionState={connectionState}
@@ -1732,7 +1793,7 @@ function DatabaseManagerPage() {
             onDropDatabase={(profile, database) => void openDropDialog(profile, database)}
           />
 
-          <div className="min-w-0">
+          <div className={cn("min-w-0", workspaceFullscreen && "overflow-y-auto")}>
             {activeTab ? (
               <>
                 <DatabaseWorkspaceTabHeader

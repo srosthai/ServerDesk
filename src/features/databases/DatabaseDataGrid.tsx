@@ -83,8 +83,12 @@ import {
   RowWriteResultBanner,
 } from "@/features/databases/DatabaseRowWriteDialogs";
 import {
+  buildInlineUpdatePayload,
   identityKey,
+  identityValues,
+  inlineEditBlocked,
   rowEditingBlocked as rowEditingBlockedReason,
+  validateInlineValue,
 } from "@/features/databases/databaseRowWriteModel";
 import { databaseRowKey, useDatabaseRowStore } from "@/stores/databaseRowStore";
 import { useDatabaseRowWriteStore } from "@/stores/databaseRowWriteStore";
@@ -124,6 +128,17 @@ type ViewerTarget = {
   cell: DatabaseRowCell;
   column: DatabaseRowColumn;
   rowNumber: number;
+};
+
+type InlineEditState = {
+  rowIndex: number;
+  columnIndex: number;
+  column: DatabaseRowColumn;
+  record: DatabaseRowRecord;
+  value: string;
+  isNull: boolean;
+  saving: boolean;
+  error: string | null;
 };
 
 type ResizeSession = {
@@ -252,6 +267,106 @@ function CellValue({
       ) : null}
       {viewerButton}
     </span>
+  );
+}
+
+function InlineCellEditor({
+  editor,
+  rowNumber,
+  onChange,
+  onToggleNull,
+  onCommit,
+  onCancel,
+}: {
+  editor: InlineEditState;
+  rowNumber: number;
+  onChange: (value: string) => void;
+  onToggleNull: () => void;
+  onCommit: () => void;
+  onCancel: () => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const input = inputRef.current;
+    if (!input) {
+      return;
+    }
+    input.focus({ preventScroll: true });
+    input.select();
+  }, []);
+
+  const placeholder = editor.isNull
+    ? "NULL"
+    : editor.column.kind === "boolean"
+      ? "true or false"
+      : editor.column.kind === "json"
+        ? "{ }"
+        : editor.column.kind === "temporal"
+          ? "YYYY-MM-DD HH:MM:SS"
+          : "Value";
+
+  return (
+    <div
+      data-inline-cell-editor
+      className="flex min-w-0 items-center gap-1"
+      onClick={(event) => event.stopPropagation()}
+      onDoubleClick={(event) => event.stopPropagation()}
+    >
+      <input
+        ref={inputRef}
+        type="text"
+        aria-label={`${editor.column.name} value in row ${rowNumber}`}
+        aria-invalid={editor.error ? true : undefined}
+        title={editor.error ?? undefined}
+        value={editor.isNull ? "" : editor.value}
+        placeholder={placeholder}
+        disabled={editor.saving}
+        spellCheck={false}
+        className={cn(
+          "h-7 min-w-0 flex-1 rounded-sm border border-input bg-card px-1.5 font-mono text-[11px] text-foreground outline-none placeholder:text-muted-foreground/60 focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-60",
+          editor.isNull && "text-muted-foreground italic",
+          editor.error && "border-destructive focus-visible:ring-destructive/40",
+        )}
+        onChange={(event) => onChange(event.currentTarget.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            event.stopPropagation();
+            onCommit();
+          } else if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            onCancel();
+          }
+        }}
+        onBlur={onCommit}
+      />
+      {editor.saving ? (
+        <CircleNotchIcon
+          className="size-3.5 shrink-0 animate-spin text-muted-foreground"
+          aria-label="Saving cell"
+        />
+      ) : null}
+      {editor.column.nullable ? (
+        <button
+          type="button"
+          aria-label={`Set ${editor.column.name} to NULL`}
+          aria-pressed={editor.isNull}
+          title="Toggle SQL NULL"
+          className={cn(
+            "h-6 shrink-0 rounded-sm border px-1 font-mono text-[9px] outline-none focus-visible:ring-2 focus-visible:ring-ring/40",
+            editor.isNull
+              ? "border-warning/50 bg-warning/10 text-warning"
+              : "border-border bg-muted/40 text-muted-foreground hover:text-foreground",
+          )}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={onToggleNull}
+        >
+          NULL
+        </button>
+      ) : null}
+    </div>
   );
 }
 
@@ -572,12 +687,14 @@ export function DatabaseDataGrid({
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [selectedRows, setSelectedRows] = useState<Set<string>>(() => new Set());
   const [activeCell, setActiveCell] = useState({ row: 0, column: 0 });
+  const [inlineEdit, setInlineEdit] = useState<InlineEditState | null>(null);
   const [resizePreview, setResizePreview] = useState<{ column: string; width: number } | null>(
     null,
   );
 
   const gridRef = useRef<HTMLTableElement>(null);
   const resizeSession = useRef<ResizeSession | null>(null);
+  const suppressInlineCommit = useRef(false);
   const draftCounter = useRef(0);
   const rawId = useId();
   const gridId = `data-grid-${rawId.replaceAll(":", "")}`;
@@ -694,6 +811,97 @@ export function DatabaseDataGrid({
       column,
       rowNumber: grid.offset + rowIndex + 1,
     });
+  }
+
+  function startInlineEdit(
+    record: DatabaseRowRecord,
+    rowIndex: number,
+    columnIndex: number,
+    column: DatabaseRowColumn,
+  ) {
+    if (loading || writePending || inlineEdit?.saving) {
+      return false;
+    }
+    const cell = record.cells[columnIndex];
+    if (inlineEditBlocked(column, cell, result, readOnly) !== null || !cell) {
+      return false;
+    }
+    suppressInlineCommit.current = false;
+    setInlineEdit({
+      rowIndex,
+      columnIndex,
+      column,
+      record,
+      value: cell.value ?? "",
+      isNull: cell.value === null,
+      saving: false,
+      error: null,
+    });
+    setActiveCell({ row: rowIndex, column: columnIndex });
+    return true;
+  }
+
+  function cancelInlineEdit() {
+    suppressInlineCommit.current = true;
+    setInlineEdit(null);
+  }
+
+  function toggleInlineNull() {
+    setInlineEdit((current) =>
+      current
+        ? {
+            ...current,
+            isNull: !current.isNull,
+            error: null,
+          }
+        : current,
+    );
+  }
+
+  async function commitInlineEdit() {
+    const editor = inlineEdit;
+    if (!editor || editor.saving) {
+      return;
+    }
+    if (suppressInlineCommit.current) {
+      suppressInlineCommit.current = false;
+      return;
+    }
+    const cell = editor.record.cells[editor.columnIndex];
+    if (!cell) {
+      setInlineEdit(null);
+      return;
+    }
+    const valueForWrite =
+      editor.column.kind === "boolean" ? editor.value.trim().toLowerCase() : editor.value;
+    const nextValue = editor.isNull ? null : valueForWrite;
+    if (nextValue === cell.value) {
+      setInlineEdit(null);
+      return;
+    }
+    const validation = validateInlineValue(editor.column, valueForWrite, editor.isNull);
+    if (validation) {
+      setInlineEdit({ ...editor, error: validation });
+      return;
+    }
+    const payload = buildInlineUpdatePayload(editor.column, cell, valueForWrite, editor.isNull);
+    if (typeof payload === "string") {
+      setInlineEdit({ ...editor, error: payload });
+      return;
+    }
+
+    setInlineEdit({ ...editor, saving: true, error: null });
+    const written = await updateRow(
+      profileId,
+      tableRef,
+      identityValues(editor.record),
+      payload.values,
+      payload.expected,
+    );
+    setInlineEdit(null);
+    if (written) {
+      handleRefresh();
+    }
   }
 
   function handleSort(column: DatabaseRowColumn, additive: boolean) {
@@ -813,7 +1021,7 @@ export function DatabaseDataGrid({
 
   function focusCell(row: number, column: number) {
     setActiveCell({ row, column });
-    gridRef.current?.focus();
+    gridRef.current?.focus({ preventScroll: true });
   }
 
   function handleGridKeyDown(event: React.KeyboardEvent<HTMLTableElement>) {
@@ -849,7 +1057,17 @@ export function DatabaseDataGrid({
       case "PageUp":
         next = { ...active, row: Math.max(0, active.row - 10) };
         break;
-      case "Enter":
+      case "Enter": {
+        const column = visibleColumns[active.column];
+        const record = rows[active.row];
+        if (column && record) {
+          event.preventDefault();
+          if (!startInlineEdit(record, active.row, active.column, column)) {
+            openViewer(record, active.column, active.row, column);
+          }
+        }
+        return;
+      }
       case " ": {
         const column = visibleColumns[active.column];
         const record = rows[active.row];
@@ -1525,6 +1743,15 @@ export function DatabaseDataGrid({
         onRetry={handleRefresh}
       />
 
+      {inlineEdit?.error ? (
+        <p
+          role="alert"
+          className="rounded-md border border-destructive/30 bg-destructive/5 px-2.5 py-1.5 text-[11px] leading-4 text-destructive"
+        >
+          {inlineEdit.error}
+        </p>
+      ) : null}
+
       {status === "error" && result ? (
         <Alert variant="destructive" className="py-2.5">
           <AlertTitle className="text-[12px]">Could not refresh table data</AlertTitle>
@@ -1795,6 +2022,9 @@ export function DatabaseDataGrid({
                         const cell = record.cells[columnIndex];
                         const presentation = cellPresentation(cell, column);
                         const isActive = active.row === rowIndex && active.column === columnIndex;
+                        const isEditing =
+                          inlineEdit?.rowIndex === rowIndex &&
+                          inlineEdit.columnIndex === columnIndex;
                         return (
                           <td
                             key={column.name}
@@ -1803,22 +2033,44 @@ export function DatabaseDataGrid({
                             aria-colindex={columnIndex + 2}
                             aria-selected={active.column === columnIndex}
                             tabIndex={-1}
-                            title={presentation.title}
+                            title={isEditing ? undefined : presentation.title}
                             className={cn(
                               "border-r border-border/50 px-2 py-1.5 align-middle",
-                              presentation.numeric && "text-right tabular-nums",
+                              presentation.numeric && !isEditing && "text-right tabular-nums",
                               active.column === columnIndex && "bg-primary/[0.035]",
                               isActive && "relative z-[1] ring-2 ring-inset ring-primary/60",
+                              isEditing && "p-0.5",
                             )}
                             onClick={() => focusCell(rowIndex, columnIndex)}
-                            onDoubleClick={() => openViewer(record, columnIndex, rowIndex, column)}
+                            onDoubleClick={() => {
+                              if (!startInlineEdit(record, rowIndex, columnIndex, column)) {
+                                openViewer(record, columnIndex, rowIndex, column);
+                              }
+                            }}
                           >
-                            <CellValue
-                              presentation={presentation}
-                              columnName={column.name}
-                              rowNumber={grid.offset + rowIndex + 1}
-                              onView={() => openViewer(record, columnIndex, rowIndex, column)}
-                            />
+                            {isEditing ? (
+                              <InlineCellEditor
+                                editor={inlineEdit}
+                                rowNumber={grid.offset + rowIndex + 1}
+                                onChange={(value) =>
+                                  setInlineEdit((current) =>
+                                    current
+                                      ? { ...current, value, isNull: false, error: null }
+                                      : current,
+                                  )
+                                }
+                                onToggleNull={toggleInlineNull}
+                                onCommit={() => void commitInlineEdit()}
+                                onCancel={cancelInlineEdit}
+                              />
+                            ) : (
+                              <CellValue
+                                presentation={presentation}
+                                columnName={column.name}
+                                rowNumber={grid.offset + rowIndex + 1}
+                                onView={() => openViewer(record, columnIndex, rowIndex, column)}
+                              />
+                            )}
                           </td>
                         );
                       })}

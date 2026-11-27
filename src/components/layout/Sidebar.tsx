@@ -44,6 +44,7 @@ function Sidebar({ open, collapsed, onClose }: SidebarProps) {
   return (
     <aside
       aria-label="Primary"
+      data-app-sidebar
       inert={!isDesktop && !open}
       className={cn(
         "fixed inset-y-0 left-0 z-50 flex w-60 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground transition-[width,transform] duration-200 ease-out md:translate-x-0",

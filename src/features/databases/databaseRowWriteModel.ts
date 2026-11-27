@@ -1,4 +1,5 @@
 import type {
+  DatabaseRowCell,
   DatabaseRowColumn,
   DatabaseRowIdentityValue,
   DatabaseRowReadResult,
@@ -170,4 +171,96 @@ export function buildUpdatePayload(fields: RowFieldDraft[]): RowUpdatePayload | 
 /** Accepts a value field only when that column is writable and not generated. */
 export function columnAcceptsValue(column: DatabaseRowColumn): boolean {
   return !column.generated;
+}
+
+/**
+ * Returns a reason why a single cell cannot be edited in place, or null when it
+ * can. Inline editing uses the same safety rules as the row dialog: stable
+ * identity, a writable non-identity column, and a complete (untruncated) value.
+ */
+export function inlineEditBlocked(
+  column: DatabaseRowColumn,
+  cell: DatabaseRowCell | undefined,
+  result: DatabaseRowReadResult | undefined,
+  sessionReadOnly: boolean,
+): string | null {
+  const rowReason = rowEditingBlocked(result, sessionReadOnly);
+  if (rowReason) {
+    return rowReason;
+  }
+  if (!result) {
+    return "Load table rows before editing.";
+  }
+  if (column.generated) {
+    return `${column.name} is generated and cannot be edited.`;
+  }
+  if (identityColumnNames(result).has(column.name)) {
+    return `${column.name} identifies the row and cannot be edited in place.`;
+  }
+  if (!cell) {
+    return "The cell is unavailable.";
+  }
+  if (cell.truncated) {
+    return `${column.name} was truncated by the server. Open the full value before editing it.`;
+  }
+  return null;
+}
+
+/** Validates a single inline value before sending a write. */
+export function validateInlineValue(
+  column: DatabaseRowColumn,
+  value: string,
+  isNull: boolean,
+): string | null {
+  if (isNull) {
+    return column.nullable ? null : `${column.name} does not allow NULL.`;
+  }
+
+  const trimmed = value.trim();
+  switch (column.kind) {
+    case "boolean":
+      return trimmed.toLowerCase() === "true" || trimmed.toLowerCase() === "false"
+        ? null
+        : `${column.name} must be true or false.`;
+    case "integer":
+      return /^-?\d+$/.test(trimmed) ? null : `${column.name} must be a whole number.`;
+    case "decimal":
+    case "float":
+      return trimmed !== "" && Number.isFinite(Number(trimmed))
+        ? null
+        : `${column.name} must be a number.`;
+    case "json":
+      if (trimmed === "") {
+        return null;
+      }
+      try {
+        JSON.parse(value);
+        return null;
+      } catch {
+        return `${column.name} must contain valid JSON.`;
+      }
+    default:
+      return null;
+  }
+}
+
+/**
+ * Builds the one-field update payload for an inline cell edit. The original
+ * cell value is kept as the conflict guard.
+ */
+export function buildInlineUpdatePayload(
+  column: DatabaseRowColumn,
+  cell: DatabaseRowCell,
+  value: string,
+  isNull: boolean,
+): RowUpdatePayload | string {
+  const field: RowFieldDraft = {
+    column,
+    mode: isNull ? "null" : "value",
+    value,
+    original: cell.value,
+    truncated: cell.truncated,
+    changed: true,
+  };
+  return buildUpdatePayload([field]);
 }
