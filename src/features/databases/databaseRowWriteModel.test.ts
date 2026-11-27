@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildInlineUpdatePayload,
   buildInsertValues,
   buildUpdatePayload,
   editFields,
   identityKey,
   identityValues,
+  inlineEditBlocked,
   insertFields,
   rowEditingBlocked,
   updateField,
+  validateInlineValue,
 } from "@/features/databases/databaseRowWriteModel";
 import type {
   DatabaseRowColumn,
@@ -172,5 +175,51 @@ describe("databaseRowWriteModel", () => {
   it("uses stable identity values and keys for selection", () => {
     expect(identityValues(record)).toEqual([{ column: "id", value: "1" }]);
     expect(identityKey(record)).toBe(JSON.stringify([["id", "1"]]));
+  });
+
+  it("allows inline edits only for writable, complete cells with a stable identity", () => {
+    const name = columns.find((column) => column.name === "name")!;
+    const id = columns.find((column) => column.name === "id")!;
+    const computed = columns.find((column) => column.name === "computed")!;
+
+    expect(
+      inlineEditBlocked(name, { value: "ann", truncated: false }, readResult, false),
+    ).toBeNull();
+    expect(inlineEditBlocked(id, { value: "1", truncated: false }, readResult, false)).toContain(
+      "identifies the row",
+    );
+    expect(
+      inlineEditBlocked(computed, { value: "x", truncated: false }, readResult, false),
+    ).toContain("generated");
+    expect(inlineEditBlocked(name, { value: "ann", truncated: true }, readResult, false)).toContain(
+      "truncated",
+    );
+    expect(inlineEditBlocked(name, { value: "ann", truncated: false }, readResult, true)).toContain(
+      "read-only",
+    );
+  });
+
+  it("validates typed inline values before a write", () => {
+    const active = columns.find((column) => column.name === "name")!;
+    const nickname = columns.find((column) => column.name === "nickname")!;
+    expect(validateInlineValue(active, "ann", false)).toBeNull();
+    expect(validateInlineValue(active, "", false)).toBeNull();
+    expect(validateInlineValue(active, "", true)).toContain("does not allow NULL");
+    expect(validateInlineValue(nickname, "", true)).toBeNull();
+    expect(validateInlineValue(active, "TRUE", false)).toBeNull();
+  });
+
+  it("builds a one-field inline update with the previous value as the guard", () => {
+    const active = columns.find((column) => column.name === "name")!;
+    expect(
+      buildInlineUpdatePayload(active, { value: "ann", truncated: false }, "ann updated", false),
+    ).toEqual({
+      values: [{ column: "name", mode: "value", value: "ann updated" }],
+      expected: [{ column: "name", value: "ann" }],
+    });
+    expect(buildInlineUpdatePayload(active, { value: "ann", truncated: false }, "", true)).toEqual({
+      values: [{ column: "name", mode: "null" }],
+      expected: [{ column: "name", value: "ann" }],
+    });
   });
 });

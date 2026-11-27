@@ -825,6 +825,90 @@ describe("DatabaseDataGrid", () => {
     expect(nameHeader).toHaveAttribute("aria-selected", "true");
 
     await user.keyboard("{Enter}");
-    expect(await screen.findByRole("dialog", { name: "name value" })).toBeInTheDocument();
+    expect(await screen.findByLabelText("name value in row 1")).toBeInTheDocument();
+  });
+
+  it("edits one cell inline and sends its original value as the conflict guard", async () => {
+    const user = userEvent.setup();
+    renderGrid();
+
+    await screen.findByRole("grid", { name: "Table data for users" });
+    const cell = screen.getByText("ann").closest("td");
+    expect(cell).not.toBeNull();
+    await user.dblClick(cell as HTMLElement);
+
+    const input = await screen.findByLabelText("name value in row 1");
+    await user.clear(input);
+    await user.type(input, "ann updated");
+    expect(input).toHaveValue("ann updated");
+    await user.keyboard("{Enter}");
+
+    await waitFor(() => {
+      expect(updateTableRow).toHaveBeenCalledWith(
+        "profile-1",
+        { database: "app", schema: "public", table: "users" },
+        [{ column: "id", value: "1" }],
+        [{ column: "name", mode: "value", value: "ann updated" }],
+        [{ column: "name", value: "ann" }],
+      );
+    });
+    expect(await screen.findByLabelText("Row write succeeded")).toHaveTextContent(
+      "Committed · 1 row affected",
+    );
+  });
+
+  it("cancels an inline edit with Escape without writing", async () => {
+    const user = userEvent.setup();
+    renderGrid();
+
+    await screen.findByRole("grid", { name: "Table data for users" });
+    const cell = screen.getByText("ann").closest("td");
+    await user.dblClick(cell as HTMLElement);
+    const input = await screen.findByLabelText("name value in row 1");
+    await user.clear(input);
+    await user.type(input, "discard me");
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByLabelText("name value in row 1")).not.toBeInTheDocument();
+    expect(updateTableRow).not.toHaveBeenCalled();
+    expect(screen.getByText("ann")).toBeInTheDocument();
+  });
+
+  it("rejects an invalid inline value before sending a write", async () => {
+    const user = userEvent.setup();
+    renderGrid();
+
+    await screen.findByRole("grid", { name: "Table data for users" });
+    const cell = screen.getByText("10.50").closest("td");
+    await user.dblClick(cell as HTMLElement);
+    const input = await screen.findByLabelText("balance value in row 1");
+    await user.clear(input);
+    await user.type(input, "not-a-number");
+    await user.keyboard("{Enter}");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("balance must be a number.");
+    expect(updateTableRow).not.toHaveBeenCalled();
+  });
+
+  it("sets a nullable cell to NULL inline", async () => {
+    const user = userEvent.setup();
+    renderGrid();
+
+    await screen.findByRole("grid", { name: "Table data for users" });
+    const cell = screen.getByText("ann").closest("td");
+    await user.dblClick(cell as HTMLElement);
+    await screen.findByLabelText("name value in row 1");
+    await user.click(screen.getByRole("button", { name: "Set name to NULL" }));
+    await user.keyboard("{Enter}");
+
+    await waitFor(() => {
+      expect(updateTableRow).toHaveBeenCalledWith(
+        "profile-1",
+        { database: "app", schema: "public", table: "users" },
+        [{ column: "id", value: "1" }],
+        [{ column: "name", mode: "null" }],
+        [{ column: "name", value: "ann" }],
+      );
+    });
   });
 });

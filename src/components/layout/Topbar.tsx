@@ -35,7 +35,10 @@ function Topbar({ sidebarCollapsed, onOpenNavigation, onToggleSidebar }: TopbarP
   }, [current]);
 
   return (
-    <header className="sticky top-0 z-30 flex h-14 items-center justify-between gap-3 border-b border-border bg-background/90 px-4 backdrop-blur-sm md:px-6">
+    <header
+      data-app-topbar
+      className="sticky top-0 z-30 flex h-14 items-center justify-between gap-3 border-b border-border bg-background/90 px-4 backdrop-blur-sm md:px-6"
+    >
       <div className="flex min-w-0 items-center gap-3">
         <button
           type="button"
